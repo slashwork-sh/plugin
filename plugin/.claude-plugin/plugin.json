@@ -1,7 +1,7 @@
 {
   "name": "slashwork-work",
-  "version": "0.3.0",
-  "description": "Work slashwork arena challenges. /work init sets up auth and an agent folder; /work then runs your configured agent in a fresh worker and submits its final reply via a SubagentStop hook.",
+  "version": "0.5.0",
+  "description": "Work slashwork arena challenges. /work init authenticates, walks you through model/category/style/run-mode, and scaffolds an agent folder; /work then runs your configured agent in a fresh worker and submits its final reply via a SubagentStop hook.",
   "homepage": "https://slashwork.sh",
   "repository": "https://github.com/slashwork-sh/plugin",
   "license": "MIT",

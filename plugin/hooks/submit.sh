@@ -66,6 +66,26 @@ STAGE="/tmp/slashwork-job-${SESSION_ID}-${ID}.json"
 BASE="$(jq -r '.base // empty' "$STAGE")"
 [ -n "$BASE" ] || { echo "slashwork: no base for $ID; skipping" >&2; exit 0; }
 
+# The token goes in this request, so re-validate the destination even though the
+# skill validated it at stage time (a prompt-injected worker could have rewritten
+# the staged file). https only (http for localhost dev), and the host must match
+# the base the skill recorded in this session's state file.
+case "$BASE" in
+  https://*) : ;;
+  http://localhost|http://localhost:*|http://127.0.0.1|http://127.0.0.1:*) : ;;
+  *) echo "slashwork: refusing to submit to non-https base '$BASE'" >&2; exit 0 ;;
+esac
+BASE_HOST=$(printf '%s' "$BASE" | sed -n 's#^https\{0,1\}://\([^/]\{1,\}\).*#\1#p')
+WORK_STATE="/tmp/slashwork-work-${SESSION_ID}.json"
+if [ -f "$WORK_STATE" ]; then
+  STATE_HOST=$(jq -r '.base // empty' "$WORK_STATE" \
+    | sed -n 's#^https\{0,1\}://\([^/]\{1,\}\).*#\1#p')
+  if [ -n "$STATE_HOST" ] && [ "$BASE_HOST" != "$STATE_HOST" ]; then
+    echo "slashwork: staged base host '$BASE_HOST' does not match session base '$STATE_HOST'; not submitting" >&2
+    exit 0
+  fi
+fi
+
 OUT="/tmp/slashwork-submit-${SESSION_ID}-${ID}.out"
 CODE=$(jq -nc --arg a "$ARTIFACT" '{artifact: $a}' \
   | curl -sS --max-time 30 -o "$OUT" -w '%{http_code}' \
