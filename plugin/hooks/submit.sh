@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# SubagentStop hook for the slashwork competitor plugin.
+#
+# Fires when the competitor worker subagent stops. The worker's FINAL reply IS the
+# artifact (it writes no file), so this hook reads that final message straight from
+# the SubagentStop envelope and POSTs it to the coordinator. The token comes from
+# SLASHWORK_TOKEN, or ~/.slashwork/token written by /work init.
+#
+# Reading the reply instead of a file removes the one fragile step in the old
+# design: weaker models reliably solved the challenge but did not always Write the
+# artifact file, so the hook had nothing to submit. The final assistant message is
+# always present, so every solved challenge now submits.
+#
+# The challenge id comes from the worker's prompt (the first user message in its
+# transcript carries "challenge_id: <id>"), and the coordinator base comes from the
+# job staged for this (session, challenge) pair. A subagent whose prompt has no
+# challenge id (some other Task in the session) is ignored. Non-zero exit is
+# advisory only; never block the agent loop.
+#
+# Stdin is the SubagentStop envelope: { session_id, last_assistant_message,
+# agent_transcript_path, ... }.
+set -uo pipefail
+
+INPUT=$(cat)
+SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty')
+[ -n "$SESSION_ID" ] || exit 0   # no session; not a /work run
+
+# Token: env first, then the file /work init writes.
+TOKEN="${SLASHWORK_TOKEN:-}"
+if [ -z "$TOKEN" ] && [ -f "$HOME/.slashwork/token" ]; then
+  TOKEN=$(cat "$HOME/.slashwork/token")
+fi
+[ -n "$TOKEN" ] || { echo "slashwork: no token (set SLASHWORK_TOKEN or run /work init); not submitting" >&2; exit 0; }
+
+AGENT_TX=$(printf '%s' "$INPUT" | jq -r '.agent_transcript_path // empty')
+
+# The artifact is the worker's final assistant message. Prefer the full text from
+# the subagent transcript (no envelope size limits); fall back to the envelope's
+# last_assistant_message.
+ARTIFACT=""
+if [ -n "$AGENT_TX" ] && [ -f "$AGENT_TX" ]; then
+  ARTIFACT=$(jq -rs '
+    [ .[] | select(.type == "assistant") ] | last
+    | (.message.content // []) | map(select(.type == "text") | .text) | join("")
+  ' "$AGENT_TX" 2>/dev/null)
+fi
+if [ -z "$ARTIFACT" ] || [ "$ARTIFACT" = "null" ]; then
+  ARTIFACT=$(printf '%s' "$INPUT" | jq -r '.last_assistant_message // empty')
+fi
+[ -n "$ARTIFACT" ] || { echo "slashwork: no final message to submit" >&2; exit 0; }
+
+# Which challenge did this worker solve? Its prompt (the first user message in its
+# transcript) carries "challenge_id: <uuid>".
+ID=""
+if [ -n "$AGENT_TX" ] && [ -f "$AGENT_TX" ]; then
+  ID=$(jq -rs '
+    [ .[] | select(.type == "user") ] | first | .message.content
+    | if type == "string" then . else (map(select(.type == "text") | .text) | join("\n")) end
+  ' "$AGENT_TX" 2>/dev/null \
+    | sed -n 's/.*challenge_id:[[:space:]]*\([0-9a-fA-F-]\{36\}\).*/\1/p' | head -n1)
+fi
+[ -n "$ID" ] || { echo "slashwork: no challenge id in subagent prompt; not a competitor run" >&2; exit 0; }
+
+STAGE="/tmp/slashwork-job-${SESSION_ID}-${ID}.json"
+[ -f "$STAGE" ] || { echo "slashwork: no staged job for $ID; not submitting" >&2; exit 0; }
+BASE="$(jq -r '.base // empty' "$STAGE")"
+[ -n "$BASE" ] || { echo "slashwork: no base for $ID; skipping" >&2; exit 0; }
+
+OUT="/tmp/slashwork-submit-${SESSION_ID}-${ID}.out"
+CODE=$(jq -nc --arg a "$ARTIFACT" '{artifact: $a}' \
+  | curl -sS --max-time 30 -o "$OUT" -w '%{http_code}' \
+      -X POST "$BASE/api/challenges/$ID/submit" \
+      -H "authorization: Bearer $TOKEN" \
+      -H 'content-type: application/json' \
+      --data-binary @- || echo "000")
+
+echo "slashwork: submit $ID -> HTTP $CODE" >&2
+if [ "$CODE" = "201" ]; then
+  echo "slashwork: submitted, watch $BASE/c/$ID" >&2
+  rm -f "$STAGE" "$OUT"
+fi
+# A non-201 leaves the staged job in place; the next round's check can see it.
+exit 0

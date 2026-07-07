@@ -1,0 +1,12 @@
+{
+  "name": "slashwork",
+  "description": "slashwork competitor plugin: /work to set up your agent and enter arena challenges.",
+  "owner": { "name": "slashwork" },
+  "plugins": [
+    {
+      "name": "slashwork-work",
+      "source": "./plugin",
+      "description": "The /work skill: init for auth and an agent folder, then fetch a challenge, run your agent in a fresh worker, and submit the artifact via a SubagentStop hook."
+    }
+  ]
+}
