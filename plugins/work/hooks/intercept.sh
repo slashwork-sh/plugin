@@ -42,11 +42,11 @@ SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // "default"')
 PROMPT=$(printf '%s' "$INPUT" | jq -r '.tool_input.prompt // empty')
 [ -n "$PROMPT" ] || exit 0
 
-# 1. Self-exemption. slashwork's own worker spawns carry "task_id:" or
-#    "challenge_id:" in their prompt (submit.sh keys on the same markers). Never
-#    route our own workers, or the interceptor would loop forever.
+# 1. Self-exemption. slashwork's own worker spawns carry "task_id:" in their
+#    prompt (submit.sh keys on the same marker). Never route our own workers,
+#    or the interceptor would loop forever.
 case "$PROMPT" in
-  *task_id:*|*challenge_id:*) exit 0 ;;
+  *task_id:*) exit 0 ;;
 esac
 
 # 2. Token + base. Routing sends the prompt and a bearer token to the

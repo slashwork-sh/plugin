@@ -7,17 +7,16 @@
 # SLASHWORK_TOKEN, or ~/.slashwork/token written by /earn init.
 #
 # Reading the reply instead of a file removes the one fragile step in the old
-# design: weaker models reliably solved the challenge but did not always Write the
-# artifact file, so the hook had nothing to submit. The final assistant message is
-# always present, so every solved challenge now submits.
+# design: weaker models reliably solved the task but did not always Write the
+# artifact file, so the hook had nothing to submit. The final assistant message
+# is always present, so every solved task now submits.
 #
-# The worker's prompt (the first user message in its transcript) says which unit
-# of work this was: "task_id: <id>" for an offload-network task (submitted to
-# /api/tasks/<id>/submit with the worker's token usage), or "challenge_id: <id>"
-# for an arena challenge (submitted to /api/challenges/<id>/submit). The
-# coordinator base comes from the job staged for this (session, id) pair. A
-# subagent whose prompt has neither marker (some other Task in the session) is
-# ignored. Non-zero exit is advisory only; never block the agent loop.
+# The worker's prompt (the first user message in its transcript) names the task
+# with "task_id: <id>"; the artifact goes to /api/tasks/<id>/submit with the
+# worker's token usage. The coordinator base comes from the job staged for this
+# (session, id) pair. A subagent whose prompt has no task_id marker (some other
+# Task in the session) is ignored. Non-zero exit is advisory only; never block
+# the agent loop.
 #
 # Stdin is the SubagentStop envelope: { session_id, last_assistant_message,
 # agent_transcript_path, ... }.
@@ -51,8 +50,8 @@ if [ -z "$ARTIFACT" ] || [ "$ARTIFACT" = "null" ]; then
 fi
 [ -n "$ARTIFACT" ] || { echo "slashwork: no final message to submit" >&2; exit 0; }
 
-# Which unit of work did this worker do? Its prompt (the first user message in
-# its transcript) carries "task_id: <uuid>" or "challenge_id: <uuid>".
+# Which task did this worker do? Its prompt (the first user message in its
+# transcript) carries "task_id: <uuid>".
 FIRST_MSG=""
 if [ -n "$AGENT_TX" ] && [ -f "$AGENT_TX" ]; then
   FIRST_MSG=$(jq -rs '
@@ -60,15 +59,8 @@ if [ -n "$AGENT_TX" ] && [ -f "$AGENT_TX" ]; then
     | if type == "string" then . else (map(select(.type == "text") | .text) | join("\n")) end
   ' "$AGENT_TX" 2>/dev/null)
 fi
-KIND=""
 ID=$(printf '%s' "$FIRST_MSG" | sed -n 's/.*task_id:[[:space:]]*\([0-9a-fA-F-]\{36\}\).*/\1/p' | head -n1)
-if [ -n "$ID" ]; then
-  KIND=task
-else
-  ID=$(printf '%s' "$FIRST_MSG" | sed -n 's/.*challenge_id:[[:space:]]*\([0-9a-fA-F-]\{36\}\).*/\1/p' | head -n1)
-  [ -n "$ID" ] && KIND=challenge
-fi
-[ -n "$ID" ] || { echo "slashwork: no task or challenge id in subagent prompt; not a slashwork run" >&2; exit 0; }
+[ -n "$ID" ] || { echo "slashwork: no task id in subagent prompt; not a slashwork run" >&2; exit 0; }
 
 STAGE="/tmp/slashwork-job-${SESSION_ID}-${ID}.json"
 [ -f "$STAGE" ] || { echo "slashwork: no staged job for $ID; not submitting" >&2; exit 0; }
@@ -95,26 +87,21 @@ if [ -f "$WORK_STATE" ]; then
   fi
 fi
 
-# Build the body and endpoint per kind. Tasks also report the worker's token
-# usage, summed from its transcript (input + output + cache writes). It is
-# advisory and untrusted server-side; clamp to the API ceiling so an outlier
-# transcript does not turn into a rejected submit.
-if [ "$KIND" = "task" ]; then
-  URL="$BASE/api/tasks/$ID/submit"
-  TOKENS=0
-  if [ -n "$AGENT_TX" ] && [ -f "$AGENT_TX" ]; then
-    TOKENS=$(jq -s '
-      [ .[] | select(.type == "assistant") | .message.usage? // empty
-        | ((.input_tokens // 0) + (.output_tokens // 0) + (.cache_creation_input_tokens // 0)) ]
-      | add // 0' "$AGENT_TX" 2>/dev/null)
-  fi
-  printf '%s' "$TOKENS" | grep -qE '^[0-9]+$' || TOKENS=0
-  [ "$TOKENS" -gt 100000000 ] && TOKENS=100000000
-  BODYJSON=$(jq -nc --arg a "$ARTIFACT" --argjson t "$TOKENS" '{artifact: $a, tokens_used: $t}')
-else
-  URL="$BASE/api/challenges/$ID/submit"
-  BODYJSON=$(jq -nc --arg a "$ARTIFACT" '{artifact: $a}')
+# Build the body. The submit also reports the worker's token usage, summed from
+# its transcript (input + output + cache writes). It is advisory and untrusted
+# server-side; clamp to the API ceiling so an outlier transcript does not turn
+# into a rejected submit.
+URL="$BASE/api/tasks/$ID/submit"
+TOKENS=0
+if [ -n "$AGENT_TX" ] && [ -f "$AGENT_TX" ]; then
+  TOKENS=$(jq -s '
+    [ .[] | select(.type == "assistant") | .message.usage? // empty
+      | ((.input_tokens // 0) + (.output_tokens // 0) + (.cache_creation_input_tokens // 0)) ]
+    | add // 0' "$AGENT_TX" 2>/dev/null)
 fi
+printf '%s' "$TOKENS" | grep -qE '^[0-9]+$' || TOKENS=0
+[ "$TOKENS" -gt 100000000 ] && TOKENS=100000000
+BODYJSON=$(jq -nc --arg a "$ARTIFACT" --argjson t "$TOKENS" '{artifact: $a, tokens_used: $t}')
 
 OUT="/tmp/slashwork-submit-${SESSION_ID}-${ID}.out"
 CODE=$(printf '%s' "$BODYJSON" \
@@ -124,13 +111,9 @@ CODE=$(printf '%s' "$BODYJSON" \
       -H 'content-type: application/json' \
       --data-binary @- || echo "000")
 
-echo "slashwork: submit $KIND $ID -> HTTP $CODE" >&2
+echo "slashwork: submit task $ID -> HTTP $CODE" >&2
 if [ "$CODE" = "201" ]; then
-  if [ "$KIND" = "task" ]; then
-    echo "slashwork: task returned to its requester" >&2
-  else
-    echo "slashwork: submitted, watch $BASE/c/$ID" >&2
-  fi
+  echo "slashwork: task returned to its requester" >&2
   rm -f "$STAGE" "$OUT"
 fi
 # A non-201 leaves the staged job in place; the next round's check can see it.

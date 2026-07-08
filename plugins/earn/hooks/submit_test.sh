@@ -3,11 +3,12 @@
 #
 # Stands up a one-shot mock coordinator on localhost, feeds submit.sh a realistic
 # SubagentStop envelope (with the subagent's final reply and its transcript path),
-# and asserts the hook POSTs that reply as the artifact to the right URL. Two
-# scenarios: an arena challenge (challenge_id in the worker prompt) and an
-# offload-network task (task_id in the prompt, token usage reported from the
-# transcript). No file is written by any worker: the point is that the hook
-# submits the worker's final message, not a file it had to write.
+# and asserts the hook POSTs that reply as the artifact to the right URL. Three
+# scenarios: a task whose transcript carries no usage fields (tokens_used falls
+# back to 0), a task with usage turns (tokens_used summed from the transcript),
+# and a subagent with no task_id marker (ignored, nothing sent). No file is
+# written by any worker: the point is that the hook submits the worker's final
+# message, not a file it had to write.
 #
 # Run: bash plugins/earn/hooks/submit_test.sh
 set -uo pipefail
@@ -47,14 +48,15 @@ MOCK=$!
 sleep 0.6
 
 # 2. Stage the job (only thing on disk; carries base). No artifact file is created.
-printf '{"id":"%s","base":"%s"}\n' "$ID" "$BASE" > "$JOB"
+printf '{"task_id":"%s","base":"%s"}\n' "$ID" "$BASE" > "$JOB"
 
-# 3. Fake subagent transcript: first user message carries challenge_id, final
-#    assistant message is the deliverable (with an earlier thinking turn for realism).
+# 3. Fake subagent transcript: first user message carries task_id, final
+#    assistant message is the deliverable (with an earlier thinking turn for
+#    realism). No usage fields anywhere, so tokens_used must fall back to 0.
 TXDIR="$(mktemp -d)"
 AT="$TXDIR/agent-test.jsonl"
 {
-  printf '{"type":"user","message":{"role":"user","content":"challenge_id: %s\\njob_file: %s\\nSolve it; your final message is the artifact."}}\n' "$ID" "$JOB"
+  printf '{"type":"user","message":{"role":"user","content":"task_id: %s\\njob_file: %s\\nProduce the deliverable; your final message is the artifact."}}\n' "$ID" "$JOB"
   printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"working"}]}}\n'
   printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"%s"}]}}\n' "$DELIVERABLE"
 } > "$AT"
@@ -73,12 +75,14 @@ fail() { echo "FAIL: $1"; echo "--- hook stderr ---"; cat "$HOOKERR" 2>/dev/null
 [ -f "$CAP" ] || fail "coordinator received no POST (hook submitted nothing)"
 GOT_PATH="$(head -1 "$CAP")"
 GOT_ART="$(tail -n +2 "$CAP" | jq -r '.artifact')"
-[ "$GOT_PATH" = "/api/challenges/$ID/submit" ] || fail "wrong URL path: $GOT_PATH"
+GOT_TOKENS="$(tail -n +2 "$CAP" | jq -r '.tokens_used')"
+[ "$GOT_PATH" = "/api/tasks/$ID/submit" ] || fail "wrong URL path: $GOT_PATH"
 [ "$GOT_ART" = "$DELIVERABLE" ] || fail "wrong artifact body: $GOT_ART"
+[ "$GOT_TOKENS" = "0" ] || fail "no-usage transcript must report tokens_used 0: $GOT_TOKENS"
 [ ! -f "$JOB" ] || fail "staged job not cleaned up after 201"
-echo "PASS: hook submitted the worker's final reply to $GOT_PATH"
+echo "PASS: hook submitted the worker's final reply to $GOT_PATH (tokens_used 0)"
 
-# ---- Scenario 2: offload-network task (task_id in the prompt) ----
+# ---- Scenario 2: token usage summed from the transcript ----
 
 TASK_ID="11111111-2222-3333-4444-555555555555"
 TASK_ART="The finished offloaded report."
@@ -132,3 +136,22 @@ GOT_TOKENS="$(tail -n +2 "$CAP" | jq -r '.tokens_used')"
 [ "$GOT_TOKENS" = "1950" ] || fail "wrong tokens_used (want 1950): $GOT_TOKENS"
 [ ! -f "$TASK_JOB" ] || fail "staged task job not cleaned up after 201"
 echo "PASS: hook submitted the task artifact with tokens_used to $GOT_PATH"
+
+# ---- Scenario 3: no task_id marker -> ignored, nothing sent ----
+
+rm -f "$CAP"
+AT3="$TXDIR/agent-other.jsonl"
+{
+  printf '{"type":"user","message":{"role":"user","content":"Summarize the design doc pasted below."}}\n'
+  printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"A summary."}]}}\n'
+} > "$AT3"
+
+ENVELOPE3="$(jq -nc \
+  --arg s "$SESSION" --arg at "$AT3" \
+  '{session_id:$s, agent_transcript_path:$at, last_assistant_message:"A summary.", hook_event_name:"SubagentStop"}')"
+
+printf '%s' "$ENVELOPE3" | SLASHWORK_TOKEN=testtoken bash "$SUBMIT" 2>"$HOOKERR"
+RC=$?
+[ "$RC" = "0" ] || fail "non-slashwork subagent must exit 0 (got $RC)"
+[ ! -f "$CAP" ] || fail "non-slashwork subagent must not POST anything: $(cat "$CAP")"
+echo "PASS: subagent without a task_id marker is ignored"
