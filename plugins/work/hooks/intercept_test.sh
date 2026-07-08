@@ -7,7 +7,7 @@
 # tool, self-worker, local prompt, secret, opt-out) falls through to the local
 # spawn (exit 0, no decision) and sends nothing it should not.
 #
-# Run: bash plugin/hooks/intercept_test.sh
+# Run: bash plugins/work/hooks/intercept_test.sh
 set -uo pipefail
 
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -114,32 +114,32 @@ ok "cold pool -> cancel + local fallback"
 
 # 3. Non-Task tool -> untouched, nothing sent.
 run cold "anything" Bash
-[ "$RC" = "0" ] && [ -z "$OUT" ] || fail "non-Task tool should be a no-op" "$OUT"
+if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "non-Task tool should be a no-op" "$OUT"; fi
 [ ! -s "$LOG" ] || fail "non-Task tool must not contact the coordinator" "$(cat "$LOG")"
 ok "non-Task tool -> no-op"
 
 # 4. Self-worker (prompt carries task_id:) -> never routed.
 run cold "task_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
 Read the job and solve it."
-[ "$RC" = "0" ] && [ -z "$OUT" ] || fail "self-worker should pass through" "$OUT"
+if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "self-worker should pass through" "$OUT"; fi
 [ ! -s "$LOG" ] || fail "self-worker must not be routed" "$(cat "$LOG")"
 ok "self-worker (task_id) -> not routed"
 
 # 5. Local-path prompt -> declined before any network.
 run returned "Refactor the function in ./src/main.rs and run the tests."
-[ "$RC" = "0" ] && [ -z "$OUT" ] || fail "local-path prompt should decline to local" "$OUT"
+if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "local-path prompt should decline to local" "$OUT"; fi
 [ ! -s "$LOG" ] || fail "local-path prompt must not be routed" "$(cat "$LOG")"
 ok "local-path prompt -> declined, no network"
 
 # 6. Secret in prompt -> declined before any network.
 run returned "Write a script that authenticates with api_key sk-abcdefTOPSECRET and fetches data."
-[ "$RC" = "0" ] && [ -z "$OUT" ] || fail "secret prompt should decline" "$OUT"
+if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "secret prompt should decline" "$OUT"; fi
 [ ! -s "$LOG" ] || fail "secret prompt must not be routed" "$(cat "$LOG")"
 ok "secret in prompt -> declined, no network"
 
 # 7. Ambiguous / no confident class -> declined, no network.
 run returned "Do the needful with the thing."
-[ "$RC" = "0" ] && [ -z "$OUT" ] || fail "unclassifiable prompt should decline" "$OUT"
+if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "unclassifiable prompt should decline" "$OUT"; fi
 [ ! -s "$LOG" ] || fail "unclassifiable prompt must not be routed" "$(cat "$LOG")"
 ok "no confident class -> declined, no network"
 
@@ -160,7 +160,7 @@ printf returned > "$MODEFILE"; : > "$LOG"
 OUT=$(envelope "Research and compare the options; pros and cons of each." Task "$FRESH" \
   | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
 RC=$?
-[ "$RC" = "0" ] && [ -z "$OUT" ] || fail "first candidate must run local (consent)" "$OUT"
+if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "first candidate must run local (consent)" "$OUT"; fi
 [ ! -s "$LOG" ] || fail "first candidate must send nothing before consent shown" "$(cat "$LOG")"
 # Second candidate in the same session now routes.
 : > "$LOG"
@@ -193,14 +193,23 @@ for P in \
 done
 ok "broadened secret scan (sk_live_, github_pat_, AIza)"
 
-# 12. Opt-out: SLASHWORK_INTERCEPT unset -> total no-op (env -u guarantees the
-#     var is absent regardless of the caller's environment).
+# 12. Default-on: SLASHWORK_INTERCEPT unset -> intercepts (install + token is
+#     the opt-in; env -u guarantees the var is absent regardless of the
+#     caller's environment).
+: > "$LOG"; printf returned > "$MODEFILE"; : > "/tmp/slashwork-intercept-consent-$SESS"
+OUT=$(envelope "Research and compare the options; pros and cons of each." \
+  | env -u SLASHWORK_INTERCEPT SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+[ "$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)" = "deny" ] \
+  || fail "unset must intercept (interception is default-on)" "$OUT"
+ok "SLASHWORK_INTERCEPT unset -> intercepts (default-on)"
+
+# 13. Opt-out: SLASHWORK_INTERCEPT=0 -> total no-op, nothing sent.
 : > "$LOG"; printf returned > "$MODEFILE"
 OUT=$(envelope "Research and compare the options." \
-  | env -u SLASHWORK_INTERCEPT SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+  | SLASHWORK_INTERCEPT=0 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
 RC=$?
-[ "$RC" = "0" ] && [ -z "$OUT" ] || fail "not opted in must be a no-op" "$OUT"
-[ ! -s "$LOG" ] || fail "not opted in must not contact the coordinator" "$(cat "$LOG")"
-ok "SLASHWORK_INTERCEPT unset -> no-op"
+if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "opted out must be a no-op" "$OUT"; fi
+[ ! -s "$LOG" ] || fail "opted out must not contact the coordinator" "$(cat "$LOG")"
+ok "SLASHWORK_INTERCEPT=0 -> no-op"
 
 echo "ALL PASS ($PASS scenarios)"

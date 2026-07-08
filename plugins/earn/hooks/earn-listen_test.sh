@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Integration test for the /work earn background SSE listener (earn-listen.sh).
+# Integration test for the /earn background SSE listener (earn-listen.sh).
 #
 # Drives the listener against a scripted mock coordinator and asserts the marker
 # outcome for each case: claims a task off the feed and stages the job; gives up
@@ -8,7 +8,7 @@
 # of busy-spinning when the coordinator is unreachable; and refuses a non-https
 # base so the token cannot leak.
 #
-# Run: bash plugin/hooks/earn-listen_test.sh
+# Run: bash plugins/earn/hooks/earn-listen_test.sh
 set -uo pipefail
 
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -86,7 +86,7 @@ run_listener() { rm -f "$MARKER" "$JOB"; SLASHWORK_TOKEN=t bash "$LISTEN" "$STAT
 printf win > "$MODEFILE"; write_state "$(( $(date +%s) + 60 ))"; run_listener
 [ "$(jq -r .status "$MARKER")" = "claimed" ] || fail "expected claimed" "$(cat "$MARKER")"
 [ "$(jq -r .id "$MARKER")" = "$TASK_ID" ] || fail "wrong task id" "$(cat "$MARKER")"
-[ -f "$JOB" ] && [ "$(jq -r .prompt "$JOB")" = "draft it" ] || fail "job not staged" "$(cat "$JOB" 2>/dev/null)"
+if ! { [ -f "$JOB" ] && [ "$(jq -r .prompt "$JOB")" = "draft it" ]; }; then fail "job not staged" "$(cat "$JOB" 2>/dev/null)"; fi
 [ "$(jq -r .base "$JOB")" = "$BASE" ] || fail "job missing base"
 ok "claims a queued task and stages the job"
 

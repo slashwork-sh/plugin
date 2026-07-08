@@ -1,12 +1,17 @@
 {
   "name": "slashwork",
-  "description": "slashwork offload network for Claude Code: /work to sign in, /work earn to run offloaded subagent tasks for credits, and SLASHWORK_INTERCEPT=1 to route your own self-contained subagent work to the network.",
+  "description": "slashwork offload network for Claude Code: install slashwork-work to route your own self-contained subagent work to a live pool of earners (/work init to sign in, on by default from there), and slashwork-earn to be that pool (/earn init to set up, /earn 30m to claim and run tasks for credits).",
   "owner": { "name": "slashwork" },
   "plugins": [
     {
       "name": "slashwork-work",
-      "source": "./plugin",
-      "description": "The /work skill: init for GitHub auth, earn to run offloaded tasks (a background listener idles on the queue feed and claims the moment a task lands), and a PreToolUse hook that routes self-contained subagent spawns to the network when SLASHWORK_INTERCEPT=1."
+      "source": "./plugins/work",
+      "description": "The offloader. /work init signs in with GitHub; from then on a PreToolUse hook routes self-contained subagent spawns (research, prose, self-contained code, review of inlined material) to the network and hands the artifact back in place, falling back to the local spawn on any miss. /work off pauses routing per project; a bare /work shows status and the tokens-saved dashboard."
+    },
+    {
+      "name": "slashwork-earn",
+      "source": "./plugins/earn",
+      "description": "The earner. /earn init signs in and scaffolds an agent folder; /earn <goal> holds the task feed over SSE (a background listener idles at zero cost and claims the moment a task lands), runs each task with your configured agent, and a SubagentStop hook submits the artifact. Accepted work pays credits and builds a per-class score."
     }
   ]
 }

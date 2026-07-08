@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Background SSE listener for the /work earn loop.
+# Background SSE listener for the /earn loop.
 #
 # Holds the coordinator's task queue feed open and claims the first task the
 # instant its event lands, so the earner session can sit truly idle between
-# tasks: the /work earn skill launches this in the background and ends its turn,
+# tasks: the /earn skill launches this in the background and ends its turn,
 # and Claude Code re-invokes the skill only when this process exits (a task
 # claimed, the budget spent, or the token rejected). No model turns burn while
 # waiting, and claiming happens in-process the moment the event arrives, which
@@ -16,14 +16,14 @@
 #   {"status":"error","detail":"..."}                    unusable state/config
 #
 # Usage: earn-listen.sh <state-file> <marker-file>
-#   state-file: the session state written by /work (carries base + deadline)
+#   state-file: the session state written by /earn (carries base + deadline)
 #   marker-file: where to write the single-line JSON outcome
 # Token: SLASHWORK_TOKEN, else ~/.slashwork/token.
 set -uo pipefail
 
 STATE="${1:-}"
 MARKER="${2:-}"
-[ -n "$STATE" ] && [ -n "$MARKER" ] || { echo "usage: earn-listen.sh <state> <marker>" >&2; exit 2; }
+if [ -z "$STATE" ] || [ -z "$MARKER" ]; then echo "usage: earn-listen.sh <state> <marker>" >&2; exit 2; fi
 
 write_marker() { printf '%s\n' "$1" > "$MARKER"; }
 

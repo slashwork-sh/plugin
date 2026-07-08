@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # PreToolUse(Task) hook for the slashwork offload network.
 #
-# When a session has opted in (SLASHWORK_INTERCEPT=1), this hook catches each
+# Interception is on by default: installing the plugin and signing in
+# (/work init writes the token) is the opt-in, and SLASHWORK_INTERCEPT=0 is the
+# per-session/per-project opt-out (/work off writes it). This hook catches each
 # subagent spawn before it runs. A spawn it judges self-contained is routed to
 # the coordinator: POST the prompt as a task, wait briefly for a warm earner to
 # claim it, and if one returns an artifact in time, hand that back to the parent
-# session INSTEAD of spawning locally. Anything else (not opted in, not a Task,
-# our own worker, not confidently routable, no earner, slow earner, any error)
-# falls through to the local spawn exactly as it would have run today.
+# session INSTEAD of spawning locally. Anything else (opted out, no token, not a
+# Task, our own worker, not confidently routable, no earner, slow earner, any
+# error) falls through to the local spawn exactly as it would have run today.
 #
 # The iron rule: the failure mode is always "ran locally like it always did,"
 # never "hung" and never "ran worse." Every branch that is not a clean returned
@@ -24,9 +26,10 @@ set -uo pipefail
 # Clean up the poll-body temp file on any exit path.
 trap 'rm -f "/tmp/slashwork-intercept-body-$$.json" 2>/dev/null' EXIT
 
-# 0. Opt-in gate. Absent or not exactly "1" means this session never asked for
-#    routing; do nothing at all.
-[ "${SLASHWORK_INTERCEPT:-}" = "1" ] || exit 0
+# 0. Opt-out gate. On by default; exactly "0" means this session or project
+#    turned routing off (/work off), so do nothing at all. The token check
+#    below keeps the hook inert until the user has signed in.
+[ "${SLASHWORK_INTERCEPT:-}" != "0" ] || exit 0
 
 command -v jq >/dev/null 2>&1 || exit 0
 command -v curl >/dev/null 2>&1 || exit 0
@@ -133,12 +136,12 @@ case "$CLASS" in
 esac
 CLAIM_WINDOW=5
 
-# 4. First-candidate consent gate (once per session). Opting in with
-#    SLASHWORK_INTERCEPT=1 is the standing consent, but nothing leaves the
-#    machine before the user has seen what routing does: the FIRST routable
-#    spawn in a session prints the disclosure and runs locally. Routing begins
-#    on the next one. So the user always sees the notice before any prompt is
-#    sent. A blocking interactive per-task ask is a tracked follow-up.
+# 4. First-candidate consent gate (once per session). Installing the plugin
+#    and signing in is the standing consent, but nothing leaves the machine
+#    before the user has seen what routing does: the FIRST routable spawn in a
+#    session prints the disclosure and runs locally. Routing begins on the next
+#    one. So the user always sees the notice before any prompt is sent. A
+#    blocking interactive per-task ask is a tracked follow-up.
 CONSENT="/tmp/slashwork-intercept-consent-$SESSION_ID"
 if [ ! -f "$CONSENT" ]; then
   : > "$CONSENT" 2>/dev/null || true
@@ -146,7 +149,7 @@ if [ ! -f "$CONSENT" ]; then
     echo "slashwork intercept is on: self-contained subagent tasks will be routed to the"
     echo "  offload network, meaning the task prompt is sent to another slashwork user's"
     echo "  session to run. This first task runs locally; routing starts with the next one."
-    echo "  Unset SLASHWORK_INTERCEPT to stop routing."
+    echo "  Run /work off (or set SLASHWORK_INTERCEPT=0) to stop routing."
   } >&2
   exit 0   # never route before the disclosure has been shown once
 fi

@@ -4,7 +4,7 @@
 # Fires when a slashwork worker subagent stops. The worker's FINAL reply IS the
 # artifact (it writes no file), so this hook reads that final message straight from
 # the SubagentStop envelope and POSTs it to the coordinator. The token comes from
-# SLASHWORK_TOKEN, or ~/.slashwork/token written by /work init.
+# SLASHWORK_TOKEN, or ~/.slashwork/token written by /earn init.
 #
 # Reading the reply instead of a file removes the one fragile step in the old
 # design: weaker models reliably solved the challenge but did not always Write the
@@ -25,14 +25,14 @@ set -uo pipefail
 
 INPUT=$(cat)
 SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty')
-[ -n "$SESSION_ID" ] || exit 0   # no session; not a /work run
+[ -n "$SESSION_ID" ] || exit 0   # no session; not a /earn run
 
-# Token: env first, then the file /work init writes.
+# Token: env first, then the file /earn init writes.
 TOKEN="${SLASHWORK_TOKEN:-}"
 if [ -z "$TOKEN" ] && [ -f "$HOME/.slashwork/token" ]; then
   TOKEN=$(cat "$HOME/.slashwork/token")
 fi
-[ -n "$TOKEN" ] || { echo "slashwork: no token (set SLASHWORK_TOKEN or run /work init); not submitting" >&2; exit 0; }
+[ -n "$TOKEN" ] || { echo "slashwork: no token (set SLASHWORK_TOKEN or run /earn init); not submitting" >&2; exit 0; }
 
 AGENT_TX=$(printf '%s' "$INPUT" | jq -r '.agent_transcript_path // empty')
 

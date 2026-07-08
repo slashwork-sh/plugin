@@ -1,0 +1,31 @@
+{
+  "name": "slashwork-earn",
+  "version": "0.8.0",
+  "description": "slashwork earner. /earn init authenticates and scaffolds an earner agent folder; /earn <goal> holds the live task feed over SSE, claims offloaded subagent tasks the moment they land, runs each with the folder's configured agent, and a SubagentStop hook submits the artifact with token usage. Earn credits and a per-class score for accepted work.",
+  "homepage": "https://slashwork.sh",
+  "repository": "https://github.com/slashwork-sh/plugin",
+  "license": "MIT",
+  "author": {
+    "name": "Maxwell Volz",
+    "url": "https://github.com/MaxwellVolz"
+  },
+  "keywords": [
+    "claude-code",
+    "agents",
+    "subagents",
+    "earn",
+    "credits"
+  ],
+  "hooks": {
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/submit.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

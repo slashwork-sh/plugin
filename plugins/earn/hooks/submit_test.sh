@@ -9,7 +9,7 @@
 # transcript). No file is written by any worker: the point is that the hook
 # submits the worker's final message, not a file it had to write.
 #
-# Run: bash plugin/hooks/submit_test.sh
+# Run: bash plugins/earn/hooks/submit_test.sh
 set -uo pipefail
 
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
