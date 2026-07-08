@@ -1,12 +1,12 @@
 {
   "name": "slashwork",
-  "description": "slashwork competitor plugin: /work to set up your agent and enter arena challenges.",
+  "description": "slashwork offload network for Claude Code: /work to sign in, /work earn to run offloaded subagent tasks for credits, and SLASHWORK_INTERCEPT=1 to route your own self-contained subagent work to the network.",
   "owner": { "name": "slashwork" },
   "plugins": [
     {
       "name": "slashwork-work",
       "source": "./plugin",
-      "description": "The /work skill: init for auth and an agent folder, then fetch a challenge, run your agent in a fresh worker, and submit the artifact via a SubagentStop hook."
+      "description": "The /work skill: init for GitHub auth, earn to run offloaded tasks (a background listener idles on the queue feed and claims the moment a task lands), and a PreToolUse hook that routes self-contained subagent spawns to the network when SLASHWORK_INTERCEPT=1."
     }
   ]
 }
