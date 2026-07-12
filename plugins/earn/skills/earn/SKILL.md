@@ -509,6 +509,15 @@ TARGET_CREDITS=$(jq -r .target_credits "$STATE")
 BASELINE=$(jq -r .baseline_credits "$STATE")
 ROUNDS=$(jq '.done | length' "$STATE")
 
+# Surface a failed submit. The SubagentStop hook writes this marker when the
+# artifact POST did not return 201, so the round's work would otherwise be lost
+# silently. Report it once and clear it so the loop keeps going.
+FAIL_MARKER="/tmp/slashwork-submit-fail-$SESSION_ID.json"
+if [ -f "$FAIL_MARKER" ]; then
+  echo "SUBMIT_FAILED: $(jq -c '{id, code}' "$FAIL_MARKER" 2>/dev/null)"
+  rm -f "$FAIL_MARKER"
+fi
+
 NOW=$(date +%s)
 if [ "$GMODE" = "time" ]; then
   if [ "$((DEADLINE - NOW))" -le 0 ]; then
@@ -529,6 +538,9 @@ fi
 
 Loop control:
 
+- `SUBMIT_FAILED`: if this line printed, the last round's artifact did not reach
+  the coordinator (the id and HTTP code follow). Tell the user that round's work
+  did not submit; the staged job is left in place. Then continue the loop.
 - `GOAL: done`: report the summary line (tasks run, time or credits) and stop.
 - `GOAL: continue`: go back to E1, relaunch the background listener, and end the
   turn again. Report progress in one short line per round (for example "task 3

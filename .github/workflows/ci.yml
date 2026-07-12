@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shellcheck plugin scripts
+        run: shellcheck plugins/work/hooks/*.sh plugins/earn/hooks/*.sh
+      - name: Submit hook integration test
+        run: bash plugins/earn/hooks/submit_test.sh
+      - name: Intercept hook integration test
+        run: bash plugins/work/hooks/intercept_test.sh
+      - name: Earn listener integration test
+        run: bash plugins/earn/hooks/earn-listen_test.sh
+      - name: Validate marketplace and plugin manifests
+        run: |
+          jq empty .claude-plugin/marketplace.json
+          jq empty plugins/work/.claude-plugin/plugin.json
+          jq empty plugins/earn/.claude-plugin/plugin.json

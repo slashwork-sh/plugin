@@ -50,6 +50,36 @@ class H(http.server.BaseHTTPRequestHandler):
             body = {"status":"returned","artifact":"OFFLOAD ARTIFACT: the answer.","tokens_used":123}
         elif m == "returned-multiline":
             body = {"status":"returned","artifact":"LINE ONE of the report\nLINE TWO details\nLINE THREE conclusion","tokens_used":200}
+        elif m == "review-then-return":
+            # First poll: the gate is running (reviewing). Next poll: accepted.
+            # Proves the hook waits through review instead of cancelling local.
+            import os
+            flip = logf + ".flip"
+            if not os.path.exists(flip):
+                open(flip, "w").write("1"); body = {"status":"reviewing"}
+            else:
+                body = {"status":"returned","artifact":"GRACE ARTIFACT: accepted late.","tokens_used":77}
+        elif m == "claim-then-die":
+            # First poll: claimed. Then the coordinator dies (500) mid-wait, so
+            # the hook must cancel and fall back local rather than hang.
+            import os
+            flip = logf + ".flip"
+            if not os.path.exists(flip):
+                open(flip, "w").write("1"); body = {"status":"claimed"}
+            else:
+                self.send_response(500); self.end_headers(); self.wfile.write(b'{"error":"down"}'); return
+        elif m == "review-then-expire":
+            # Reviewing for the first few polls, then expired: exercises the
+            # deadline grace loop ending in a local fallback, not a stale emit.
+            import os
+            ctrf = logf + ".ctr"
+            try:
+                c = int(open(ctrf).read().strip())
+            except Exception:
+                c = 0
+            c += 1
+            open(ctrf, "w").write(str(c))
+            body = {"status":"reviewing"} if c <= 3 else {"status":"expired"}
         elif m == "claimed":
             body = {"status":"claimed"}
         else:  # cold: nobody claims
@@ -69,7 +99,7 @@ PY
   sleep 0.6
 }
 stop_mock() { kill "$MOCK" 2>/dev/null || true; }
-trap 'stop_mock; rm -f "$LOG" "$MODEFILE" /tmp/slashwork-intercept-consent-*' EXIT
+trap 'stop_mock; rm -f "$LOG" "$LOG.flip" "$LOG.ctr" "$MODEFILE" /tmp/slashwork-intercept-consent-*' EXIT
 start_mock
 
 # A fixed session id whose consent marker the routing scenarios pre-create, so
@@ -103,6 +133,21 @@ printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep
   || fail "deny reason must mark the artifact untrusted" "$OUT"
 grep -q "POST /api/tasks" "$LOG" || fail "should have POSTed the task" "$(cat "$LOG")"
 ok "routable task returns -> deny with untrusted artifact"
+
+# 1b. Reviewing (the gate is running) must keep waiting, not cancel to local;
+#     when the gate accepts inside the grace, the artifact is emitted. This
+#     guards the double-charge path: cancelling here while an accept can still
+#     pay the earner would charge the requester credits AND run local.
+printf review-then-return > "$MODEFILE"; : > "$LOG"; rm -f "$LOG.flip"
+: > "/tmp/slashwork-intercept-consent-$SESS"
+OUT=$(envelope "Research and compare the options; pros and cons of each." \
+  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+DEC=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
+[ "$DEC" = "deny" ] || fail "reviewing then accepted should deny local and emit the artifact" "$OUT"
+printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -q "GRACE ARTIFACT" \
+  || fail "should emit the accepted artifact after review" "$OUT"
+if grep -q "DELETE /api/tasks/" "$LOG"; then fail "must NOT cancel while reviewing (would double-charge)" "$(cat "$LOG")"; fi
+ok "reviewing keeps waiting -> emits accepted artifact, no cancel"
 
 # 2. Cold pool: nobody claims within the window -> cancel + local spawn.
 run cold "Draft a report summarizing the quarterly numbers below: revenue up, costs flat."
@@ -203,13 +248,49 @@ OUT=$(envelope "Research and compare the options; pros and cons of each." \
   || fail "unset must intercept (interception is default-on)" "$OUT"
 ok "SLASHWORK_INTERCEPT unset -> intercepts (default-on)"
 
-# 13. Opt-out: SLASHWORK_INTERCEPT=0 -> total no-op, nothing sent.
+# 13. Opt-out: SLASHWORK_INTERCEPT=0 -> total no-op, nothing sent. The hook
+#     exits at the opt-out gate BEFORE reading stdin, so a piped producer (jq in
+#     envelope) would get SIGPIPE and, under `set -o pipefail`, fail the whole
+#     pipeline spuriously. Feed the envelope as a here-string so there is no
+#     upstream producer to break.
 : > "$LOG"; printf returned > "$MODEFILE"
-OUT=$(envelope "Research and compare the options." \
-  | SLASHWORK_INTERCEPT=0 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+ENV_OPTOUT=$(envelope "Research and compare the options.")
+OUT=$(SLASHWORK_INTERCEPT=0 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" \
+  bash "$INTERCEPT" 2>/dev/null <<< "$ENV_OPTOUT")
 RC=$?
 if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "opted out must be a no-op" "$OUT"; fi
 [ ! -s "$LOG" ] || fail "opted out must not contact the coordinator" "$(cat "$LOG")"
 ok "SLASHWORK_INTERCEPT=0 -> no-op"
+
+# 14. Non-https base -> decline before any network (the token must not leave for
+#     an arbitrary host). The base check runs before the classifier, so even a
+#     routable prompt is declined.
+: > "$LOG"; printf returned > "$MODEFILE"; : > "/tmp/slashwork-intercept-consent-$SESS"
+OUT=$(envelope "Research and compare the options; pros and cons of each." \
+  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="http://evil.example" bash "$INTERCEPT" 2>/dev/null)
+RC=$?
+if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "non-https base must decline to local" "$OUT"; fi
+[ ! -s "$LOG" ] || fail "non-https base must not contact any coordinator" "$(cat "$LOG")"
+ok "non-https base -> declined, no network"
+
+# 15. Coordinator dies after the claim: the next poll errors (500) mid-wait, so
+#     the hook cancels (refund) and falls back local instead of hanging.
+printf claim-then-die > "$MODEFILE"; : > "$LOG"; rm -f "$LOG.flip"; : > "/tmp/slashwork-intercept-consent-$SESS"
+OUT=$(envelope "Research and compare the options; pros and cons of each." \
+  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+RC=$?
+if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "a dying coordinator must fall back to local" "$OUT"; fi
+grep -q "DELETE /api/tasks/" "$LOG" || fail "should cancel the task when the poll errors" "$(cat "$LOG")"
+ok "coordinator dies after claim -> cancel + local, no hang"
+
+# 16. Reviewing then expired (the gate rejected within the grace): the hook rides
+#     the grace poll loop, then falls back local, never emitting a stale artifact.
+printf review-then-expire > "$MODEFILE"; : > "$LOG"; rm -f "$LOG.ctr"; : > "/tmp/slashwork-intercept-consent-$SESS"
+OUT=$(envelope "Research and compare the options; pros and cons of each." \
+  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+RC=$?
+if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "reviewing that expires must fall back to local" "$OUT"; fi
+grep -q "DELETE /api/tasks/" "$LOG" || fail "should cancel after the grace loop ends expired" "$(cat "$LOG")"
+ok "reviewing then expired -> local fallback after the grace loop"
 
 echo "ALL PASS ($PASS scenarios)"

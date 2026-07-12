@@ -132,10 +132,14 @@ while :; do
             write_marker "$(jq -nc --arg id "$TID" --arg job "$JOB" \
               '{status:"claimed", id:$id, job:$job}')"
             exit 0 ;;
-          401|403)
+          401)
             write_marker '{"status":"auth_failed"}'
             exit 0 ;;
-          *) : ;;   # 409 lost the race, 5xx transient: keep listening
+          # 403 on a claim is not a dead token: post_claim only returns it when
+          # the score gate refuses THIS large task to an unproven earner. Skip it
+          # like a lost race and keep listening; killing the session here would
+          # tell a fresh earner to reauth over a per-task routing refusal.
+          *) : ;;   # 403 gated, 409 lost the race, 5xx transient: keep listening
         esac
         ;;
     esac

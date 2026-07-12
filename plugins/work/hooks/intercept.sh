@@ -214,14 +214,17 @@ emit_result() { # deny the local spawn and hand back the artifact from $POLL_BOD
 # an empty queue. Any non-claim outcome cancels (refund) and falls back local.
 STATUS=$(poll "$CLAIM_WINDOW")
 case "$STATUS" in
-  returned) emit_result ;;
-  claimed)  : ;;  # an earner has it; wait out the deadline below
-  *)        cancel_and_local "no earner claimed within ${CLAIM_WINDOW}s (status: $STATUS)" ;;
+  returned)          emit_result ;;
+  claimed|reviewing) : ;;  # an earner has it; wait it out below
+  *)                 cancel_and_local "no earner claimed within ${CLAIM_WINDOW}s (status: $STATUS)" ;;
 esac
 
 # Claimed: wait for the artifact up to the task deadline or the hard wall-clock
-# cap, whichever comes first. A returned artifact wins; anything else cancels
-# and runs local so the offloader is refunded and never left hanging.
+# cap, whichever comes first. A returned artifact wins; `reviewing` means the
+# earner submitted and the acceptance gate is running, so keep waiting (bailing
+# to local here while the gate can still accept and pay would charge the user
+# twice). Anything else cancels and runs local so the offloader is refunded and
+# never left hanging.
 WAITED=$CLAIM_WINDOW
 while [ "$WAITED" -lt "$DEADLINE_SECS" ]; do
   [ "$(( $(date +%s) - DISPATCH_START ))" -lt "$HARD_CAP" ] || cancel_and_local "hit the wall-clock guard"
@@ -229,9 +232,23 @@ while [ "$WAITED" -lt "$DEADLINE_SECS" ]; do
   STATUS=$(poll "$CHUNK")
   WAITED=$(( WAITED + CHUNK ))
   case "$STATUS" in
-    returned) emit_result ;;
-    claimed)  : ;;  # still running; keep waiting
-    *)        cancel_and_local "task did not return (status: $STATUS)" ;;
+    returned)          emit_result ;;
+    claimed|reviewing) : ;;  # still running / in the gate; keep waiting
+    *)                 cancel_and_local "task did not return (status: $STATUS)" ;;
+  esac
+done
+
+# Deadline reached. A task still `reviewing` had its artifact submitted in time
+# and the gate is finishing; the coordinator keeps it acceptable for a short
+# grace past the deadline (and reports `reviewing` until then), so keep polling
+# so an accept in the grace returns the artifact here instead of losing it to a
+# local run. Bounded by the hard wall-clock cap.
+while [ "$STATUS" = "reviewing" ] && [ "$(( $(date +%s) - DISPATCH_START ))" -lt "$HARD_CAP" ]; do
+  STATUS=$(poll 10)
+  case "$STATUS" in
+    returned)  emit_result ;;
+    reviewing) : ;;   # gate still running; keep waiting through the grace
+    *)         break ;;  # expired or gone: fall back local below
   esac
 done
 cancel_and_local "no artifact returned before the deadline"
