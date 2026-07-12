@@ -49,10 +49,20 @@ class H(http.server.BaseHTTPRequestHandler):
         # /api/queue/stream: announce one queued task, then hold ~1s and close.
         self.send_response(200)
         self.send_header("content-type", "text/event-stream"); self.end_headers()
-        if mode() != "none":
-            self.wfile.write(("event: task\r\ndata: " + json.dumps({"id": tid, "class": "prose", "cost": 30}) + "\r\n\r\n").encode())
-            try: self.wfile.flush()
+        def send(raw):
+            try:
+                self.wfile.write(raw.encode()); self.wfile.flush()
             except Exception: pass
+        m = mode()
+        valid = "event: task\r\ndata: " + json.dumps({"id": tid, "class": "prose", "cost": 30}) + "\r\n\r\n"
+        if m == "malformed-then-valid":
+            # Non-JSON data, then a well-formed frame with a non-UUID id, then the
+            # real task. The listener must skip the first two and claim the third.
+            send("event: task\r\ndata: this is not json\r\n\r\n")
+            send("event: task\r\ndata: " + json.dumps({"id": "not-a-uuid", "class": "prose"}) + "\r\n\r\n")
+            send(valid)
+        elif m != "none":
+            send(valid)
         time.sleep(1.0)
     def do_POST(self):
         n = int(self.headers.get('content-length', 0)); self.rfile.read(n)
@@ -62,6 +72,11 @@ class H(http.server.BaseHTTPRequestHandler):
         if m == "win-after-lost":
             open(modef, "w").write("win")   # next claim wins
             self.send_response(409); self.end_headers(); self.wfile.write(b'{}'); return
+        if m == "gate-then-win":
+            open(modef, "w").write("win")   # next claim wins
+            # 403: the score gate refused this large task. Must not kill the
+            # session; the listener should skip and claim a later task.
+            self.send_response(403); self.end_headers(); self.wfile.write(b'{}'); return
         self.send_response(200); self.send_header("content-type","application/json"); self.end_headers()
         self.wfile.write(json.dumps({"task_id": tid, "class":"prose", "prompt":"draft it", "context_bundle":"", "cost":30, "deadline":"2099-01-01T00:00:00Z"}).encode())
     def log_message(self, *a): pass
@@ -105,6 +120,19 @@ ok "reports a rejected token via the probe"
 printf win-after-lost > "$MODEFILE"; write_state "$(( $(date +%s) + 60 ))"; run_listener
 [ "$(jq -r .status "$MARKER")" = "claimed" ] || fail "expected claim after a lost race" "$(cat "$MARKER")"
 ok "keeps listening past a lost claim and wins the next"
+
+# 4b. Score gate refuses a large task (403): the listener must NOT report
+#     auth_failed. It skips like a lost race and claims a later task.
+printf gate-then-win > "$MODEFILE"; write_state "$(( $(date +%s) + 60 ))"; run_listener
+[ "$(jq -r .status "$MARKER")" = "claimed" ] || fail "a gated 403 must not kill the session" "$(cat "$MARKER")"
+ok "treats a score-gate 403 as skip-and-keep-listening, not auth_failed"
+
+# 4c. Malformed SSE frames (non-JSON data, non-UUID id) are skipped without
+#     crashing the reader, and a following valid task is still claimed.
+printf malformed-then-valid > "$MODEFILE"; write_state "$(( $(date +%s) + 60 ))"; run_listener
+[ "$(jq -r .status "$MARKER")" = "claimed" ] || fail "malformed frames must not break the reader" "$(cat "$MARKER")"
+[ "$(jq -r .id "$MARKER")" = "$TASK_ID" ] || fail "should claim the valid task after malformed frames" "$(cat "$MARKER")"
+ok "skips malformed SSE frames and claims the valid task"
 
 # 5. Coordinator unreachable (closed port): must back off, not busy-spin, and
 #    reach budget_spent. A ~4s budget should take at least one backoff sleep

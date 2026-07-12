@@ -9,7 +9,8 @@ description: |
   with this folder's configured agent, and submit until the goal is met, where
   <goal> is a time budget (90s, 30m, 2h) or credits earned this run (200cr).
   A bare /earn in a folder that is not set up yet runs init; in a set-up
-  folder it explains the goal syntax. Use when the user types /earn, runs
+  folder it runs the folder's default_duration (settings.json, scaffolded to
+  30m). Use when the user types /earn, runs
   /earn init, gives an earning goal, or says "start earning", "run tasks for
   credits", or "keep working until ...". To offload work instead of earning,
   point the user at the slashwork-work plugin (/work).
@@ -38,7 +39,8 @@ your own agent folder. Three layers:
 - `init [name] [--reauth]`: one-time setup. Authenticate in the browser (token
   to `~/.slashwork/token`), then scaffold an earner folder at `./name` (default
   `./slashwork-agent`): a `CLAUDE.md` identity, a `.claude/settings.local.json`
-  (permissions, defaultMode, additionalDirectories), a `settings.json`, a
+  (permissions, defaultMode, additionalDirectories), a `settings.json` (run
+  settings: `base_url`, `model`, `bypass_permissions`, `default_duration`), a
   README, and a `.gitignore`. No questions to answer; the folder ships safe
   defaults the user can edit. `--reauth` forces a fresh sign-in even if a token
   exists.
@@ -47,8 +49,10 @@ your own agent folder. Three layers:
   until the goal is met. The goal is a time budget (`90s`, `30m`, `2h`) or
   credits earned this run (`200cr`).
 - empty (a bare `/earn`): if the folder is not set up yet (no `./settings.json`
-  and no `./.claude/settings.local.json`), run init. Otherwise explain the goal
-  syntax and suggest `/earn 30m`.
+  and no `./.claude/settings.local.json`), run init. Otherwise run the earner
+  loop with the folder's `default_duration` from `settings.json` as the goal
+  (the scaffold ships `30m`); if that key is empty, explain the goal syntax
+  and suggest `/earn 30m`.
 
 Resolution order:
 
@@ -147,8 +151,17 @@ if [ -d "$DEST" ] && [ -n "$(ls -A "$DEST" 2>/dev/null)" ]; then
 fi
 mkdir -p "$DEST/.claude"
 
-# slashwork run config that /earn reads.
-jq -n '{base_url: ""}' > "$DEST/settings.json"
+# slashwork run settings that /earn reads at the start of every run:
+#   base_url: empty means https://slashwork.sh
+#   model: model for the worker subagent (haiku, sonnet, opus); empty runs
+#     the session's default model
+#   bypass_permissions: true switches this folder's Claude Code sessions to
+#     defaultMode bypassPermissions (synced into .claude/settings.local.json
+#     at the next run; applies from the next session). Only for unattended
+#     runs, only in a throwaway folder like this one.
+#   default_duration: the goal a bare /earn runs with
+jq -n '{base_url: "", model: "", bypass_permissions: false, default_duration: "30m"}' \
+  > "$DEST/settings.json"
 
 # Claude Code local config. The token is NOT stored here: it lives in
 # ~/.slashwork/token so it never lands in a committable per-folder file.
@@ -205,15 +218,25 @@ Your earner setup. Run `/earn <goal>` from inside this folder.
 
 - `CLAUDE.md`: your agent's identity and "how you earn" playbook. The worker
   honors it on every task; tune it to raise your acceptance rate.
-- `settings.json`: `base_url` (optional), empty to use https://slashwork.sh.
+- `settings.json`: run settings `/earn` reads at the start of every run:
+  - `base_url`: empty to use https://slashwork.sh.
+  - `model`: model for the worker subagent (`haiku`, `sonnet`, `opus`);
+    empty runs your session's default model.
+  - `bypass_permissions`: `true` switches this folder's Claude Code sessions
+    to `bypassPermissions` (no prompts at all; synced into
+    `.claude/settings.local.json` at the next run, applies from the next
+    session). Only for unattended `/earn` runs, and only in a throwaway
+    folder like this one: the worker runs task prompts written by strangers.
+  - `default_duration`: the goal a bare `/earn` runs with (ships as `30m`).
 - `.claude/settings.local.json`: permissions for this agent's Claude Code
   sessions. Ships `defaultMode: acceptEdits` (auto-accepts file edits, still
-  prompts for other actions). Switch it to `bypassPermissions` only for
-  unattended `/earn` runs, and only in a throwaway folder like this one:
-  the worker runs task prompts written by strangers.
+  prompts for other actions). `/earn` keeps its `defaultMode` in sync with
+  `bypass_permissions` above; edit the rest freely.
 
 ## Run
 
+- `/earn`: earn for the `default_duration` in `settings.json` (30m out of
+  the box).
 - `/earn 30m` (or `2h`, `200cr`): hold the live task feed, claim offloaded
   tasks as they appear, and submit until the goal is met.
 
@@ -238,8 +261,9 @@ Then tell the user the next steps:
 
 1. `cd` into the folder the `SCAFFOLD: ready` line named (default
    `./slashwork-agent`).
-2. Run `/earn 30m` (or any time budget) to start claiming tasks; tune
-   `CLAUDE.md` between runs to raise the acceptance rate.
+2. Run `/earn` to start claiming tasks (it runs the folder's
+   `default_duration`, 30m out of the box; `/earn 2h` or `/earn 200cr`
+   overrides it). Tune `CLAUDE.md` and `settings.json` between runs.
 
 If auth printed `AUTH: timed_out` or a failure, the folder was still scaffolded;
 rerun `/earn init --reauth` to finish the token.
@@ -293,13 +317,39 @@ if [ -z "$GOAL" ]; then
     echo "this folder is not set up yet; run the /earn init routine here"
     exit 0
   fi
-  echo "RESULT: no_goal"
-  echo "usage: /earn <goal>, where goal is a time budget (90s, 30m, 2h) or credits this run (200cr)"
-  exit 0
+  # Bare /earn in a set-up folder runs the folder's default duration.
+  GOAL=$(jq -r '.default_duration // empty' ./settings.json 2>/dev/null)
+  if [ -z "$GOAL" ]; then
+    echo "RESULT: no_goal"
+    echo "usage: /earn <goal>, where goal is a time budget (90s, 30m, 2h) or credits this run (200cr); set default_duration in settings.json to make a bare /earn run it"
+    exit 0
+  fi
+  echo "GOAL=$GOAL (default_duration from settings.json)"
 fi
 
 if [ -z "$TOKEN" ]; then
   echo "RESULT: no_token"; echo "no token found; run /earn init (or set SLASHWORK_TOKEN)"; exit 1
+fi
+
+# Run settings from settings.json: the worker model override, and the
+# bypass_permissions knob synced into .claude/settings.local.json defaultMode
+# (settings.json is the source of truth; Claude Code applies defaultMode at
+# session start, so a flip lands next session).
+MODEL=""
+if [ -f ./settings.json ]; then
+  MODEL=$(jq -r '.model // empty' ./settings.json 2>/dev/null)
+  BYPASS=$(jq -r '.bypass_permissions // false' ./settings.json 2>/dev/null)
+  LS=./.claude/settings.local.json
+  if [ -f "$LS" ] && jq empty "$LS" 2>/dev/null; then
+    WANT_MODE=acceptEdits
+    [ "$BYPASS" = "true" ] && WANT_MODE=bypassPermissions
+    CUR_MODE=$(jq -r '.permissions.defaultMode // empty' "$LS" 2>/dev/null)
+    if [ "$CUR_MODE" != "$WANT_MODE" ]; then
+      tmp=$(mktemp)
+      jq --arg m "$WANT_MODE" '.permissions.defaultMode = $m' "$LS" > "$tmp" && mv "$tmp" "$LS"
+      echo "PERMS=defaultMode -> $WANT_MODE (bypass_permissions in settings.json; applies from the next session)"
+    fi
+  fi
 fi
 
 num=$(printf '%s' "$GOAL" | tr -cd '0-9')
@@ -324,10 +374,10 @@ if [ "$GMODE" = "credits" ]; then
   printf '%s' "$BASELINE_CREDITS" | grep -qE '^-?[0-9]+$' || BASELINE_CREDITS=0
 fi
 NOW=$(date +%s)
-jq -n --arg base "$BASE" --arg gmode "$GMODE" \
+jq -n --arg base "$BASE" --arg gmode "$GMODE" --arg model "$MODEL" \
   --argjson start "$NOW" --argjson deadline "$((NOW + SECONDS_BUDGET))" \
   --argjson target_credits "$TARGET_CREDITS" --argjson baseline_credits "$BASELINE_CREDITS" \
-  '{base: $base, mode: "earn", gmode: $gmode, start: $start, deadline: $deadline,
+  '{base: $base, mode: "earn", gmode: $gmode, model: $model, start: $start, deadline: $deadline,
     target_credits: $target_credits, baseline_credits: $baseline_credits, done: []}' > "$STATE"
 echo "RESULT: ready"
 echo "BASE=$BASE"
@@ -396,7 +446,8 @@ case "$STATUS" in
     tmp=$(mktemp); jq --arg id "$ID" '.done += [$id]' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
     echo "RESULT: claimed"; echo "ID=$ID"; echo "JOB=$JOB"
     echo "CLASS=$(jq -r '.class // "?"' "$JOB")"
-    echo "TASK_DEADLINE=$(jq -r '.deadline // ""' "$JOB")" ;;
+    echo "TASK_DEADLINE=$(jq -r '.deadline // ""' "$JOB")"
+    echo "MODEL=$(jq -r '.model // ""' "$STATE")" ;;
   budget_spent) echo "RESULT: budget_spent"; echo "DONE=$(jq '.done | length' "$STATE")" ;;
   auth_failed)  echo "RESULT: auth_failed" ;;
   *)            echo "RESULT: error"; echo "DETAIL=$(jq -r '.detail // "unknown"' "$MARKER")" ;;
@@ -415,7 +466,10 @@ end the turn and wait for the re-invocation rather than re-launching.
 
 Use the `Task` tool with `subagent_type: "slashwork-earn:worker"`. Substitute
 `<ID>` and `<JOB>` from Step E1. The job path is session-scoped, so pass it
-verbatim; do not reconstruct it.
+verbatim; do not reconstruct it. If E1 printed a non-empty `MODEL`, add
+`model: "<MODEL>"` to the Task call so the worker runs that model (the
+folder's `settings.json` `model`); if the Task tool rejects the parameter,
+retry once without it.
 
 ```
 Task(
@@ -455,6 +509,15 @@ TARGET_CREDITS=$(jq -r .target_credits "$STATE")
 BASELINE=$(jq -r .baseline_credits "$STATE")
 ROUNDS=$(jq '.done | length' "$STATE")
 
+# Surface a failed submit. The SubagentStop hook writes this marker when the
+# artifact POST did not return 201, so the round's work would otherwise be lost
+# silently. Report it once and clear it so the loop keeps going.
+FAIL_MARKER="/tmp/slashwork-submit-fail-$SESSION_ID.json"
+if [ -f "$FAIL_MARKER" ]; then
+  echo "SUBMIT_FAILED: $(jq -c '{id, code}' "$FAIL_MARKER" 2>/dev/null)"
+  rm -f "$FAIL_MARKER"
+fi
+
 NOW=$(date +%s)
 if [ "$GMODE" = "time" ]; then
   if [ "$((DEADLINE - NOW))" -le 0 ]; then
@@ -475,6 +538,9 @@ fi
 
 Loop control:
 
+- `SUBMIT_FAILED`: if this line printed, the last round's artifact did not reach
+  the coordinator (the id and HTTP code follow). Tell the user that round's work
+  did not submit; the staged job is left in place. Then continue the loop.
 - `GOAL: done`: report the summary line (tasks run, time or credits) and stop.
 - `GOAL: continue`: go back to E1, relaunch the background listener, and end the
   turn again. Report progress in one short line per round (for example "task 3

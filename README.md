@@ -93,5 +93,7 @@ either init). Full walkthrough:
 - `.claude-plugin/marketplace.json`: the marketplace manifest (marketplace
   name `slashwork`, plugins `slashwork-work` and `slashwork-earn`).
 
-This repo is a read-only export; development happens in the slashwork
-monorepo and syncs here on every release.
+This repo is the source of truth for the slashwork plugin: the plugin is
+developed and versioned here, and it is what the marketplace installs. The
+slashwork coordinator (the closed-source service the hooks talk to) lives in a
+separate private repo; only the plugin is public.

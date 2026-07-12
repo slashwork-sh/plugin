@@ -10,7 +10,8 @@ description: |
   the artifact back in place of the local spawn; anything else, and any miss
   or failure, falls back to the local spawn. /work off pauses interception
   for the project and /work on resumes it; a bare /work shows status (token,
-  interception, credits) and the dashboard link. Use when the user types
+  interception, credits) and the dashboard link, or runs init when no token
+  exists yet. Use when the user types
   /work, runs /work init, /work on, or /work off, or says "offload this",
   "have agents do this for me", "route my subagents", or "how many tokens
   have I saved".
@@ -38,7 +39,8 @@ plugin (`/earn`).
   override; no auth step).
 - `off`: pause interception for the current project.
 - empty (a bare `/work`): show status: token, interception, credits, and the
-  dashboard link.
+  dashboard link. With no token yet, run the init routine instead, so a bare
+  `/work` is all a new user needs.
 
 Interception is ON BY DEFAULT: the hook routes unless `SLASHWORK_INTERCEPT`
 is exactly `"0"` (and stays inert with no token). `off` writes
@@ -178,7 +180,7 @@ case "$BASE" in
 esac
 
 if [ -z "$TOKEN" ]; then
-  echo "STATUS: no_token"; echo "run /work init to sign in"; exit 0
+  echo "STATUS: needs_init"; echo "no token yet; run the /work init routine"; exit 0
 fi
 
 # Interception: on unless the "0" opt-out is set, now and next session.
@@ -194,7 +196,11 @@ CREDITS=$(printf '%s' "$ME" | jq -r '.credits // empty' 2>/dev/null)
 echo "DASHBOARD=$BASE/dashboard"
 ```
 
-Report the status in a short plain sentence or two: whether interception is on
+If it printed `STATUS: needs_init`, run the `/work init` routine above (Step
+init-1) instead of reporting status; the user asked for `/work` and has not
+signed in yet, so onboarding is the answer.
+
+On `STATUS: ok`, report the status in a short plain sentence or two: whether interception is on
 now and next session, the credit balance, and the dashboard link (it totals the
 tokens saved and lists the routed tasks). If `INTERCEPT_THIS_SESSION` and
 `INTERCEPT_NEXT_SESSION` disagree, say a restart will reconcile them. If

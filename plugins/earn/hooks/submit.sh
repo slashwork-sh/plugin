@@ -60,7 +60,25 @@ if [ -n "$AGENT_TX" ] && [ -f "$AGENT_TX" ]; then
   ' "$AGENT_TX" 2>/dev/null)
 fi
 ID=$(printf '%s' "$FIRST_MSG" | sed -n 's/.*task_id:[[:space:]]*\([0-9a-fA-F-]\{36\}\).*/\1/p' | head -n1)
-[ -n "$ID" ] || { echo "slashwork: no task id in subagent prompt; not a slashwork run" >&2; exit 0; }
+
+# Fallback when the prompt carried no task_id: the subagent transcript was
+# missing or unreadable (some harness versions do not pass agent_transcript_path,
+# and the envelope's last_assistant_message alone does not name the task). In an
+# /earn run the session's only subagent is the worker, and a staged job exists
+# only because THIS session claimed a task, so if exactly one job is staged for
+# this session it is this worker's task. Zero or several: stay safe and submit
+# nothing, so a bare non-worker subagent never has its final message posted.
+if [ -z "$ID" ]; then
+  STAGED=()
+  while IFS= read -r f; do STAGED+=("$f"); done < <(
+    ls -1 "/tmp/slashwork-job-${SESSION_ID}-"*.json 2>/dev/null)
+  if [ "${#STAGED[@]}" -eq 1 ]; then
+    ID=$(basename "${STAGED[0]}" \
+      | sed -n "s/^slashwork-job-${SESSION_ID}-\([0-9a-fA-F-]\{36\}\)\.json\$/\1/p")
+    [ -n "$ID" ] && echo "slashwork: no task_id in prompt; recovered $ID from the single staged job for this session" >&2
+  fi
+fi
+[ -n "$ID" ] || { echo "slashwork: no task id and no single staged job for this session; not submitting" >&2; exit 0; }
 
 STAGE="/tmp/slashwork-job-${SESSION_ID}-${ID}.json"
 [ -f "$STAGE" ] || { echo "slashwork: no staged job for $ID; not submitting" >&2; exit 0; }
@@ -112,9 +130,20 @@ CODE=$(printf '%s' "$BODYJSON" \
       --data-binary @- || echo "000")
 
 echo "slashwork: submit task $ID -> HTTP $CODE" >&2
+FAIL_MARKER="/tmp/slashwork-submit-fail-${SESSION_ID}.json"
 if [ "$CODE" = "201" ]; then
-  echo "slashwork: task returned to its requester" >&2
-  rm -f "$STAGE" "$OUT"
+  # 201 means the artifact was accepted for review (status 'reviewing'); the
+  # acceptance gate runs async and decides accept/requeue/reject, so it is not
+  # yet 'returned' to the requester. Say what actually happened.
+  echo "slashwork: artifact submitted; the acceptance gate is now judging it" >&2
+  rm -f "$STAGE" "$OUT" "$FAIL_MARKER"
+else
+  # A non-201 leaves the staged job in place and records a durable marker so the
+  # loss is visible to the /earn loop instead of vanishing into this hook's
+  # stderr: the worker did the work but nothing reached the requester.
+  DETAIL=$(head -c 300 "$OUT" 2>/dev/null | tr -d '\000')
+  jq -nc --arg id "$ID" --arg code "$CODE" --arg detail "$DETAIL" \
+    '{id:$id, code:$code, detail:$detail}' > "$FAIL_MARKER" 2>/dev/null || true
+  echo "slashwork: submit failed (HTTP $CODE); left a marker at $FAIL_MARKER" >&2
 fi
-# A non-201 leaves the staged job in place; the next round's check can see it.
 exit 0

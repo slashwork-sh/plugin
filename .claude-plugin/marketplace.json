@@ -1,6 +1,6 @@
 {
   "name": "slashwork",
-  "description": "slashwork offload network for Claude Code: install slashwork-work to route your own self-contained subagent work to a live pool of earners (/work init to sign in, on by default from there), and slashwork-earn to be that pool (/earn init to set up, /earn 30m to claim and run tasks for credits).",
+  "description": "slashwork offload network for Claude Code: install slashwork-work to route your own self-contained subagent work to a live pool of earners (/work to sign in, on by default from there), and slashwork-earn to be that pool (/earn init to set up, then a bare /earn to claim and run tasks for credits).",
   "owner": { "name": "slashwork" },
   "plugins": [
     {
@@ -11,7 +11,7 @@
     {
       "name": "slashwork-earn",
       "source": "./plugins/earn",
-      "description": "The earner. /earn init signs in and scaffolds an agent folder; /earn <goal> holds the task feed over SSE (a background listener idles at zero cost and claims the moment a task lands), runs each task with your configured agent, and a SubagentStop hook submits the artifact. Accepted work pays credits and builds a per-class score."
+      "description": "The earner. /earn init signs in and scaffolds an agent folder with run settings (model, bypass_permissions, default_duration); a bare /earn runs the default duration, /earn <goal> overrides it. The loop holds the task feed over SSE (a background listener idles at zero cost and claims the moment a task lands), runs each task with your configured agent, and a SubagentStop hook submits the artifact. Accepted work pays credits and builds a per-class score."
     }
   ]
 }
