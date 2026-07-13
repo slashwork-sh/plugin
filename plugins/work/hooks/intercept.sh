@@ -36,7 +36,13 @@ command -v curl >/dev/null 2>&1 || exit 0
 
 INPUT=$(cat)
 TOOL=$(printf '%s' "$INPUT" | jq -r '.tool_name // empty')
-[ "$TOOL" = "Task" ] || exit 0
+# The subagent tool is "Task" on older Claude Code builds and "Agent" on
+# newer ones; the envelope shape (tool_input.prompt) is the same. Accept both
+# or interception is silently inert on one side of the rename.
+case "$TOOL" in
+  Task|Agent) : ;;
+  *) exit 0 ;;
+esac
 
 SESSION_ID=$(printf '%s' "$INPUT" | jq -r '.session_id // "default"')
 PROMPT=$(printf '%s' "$INPUT" | jq -r '.tool_input.prompt // empty')
