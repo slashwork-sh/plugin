@@ -131,14 +131,18 @@ printf '%s' "$LP" | grep -qE '\b(write|implement|generate) (a|an) (function|scri
 [ "$MATCHES" -eq 1 ] || decline "no single confident class (matched $MATCHES)"
 
 # Deadline the parent will wait, by class. The parent session blocks up to this
-# long, same as it would have blocked on the local subagent. Kept well under the
-# 120s manifest hook timeout: worst-case wall time is POST(15) + claim(10) +
-# two poll chunks, so DEADLINE stays <=75 and the total stays near 105s.
+# long, same as it would have blocked on the local subagent (a local research
+# spawn routinely runs two minutes plus, so waiting a comparable window for the
+# network costs nothing when it succeeds). Sized to the measured earner
+# pipeline: claim under 1s, ~25s of session wake and worker spawn, then
+# generation; the old 75s ceiling expired real tasks whose artifacts were
+# seconds away. Kept under HARD_CAP below, which stays under the manifest
+# timeout, so the hook always gets to cancel before it is killed.
 case "$CLASS" in
-  research) DEADLINE_SECS=75 ;;
-  prose|codegen) DEADLINE_SECS=55 ;;
-  review) DEADLINE_SECS=40 ;;
-  *) DEADLINE_SECS=55 ;;
+  research) DEADLINE_SECS=150 ;;
+  prose|codegen) DEADLINE_SECS=90 ;;
+  review) DEADLINE_SECS=60 ;;
+  *) DEADLINE_SECS=90 ;;
 esac
 CLAIM_WINDOW=5
 
@@ -176,9 +180,10 @@ TASK_ID=$(printf '%s' "$RBODY" | jq -r '.task_id // empty')
 printf '%s' "$TASK_ID" | grep -qE '^[0-9a-fA-F-]{36}$' || decline "no task id from coordinator"
 
 # Hard wall-clock guard: never let the hook run past this, whatever curl does,
-# so it stays under the 120s manifest timeout (a killed hook cannot cancel).
+# so it stays under the 240s manifest timeout (a killed hook cannot cancel).
+# Covers the longest class (150s) plus the 15s review grace plus poll slack.
 DISPATCH_START=$(date +%s)
-HARD_CAP=105
+HARD_CAP=200
 
 cancel() {
   curl -sS --max-time 8 -X DELETE "$BASE/api/tasks/$TASK_ID" \
@@ -190,7 +195,7 @@ cancel_and_local() { cancel; decline "$1"; }
 # status word. The artifact is extracted separately from $POLL_BODY, so a
 # multi-line or tab-bearing artifact is never truncated (the whole point).
 POLL_BODY="/tmp/slashwork-intercept-body-$$.json"
-poll() { # $1 = wait_secs; echoes status; body in $POLL_BODY
+poll_once() { # $1 = wait_secs; echoes status; body in $POLL_BODY
   local r code
   r=$(curl -sS --max-time $(( $1 + 5 )) -w $'\n%{http_code}' \
     "$BASE/api/tasks/$TASK_ID/result?wait_secs=$1" \
@@ -202,6 +207,17 @@ poll() { # $1 = wait_secs; echoes status; body in $POLL_BODY
   else
     echo error
   fi
+}
+poll() { # poll_once, retrying a single transport error before giving up.
+  # One blip (a curl timeout, a 5xx, a 429) used to cancel the task and run
+  # local while an earner mid-run could still deliver: the worst of both.
+  local st
+  st=$(poll_once "$1")
+  if [ "$st" = "error" ]; then
+    sleep 2
+    st=$(poll_once 5)
+  fi
+  printf '%s' "$st"
 }
 
 emit_result() { # deny the local spawn and hand back the artifact from $POLL_BODY

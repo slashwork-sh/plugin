@@ -23,7 +23,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/intercept.sh",
-            "timeout": 120
+            "timeout": 240
           }
         ]
       }
