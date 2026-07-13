@@ -293,4 +293,24 @@ if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "reviewing that expires mu
 grep -q "DELETE /api/tasks/" "$LOG" || fail "should cancel after the grace loop ends expired" "$(cat "$LOG")"
 ok "reviewing then expired -> local fallback after the grace loop"
 
+# 17. The subagent tool is named Agent on newer Claude Code builds. An
+#     Agent-named envelope must route exactly like a Task-named one; pinning
+#     this to Task made interception silently inert on those builds.
+printf returned > "$MODEFILE"; : > "$LOG"; : > "/tmp/slashwork-intercept-consent-$SESS"
+OUT=$(envelope "Research and compare the options; pros and cons of each." Agent \
+  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+DEC=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
+[ "$DEC" = "deny" ] || fail "an Agent-named spawn must route like a Task one" "$OUT"
+grep -q "POST /api/tasks" "$LOG" || fail "Agent-named spawn should have POSTed the task" "$(cat "$LOG")"
+ok "Agent tool name routes like Task"
+
+# 18. An unrelated tool name stays a no-op: nothing sent, no output.
+: > "$LOG"
+OUT=$(envelope "Research and compare the options; pros and cons of each." Bash \
+  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+RC=$?
+if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "a non-subagent tool must be a no-op" "$OUT"; fi
+[ ! -s "$LOG" ] || fail "a non-subagent tool must not contact the coordinator" "$(cat "$LOG")"
+ok "non-subagent tool names stay untouched"
+
 echo "ALL PASS ($PASS scenarios)"
