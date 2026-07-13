@@ -40,14 +40,19 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         self._log()
         n = int(self.headers.get('content-length', 0)); self.rfile.read(n)
-        # POST /api/tasks -> always create a task
+        if mode() == "no-credits":
+            # POST /api/tasks -> the requester cannot pay; nothing is created.
+            self.send_response(400); self.send_header("content-type","application/json"); self.end_headers()
+            self.wfile.write(json.dumps({"error":{"code":"validation_failed","message":"not enough credits to route this task: you have 3, it costs 50"}}).encode())
+            return
+        # POST /api/tasks -> create a task
         self.send_response(201); self.send_header("content-type","application/json"); self.end_headers()
         self.wfile.write(json.dumps({"task_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","status":"queued","cost":50}).encode())
     def do_GET(self):
         self._log()
         m = mode()
         if m == "returned":
-            body = {"status":"returned","artifact":"OFFLOAD ARTIFACT: the answer.","tokens_used":123}
+            body = {"status":"returned","artifact":"OFFLOAD ARTIFACT: the answer.","tokens_used":123,"cost":50}
         elif m == "returned-multiline":
             body = {"status":"returned","artifact":"LINE ONE of the report\nLINE TWO details\nLINE THREE conclusion","tokens_used":200}
         elif m == "review-then-return":
@@ -131,8 +136,13 @@ printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep
   || fail "deny reason missing the artifact" "$OUT"
 printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -qi "untrusted" \
   || fail "deny reason must mark the artifact untrusted" "$OUT"
+# The user's receipt: tokens saved, credits spent, and the /earn pointer.
+SM=$(printf '%s' "$OUT" | jq -r '.systemMessage // empty' 2>/dev/null)
+printf '%s' "$SM" | grep -q "saved you 123 tokens" || fail "systemMessage missing tokens saved" "$OUT"
+printf '%s' "$SM" | grep -q "Spent 50 credits" || fail "systemMessage missing credits spent" "$OUT"
+printf '%s' "$SM" | grep -q "/earn" || fail "systemMessage missing the /earn pointer" "$OUT"
 grep -q "POST /api/tasks" "$LOG" || fail "should have POSTed the task" "$(cat "$LOG")"
-ok "routable task returns -> deny with untrusted artifact"
+ok "routable task returns -> deny with untrusted artifact + saved-tokens receipt"
 
 # 1b. Reviewing (the gate is running) must keep waiting, not cancel to local;
 #     when the gate accepts inside the grace, the artifact is emitted. This
@@ -198,14 +208,19 @@ printf '%s' "$REASON" | grep -q "LINE THREE" || fail "multiline artifact truncat
 ok "multi-line artifact returned whole"
 
 # 9. First-candidate consent gate: a fresh session's first routable spawn runs
-#    local (shows the disclosure) and sends nothing; routing starts next time.
+#    local, shows the disclosure as a visible systemMessage (stderr only shows
+#    in verbose mode), and sends nothing; routing starts next time.
 FRESH="itest-fresh-$RANDOM"
 rm -f "/tmp/slashwork-intercept-consent-$FRESH"
 printf returned > "$MODEFILE"; : > "$LOG"
 OUT=$(envelope "Research and compare the options; pros and cons of each." Task "$FRESH" \
   | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
 RC=$?
-if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "first candidate must run local (consent)" "$OUT"; fi
+[ "$RC" = "0" ] || fail "first candidate exit code $RC" "$OUT"
+DEC=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
+[ -z "$DEC" ] || fail "first candidate must carry no decision (local spawn)" "$OUT"
+printf '%s' "$OUT" | jq -r '.systemMessage // empty' 2>/dev/null | grep -q "slashwork intercept is on" \
+  || fail "first candidate must show the disclosure as a systemMessage" "$OUT"
 [ ! -s "$LOG" ] || fail "first candidate must send nothing before consent shown" "$(cat "$LOG")"
 # Second candidate in the same session now routes.
 : > "$LOG"
@@ -292,6 +307,22 @@ RC=$?
 if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "reviewing that expires must fall back to local" "$OUT"; fi
 grep -q "DELETE /api/tasks/" "$LOG" || fail "should cancel after the grace loop ends expired" "$(cat "$LOG")"
 ok "reviewing then expired -> local fallback after the grace loop"
+
+# 16b. Out of credits: the POST is rejected before any task exists, so the
+#      spawn runs locally (no decision, no cancel) and the user gets a visible
+#      systemMessage pointing at /earn.
+printf no-credits > "$MODEFILE"; : > "$LOG"; : > "/tmp/slashwork-intercept-consent-$SESS"
+OUT=$(envelope "Research and compare the options; pros and cons of each." \
+  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+RC=$?
+[ "$RC" = "0" ] || fail "out-of-credits exit code $RC" "$OUT"
+DEC=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
+[ -z "$DEC" ] || fail "out of credits must carry no decision (local spawn)" "$OUT"
+SM=$(printf '%s' "$OUT" | jq -r '.systemMessage // empty' 2>/dev/null)
+printf '%s' "$SM" | grep -q "not enough credits" || fail "out-of-credits message missing the reason" "$OUT"
+printf '%s' "$SM" | grep -q "/earn" || fail "out-of-credits message missing the /earn pointer" "$OUT"
+if grep -q "DELETE /api/tasks/" "$LOG"; then fail "no task was created, nothing to cancel" "$(cat "$LOG")"; fi
+ok "out of credits -> local spawn + visible /earn nudge"
 
 # 17. The subagent tool is named Agent on newer Claude Code builds. An
 #     Agent-named envelope must route exactly like a Task-named one; pinning
