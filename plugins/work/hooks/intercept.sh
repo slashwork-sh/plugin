@@ -220,15 +220,23 @@ poll_once() { # $1 = wait_secs; echoes status; body in $POLL_BODY
     echo error
   fi
 }
-poll() { # poll_once, retrying a single transport error before giving up.
-  # One blip (a curl timeout, a 5xx, a 429) used to cancel the task and run
-  # local while an earner mid-run could still deliver: the worst of both.
-  local st
+poll() { # poll_once, retrying transient transport errors before giving up.
+  # Only used once an earner has (or may have) the task. Cancelling on one
+  # blip (a curl timeout, a 5xx, a deploy swapping the coordinator) throws
+  # away an earner mid-run and reruns locally from zero: the retry pause is
+  # seconds, the local rerun costs minutes. Two retries ~5s apart cover a
+  # container swap; the wall-clock guard still bounds the whole wait. The
+  # claim window deliberately calls poll_once instead: nothing is invested
+  # yet, so an unreachable coordinator means an immediate local fallback,
+  # not retries the user sits through.
+  local st tries=0
   st=$(poll_once "$1")
-  if [ "$st" = "error" ]; then
-    sleep 2
+  while [ "$st" = "error" ] && [ "$tries" -lt 2 ]; do
+    [ "$(( $(date +%s) - DISPATCH_START ))" -lt "$HARD_CAP" ] || break
+    sleep 5
     st=$(poll_once 5)
-  fi
+    tries=$((tries + 1))
+  done
   printf '%s' "$st"
 }
 
@@ -253,7 +261,9 @@ emit_result() { # deny the local spawn and hand back the artifact from $POLL_BOD
 # Claim window: give a warm earner a few seconds to grab it. Still queued after
 # that means the pool is cold; cancel and run local so the user never waits on
 # an empty queue. Any non-claim outcome cancels (refund) and falls back local.
-STATUS=$(poll "$CLAIM_WINDOW")
+# poll_once, not poll: no earner holds the task yet, so a transport error here
+# gets no retries, just the instant local fallback (the cancel refunds).
+STATUS=$(poll_once "$CLAIM_WINDOW")
 case "$STATUS" in
   returned)          emit_result ;;
   claimed|reviewing) : ;;  # an earner has it; wait it out below
