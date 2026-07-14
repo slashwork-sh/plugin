@@ -73,6 +73,27 @@ class H(http.server.BaseHTTPRequestHandler):
                 open(flip, "w").write("1"); body = {"status":"claimed"}
             else:
                 self.send_response(500); self.end_headers(); self.wfile.write(b'{"error":"down"}'); return
+        elif m == "die-on-poll":
+            # Every result poll fails: the coordinator went down before anyone
+            # claimed. The claim window must fall back local with no retries.
+            self.send_response(500); self.end_headers(); self.wfile.write(b'{"error":"down"}'); return
+        elif m == "die-then-return":
+            # Claimed, then one blip (500), then the artifact: a deploy-sized
+            # gap the post-claim retry must ride out instead of cancelling.
+            import os
+            ctrf = logf + ".ctr"
+            try:
+                c = int(open(ctrf).read().strip())
+            except Exception:
+                c = 0
+            c += 1
+            open(ctrf, "w").write(str(c))
+            if c == 1:
+                body = {"status":"claimed"}
+            elif c == 2:
+                self.send_response(500); self.end_headers(); self.wfile.write(b'{"error":"blip"}'); return
+            else:
+                body = {"status":"returned","artifact":"RETRY ARTIFACT: survived the blip.","tokens_used":55}
         elif m == "review-then-expire":
             # Reviewing for the first few polls, then expired: exercises the
             # deadline grace loop ending in a local fallback, not a stale emit.
@@ -343,5 +364,33 @@ RC=$?
 if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "a non-subagent tool must be a no-op" "$OUT"; fi
 [ ! -s "$LOG" ] || fail "a non-subagent tool must not contact the coordinator" "$(cat "$LOG")"
 ok "non-subagent tool names stay untouched"
+
+# 19. Coordinator unreachable during the claim window: nothing is invested yet,
+#     so the hook must fall back local IMMEDIATELY (exactly one result poll, no
+#     retries burning user time), cancelling for the refund.
+printf die-on-poll > "$MODEFILE"; : > "$LOG"; : > "/tmp/slashwork-intercept-consent-$SESS"
+OUT=$(envelope "Research and compare the options; pros and cons of each." \
+  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+RC=$?
+if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "a dead coordinator in the claim window must fall back to local" "$OUT"; fi
+POLLS=$(grep -c "GET /api/tasks/.*/result" "$LOG")
+[ "$POLLS" = "1" ] || fail "claim-window error must not retry (saw $POLLS polls)" "$(cat "$LOG")"
+grep -q "DELETE /api/tasks/" "$LOG" || fail "should still cancel for the refund" "$(cat "$LOG")"
+ok "dead coordinator in the claim window -> one poll, instant local fallback"
+
+# 20. One blip after the claim (a deploy swapping the coordinator): the retry
+#     rides it out and the artifact still comes back instead of a cancel that
+#     throws away an earner mid-run.
+printf die-then-return > "$MODEFILE"; : > "$LOG"; rm -f "$LOG.ctr"; : > "/tmp/slashwork-intercept-consent-$SESS"
+OUT=$(envelope "Research and compare the options; pros and cons of each." \
+  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+RC=$?
+[ "$RC" = "0" ] || fail "post-claim blip exit code $RC" "$OUT"
+DEC=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
+[ "$DEC" = "deny" ] || fail "the retry must bridge one post-claim blip and return the artifact" "$OUT"
+printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -q "RETRY ARTIFACT" \
+  || fail "deny reason missing the post-blip artifact" "$OUT"
+if grep -q "DELETE /api/tasks/" "$LOG"; then fail "a bridged blip must not cancel the task" "$(cat "$LOG")"; fi
+ok "one blip after the claim -> retried, artifact returned"
 
 echo "ALL PASS ($PASS scenarios)"
