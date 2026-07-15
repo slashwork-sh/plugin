@@ -52,7 +52,7 @@ class H(http.server.BaseHTTPRequestHandler):
         self._log()
         m = mode()
         if m == "returned":
-            body = {"status":"returned","artifact":"OFFLOAD ARTIFACT: the answer.","tokens_used":123,"cost":50}
+            body = {"status":"returned","artifact":"OFFLOAD ARTIFACT: the answer.","tokens_used":123,"class":"research","cost":50,"settled":12,"tokens_saved_total":4560}
         elif m == "returned-multiline":
             body = {"status":"returned","artifact":"LINE ONE of the report\nLINE TWO details\nLINE THREE conclusion","tokens_used":200}
         elif m == "review-then-return":
@@ -136,10 +136,12 @@ printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep
   || fail "deny reason missing the artifact" "$OUT"
 printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -qi "untrusted" \
   || fail "deny reason must mark the artifact untrusted" "$OUT"
-# The user's receipt: tokens saved, credits spent, and the /earn pointer.
+# The user's receipt: tokens saved, credits settled, the ASCII plot, and the
+# /earn pointer.
 SM=$(printf '%s' "$OUT" | jq -r '.systemMessage // empty' 2>/dev/null)
-printf '%s' "$SM" | grep -q "saved you 123 tokens" || fail "systemMessage missing tokens saved" "$OUT"
-printf '%s' "$SM" | grep -q "Spent 50 credits" || fail "systemMessage missing credits spent" "$OUT"
+printf '%s' "$SM" | grep -q "123 tokens" || fail "systemMessage missing tokens saved" "$OUT"
+printf '%s' "$SM" | grep -q "12 cr" || fail "systemMessage missing settled credits" "$OUT"
+printf '%s' "$SM" | grep -q "tokens saved" || fail "systemMessage missing the plot header" "$OUT"
 printf '%s' "$SM" | grep -q "/earn" || fail "systemMessage missing the /earn pointer" "$OUT"
 grep -q "POST /api/tasks" "$LOG" || fail "should have POSTed the task" "$(cat "$LOG")"
 ok "routable task returns -> deny with untrusted artifact + saved-tokens receipt"
