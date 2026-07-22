@@ -51,9 +51,12 @@ fi
 [ -n "$ARTIFACT" ] || { echo "slashwork: no final message to submit" >&2; exit 0; }
 
 # Which task did this worker do? Its prompt (the first user message in its
-# transcript) carries "task_id: <uuid>".
+# transcript) carries "task_id: <uuid>". Track whether the transcript was even
+# readable, because a missing task_id means different things with and without it.
 FIRST_MSG=""
+HAVE_TX=0
 if [ -n "$AGENT_TX" ] && [ -f "$AGENT_TX" ]; then
+  HAVE_TX=1
   FIRST_MSG=$(jq -rs '
     [ .[] | select(.type == "user") ] | first | .message.content
     | if type == "string" then . else (map(select(.type == "text") | .text) | join("\n")) end
@@ -61,24 +64,40 @@ if [ -n "$AGENT_TX" ] && [ -f "$AGENT_TX" ]; then
 fi
 ID=$(printf '%s' "$FIRST_MSG" | sed -n 's/.*task_id:[[:space:]]*\([0-9a-fA-F-]\{36\}\).*/\1/p' | head -n1)
 
-# Fallback when the prompt carried no task_id: the subagent transcript was
-# missing or unreadable (some harness versions do not pass agent_transcript_path,
-# and the envelope's last_assistant_message alone does not name the task). In an
-# /earn run the session's only subagent is the worker, and a staged job exists
-# only because THIS session claimed a task, so if exactly one job is staged for
-# this session it is this worker's task. Zero or several: stay safe and submit
-# nothing, so a bare non-worker subagent never has its final message posted.
 if [ -z "$ID" ]; then
-  STAGED=()
-  while IFS= read -r f; do STAGED+=("$f"); done < <(
-    ls -1 "/tmp/slashwork-job-${SESSION_ID}-"*.json 2>/dev/null)
-  if [ "${#STAGED[@]}" -eq 1 ]; then
-    ID=$(basename "${STAGED[0]}" \
-      | sed -n "s/^slashwork-job-${SESSION_ID}-\([0-9a-fA-F-]\{36\}\)\.json\$/\1/p")
-    [ -n "$ID" ] && echo "slashwork: no task_id in prompt; recovered $ID from the single staged job for this session" >&2
+  if [ "$HAVE_TX" -eq 1 ]; then
+    # The transcript was readable but carries no task_id marker. A slashwork
+    # worker prompt always has one, so this is some OTHER Task that stopped in
+    # this /earn session. Submit nothing and leave any staged job alone, so a
+    # bystander subagent's final message never reaches the coordinator.
+    echo "slashwork: subagent has a transcript but no task_id; not a worker, ignoring" >&2
+    exit 0
+  fi
+  # No transcript at all (a harness that does not pass agent_transcript_path, so
+  # the prompt cannot be read). earn-listen wrote a claim marker for THIS session
+  # naming the task it claimed; that is the authoritative identity and stays
+  # correct even when stale staged jobs from earlier failed submits are lying
+  # around. Prefer it; fall back to a lone staged job only if the marker is gone.
+  MARKER="/tmp/slashwork-earn-${SESSION_ID}.json"
+  if [ -f "$MARKER" ] && [ "$(jq -r '.status // empty' "$MARKER" 2>/dev/null)" = "claimed" ]; then
+    CAND=$(jq -r '.id // empty' "$MARKER" 2>/dev/null)
+    if printf '%s' "$CAND" | grep -qE '^[0-9a-fA-F-]{36}$'; then
+      ID="$CAND"
+      echo "slashwork: no transcript; using claimed task $ID from the session claim marker" >&2
+    fi
+  fi
+  if [ -z "$ID" ]; then
+    STAGED=()
+    while IFS= read -r f; do STAGED+=("$f"); done < <(
+      ls -1 "/tmp/slashwork-job-${SESSION_ID}-"*.json 2>/dev/null)
+    if [ "${#STAGED[@]}" -eq 1 ]; then
+      ID=$(basename "${STAGED[0]}" \
+        | sed -n "s/^slashwork-job-${SESSION_ID}-\([0-9a-fA-F-]\{36\}\)\.json\$/\1/p")
+      [ -n "$ID" ] && echo "slashwork: no task_id and no marker; recovered $ID from the single staged job" >&2
+    fi
   fi
 fi
-[ -n "$ID" ] || { echo "slashwork: no task id and no single staged job for this session; not submitting" >&2; exit 0; }
+[ -n "$ID" ] || { echo "slashwork: no task id (no task_id, no claim marker, no single staged job); not submitting" >&2; exit 0; }
 
 STAGE="/tmp/slashwork-job-${SESSION_ID}-${ID}.json"
 [ -f "$STAGE" ] || { echo "slashwork: no staged job for $ID; not submitting" >&2; exit 0; }
