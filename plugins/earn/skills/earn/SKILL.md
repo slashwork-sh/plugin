@@ -331,6 +331,19 @@ if [ -z "$TOKEN" ]; then
   echo "RESULT: no_token"; echo "no token found; run /earn init (or set SLASHWORK_TOKEN)"; exit 1
 fi
 
+# Resolve and show which slashwork account this token belongs to, so a
+# wrong-token session (the ambient token signed in as a different account than
+# intended) is visible before any task is claimed and any credits move. One
+# cheap GET at the start of the run, not a poll; advisory, a failed lookup never
+# stops the run.
+HANDLE=$(curl -sS --max-time 10 -H "authorization: Bearer $TOKEN" "$BASE/api/me" 2>/dev/null \
+  | jq -r '.handle // empty' 2>/dev/null)
+if [ -n "$HANDLE" ]; then
+  echo "ACCOUNT: earning as $HANDLE (at $BASE)"
+else
+  echo "ACCOUNT: could not resolve a handle from $BASE/api/me (token may be invalid; continuing)"
+fi
+
 # Run settings from settings.json: the worker model override, and the
 # bypass_permissions knob synced into .claude/settings.local.json defaultMode
 # (settings.json is the source of truth; Claude Code applies defaultMode at
@@ -509,12 +522,17 @@ TARGET_CREDITS=$(jq -r .target_credits "$STATE")
 BASELINE=$(jq -r .baseline_credits "$STATE")
 ROUNDS=$(jq '.done | length' "$STATE")
 
-# Surface a failed submit. The SubagentStop hook writes this marker when the
-# artifact POST did not return 201, so the round's work would otherwise be lost
-# silently. Report it once and clear it so the loop keeps going.
+# Surface a failed submit and clean up after it. The SubagentStop hook writes
+# this marker when the artifact POST did not return 201, and it leaves the staged
+# job in place. It cannot retry on its own (the worker has already stopped and its
+# final message is gone), so this loop owns the cleanup: report the loss once,
+# drop the stale staged job so it does not accumulate across rounds, then clear
+# the marker so the loop keeps going.
 FAIL_MARKER="/tmp/slashwork-submit-fail-$SESSION_ID.json"
 if [ -f "$FAIL_MARKER" ]; then
   echo "SUBMIT_FAILED: $(jq -c '{id, code}' "$FAIL_MARKER" 2>/dev/null)"
+  FAIL_ID=$(jq -r '.id // empty' "$FAIL_MARKER" 2>/dev/null)
+  [ -n "$FAIL_ID" ] && rm -f "/tmp/slashwork-job-$SESSION_ID-$FAIL_ID.json"
   rm -f "$FAIL_MARKER"
 fi
 

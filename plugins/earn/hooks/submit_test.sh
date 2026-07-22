@@ -350,3 +350,93 @@ wait "$MOCK5" 2>/dev/null || true
 GOT_ART="$(tail -n +2 "$CAP" | jq -r '.artifact')"
 [ "$GOT_ART" = "TRANSCRIPT ARTIFACT" ] || fail "the transcript's final message should win: $GOT_ART"
 echo "PASS: the transcript's final message is preferred over the envelope's"
+
+# ---- Scenario 10: a non-worker subagent (transcript present, no task_id) must
+# not be submitted, even when a job is staged. The old glob fallback fired on any
+# missing task_id, so an unrelated Task stopping in an /earn session had its final
+# message POSTed as the artifact (leaking local context) and the real worker's
+# stage deleted. A worker prompt always carries task_id; its absence WITH a
+# transcript means this is not the worker. ----
+NW="abababab-cdcd-efef-0101-232323232323"
+NW_JOB="/tmp/slashwork-job-${SESSION}-${NW}.json"
+cleanup9() { cleanup8; rm -f "$NW_JOB"; }
+trap cleanup9 EXIT
+rm -f "$CAP"; rm -f /tmp/slashwork-job-"${SESSION}"-*.json
+rm -f "/tmp/slashwork-earn-${SESSION}.json"   # no claim marker for this case
+# The real worker's task is staged and still in flight.
+printf '{"task_id":"%s","base":"%s"}\n' "$NW" "$BASE" > "$NW_JOB"
+
+timeout 20 python3 - "$PORT" "$CAP" <<'PY' &
+import sys, http.server, socketserver
+port, cap = int(sys.argv[1]), sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('content-length', 0))
+        body = self.rfile.read(n).decode()
+        open(cap, 'w').write(self.path + "\n" + body)
+        self.send_response(201); self.end_headers(); self.wfile.write(b'{"ok":true}')
+    def log_message(self, *a): pass
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", port), H) as s:
+    s.handle_request()
+PY
+MOCK10=$!
+sleep 0.6
+
+AT10="$TXDIR/agent-nonworker.jsonl"
+{
+  printf '{"type":"user","message":{"role":"user","content":"Summarize the notes pasted below into three bullets."}}\n'
+  printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"local context that must not leak"}]}}\n'
+} > "$AT10"
+ENVELOPE10="$(jq -nc --arg s "$SESSION" --arg at "$AT10" --arg lam "local context that must not leak" \
+  '{session_id:$s, agent_transcript_path:$at, last_assistant_message:$lam, hook_event_name:"SubagentStop"}')"
+printf '%s' "$ENVELOPE10" | SLASHWORK_TOKEN=testtoken bash "$SUBMIT" 2>"$HOOKERR"
+sleep 0.3
+kill "$MOCK10" 2>/dev/null || true
+[ ! -f "$CAP" ] || fail "a non-worker subagent (transcript, no task_id) must submit nothing" "$(cat "$CAP")"
+[ -f "$NW_JOB" ] || fail "must not delete the real worker's staged job"
+echo "PASS: non-worker subagent with a transcript is ignored, staged job untouched"
+
+# ---- Scenario 11: transcript absent + a claim marker -> use the marker's id as
+# the identity source, even with several staged jobs. Without reading the marker,
+# 2+ staged jobs (e.g. a stale one left by an earlier failed submit) made the hook
+# refuse and silently drop the round on transcript-less harnesses. ----
+CM="cdcdcdcd-efef-0101-2323-454545454545"
+CM_JOB="/tmp/slashwork-job-${SESSION}-${CM}.json"
+CM_OUT="/tmp/slashwork-submit-${SESSION}-${CM}.out"
+STALE_JOB="/tmp/slashwork-job-${SESSION}-eeeeeeee-ffff-0000-1111-222222222222.json"
+MARKER="/tmp/slashwork-earn-${SESSION}.json"
+cleanup10() { cleanup9; rm -f "$CM_JOB" "$CM_OUT" "$STALE_JOB" "$MARKER"; }
+trap cleanup10 EXIT
+rm -f "$CAP"; rm -f /tmp/slashwork-job-"${SESSION}"-*.json
+printf '{"task_id":"%s","base":"%s"}\n' "$CM" "$BASE" > "$CM_JOB"
+printf '{"task_id":"stale","base":"%s"}\n' "$BASE" > "$STALE_JOB"   # a leftover second stage
+printf '{"status":"claimed","id":"%s","job":"%s"}\n' "$CM" "$CM_JOB" > "$MARKER"
+
+timeout 20 python3 - "$PORT" "$CAP" <<'PY' &
+import sys, http.server, socketserver
+port, cap = int(sys.argv[1]), sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('content-length', 0))
+        body = self.rfile.read(n).decode()
+        open(cap, 'w').write(self.path + "\n" + body)
+        self.send_response(201); self.end_headers(); self.wfile.write(b'{"ok":true}')
+    def log_message(self, *a): pass
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", port), H) as s:
+    s.handle_request()
+PY
+MOCK11=$!
+sleep 0.6
+
+# Envelope with NO agent_transcript_path; identity must come from the marker.
+ENVELOPE11="$(jq -nc --arg s "$SESSION" --arg lam "recovered via claim marker" \
+  '{session_id:$s, last_assistant_message:$lam, hook_event_name:"SubagentStop"}')"
+printf '%s' "$ENVELOPE11" | SLASHWORK_TOKEN=testtoken bash "$SUBMIT" 2>"$HOOKERR"
+wait "$MOCK11" 2>/dev/null || true
+[ -f "$CAP" ] || fail "claim-marker identity submitted nothing (marker not read)"
+GOT_PATH="$(head -1 "$CAP")"
+[ "$GOT_PATH" = "/api/tasks/$CM/submit" ] || fail "should submit to the marker's task id: $GOT_PATH"
+[ ! -f "$CM_JOB" ] || fail "marker-recovered submit should clean its staged job after 201"
+echo "PASS: transcript absent -> identity from the claim marker, past stale stages"
