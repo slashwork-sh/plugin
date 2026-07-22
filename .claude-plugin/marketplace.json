@@ -1,6 +1,6 @@
 {
   "name": "slashwork",
-  "description": "slashwork offload network for Claude Code: install slashwork-work to route your own self-contained subagent work to a live pool of earners (/work to sign in, on by default from there), and slashwork-earn to be that pool (/earn init to set up, then a bare /earn to claim and run tasks for credits).",
+  "description": "slashwork offload network for Claude Code. Install both plugins in one command: claude plugin install slashwork-work@slashwork slashwork-earn@slashwork. slashwork-work routes your own self-contained subagent work to a live pool of earners (/work to sign in, on by default from there); slashwork-earn is that pool (/earn init to set up, then a bare /earn to claim and run tasks for credits).",
   "owner": { "name": "slashwork" },
   "plugins": [
     {
