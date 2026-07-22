@@ -99,9 +99,16 @@ LP=$(printf '%s' "$PROMPT" | tr '[:upper:]' '[:lower:]')
 if printf '%s' "$LP" | grep -qE '(^|[^a-z])(/(users|home|var|etc|tmp|opt|usr|private|volumes|mnt|srv|root|library)/|~/|\./|\.\./|[a-z]:\\)'; then
   decline "local path reference"
 fi
-# A bare filename with an extension (report.csv, api.h, data.ipynb) or a
-# relative dir path (src/data, lib/util.rs).
-if printf '%s' "$LP" | grep -qE '\b[a-z0-9_.-]+\.[a-z0-9]{1,6}\b|\b[a-z0-9_-]+/[a-z0-9_./-]+'; then
+# A bare filename with a KNOWN file extension (report.csv, api.h, data.ipynb) or
+# a deep relative path (src/models/user, 2+ separators). The old check declined
+# any dotted token and any single slash, which lost ordinary research prose:
+# abbreviations (e.g., i.e.) read as extensions and rate terms (requests/second)
+# read as paths. Requiring a known extension and 2+ path separators keeps real
+# file references declining while routing that prose; a rare false accept still
+# has to clear the repo-verb and secret checks below.
+FILE_EXT='csv|tsv|txt|md|rst|json|ya?ml|toml|ini|conf|cfg|env|xml|html?|css|scss|sass|less|sql|log|lock|pdf|png|jpe?g|gif|svg|webp|ico|ipynb|rs|py|js|mjs|ts|jsx|tsx|go|java|rb|php|cpp|hpp|cc|cxx|hh|cs|swift|kt|scala|clj|hs|dart|sh|bash|zsh|ps1|bat|db|sqlite|parquet|avro|proto|graphql|gz|tgz|zip|tar|xlsx|xls|docx|doc|pptx|ppt|npy|h5|pkl|wav|mp3|mp4|mov|webm|c|h'
+if printf '%s' "$LP" | grep -qE "\b[a-z0-9_-]+\.($FILE_EXT)\b" \
+  || printf '%s' "$LP" | grep -qE '\b[a-z0-9_-]+/[a-z0-9_-]+/[a-z0-9_./-]+'; then
   decline "probable local file or path"
 fi
 if printf '%s' "$LP" | grep -qE '\b(git|commit|repo|repository|codebase|the tests?|test suite|run the|npm |cargo |pytest|build the|compile|refactor|edit the|modify the|this file|these files|the file|attached|working directory|cwd|localhost)\b'; then

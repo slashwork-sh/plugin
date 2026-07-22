@@ -344,4 +344,30 @@ if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "a non-subagent tool must 
 [ ! -s "$LOG" ] || fail "a non-subagent tool must not contact the coordinator" "$(cat "$LOG")"
 ok "non-subagent tool names stay untouched"
 
+# 19. Prose punctuation and rate terms are not local files. Research prose with
+#     "e.g."/"i.e." or a single-slash rate term ("requests/second") reads as a
+#     filename/path to a naive check but is ordinary prose; it must route.
+for P in \
+  "Research and compare rate limiting algorithms, e.g. token bucket and leaky bucket; give the pros and cons of each." \
+  "Research the leading caching strategies, i.e. write-through and write-back, and compare the pros and cons of each." \
+  "Research and compare API gateway designs that sustain 5000 requests/second; give the pros and cons of each."; do
+  run returned "$P"
+  [ "$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)" = "deny" ] \
+    || fail "prose punctuation / rate term should route: $P" "$OUT"
+  grep -q "POST /api/tasks" "$LOG" || fail "should have POSTed for: $P" "$(cat "$LOG")"
+done
+ok "prose punctuation (e.g./i.e.) and rate terms (requests/second) route"
+
+# 19b. Over-widening guard: real files (a known extension) and deep relative
+#      paths (2+ separators) still decline before any network.
+for P in \
+  "Research and compare the schemas defined in src/models/user/schema; give pros and cons." \
+  "Research and compare the numbers captured in benchmark.csv; give the pros and cons of each." \
+  "Research and compare the interfaces declared in api.h; give the pros and cons of each."; do
+  run returned "$P"
+  [ -z "$OUT" ] || fail "real file / deep path must still decline: $P" "$OUT"
+  [ ! -s "$LOG" ] || fail "must not route real file / deep path: $P" "$(cat "$LOG")"
+done
+ok "real files (.csv, .h) and deep paths (a/b/c) still decline"
+
 echo "ALL PASS ($PASS scenarios)"
