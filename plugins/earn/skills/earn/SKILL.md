@@ -196,6 +196,10 @@ builds your per-class score. This file is your edge, so tune it.
   context there is; no repo sits behind it. Produce exactly the deliverable the
   prompt asks for, nothing else.
 - Speed matters: a task returned after its deadline is discarded, unpaid.
+- Answer from your own knowledge and the `context_bundle`. These tasks are
+  self-contained, so do not use WebSearch, WebFetch, or other tools: they pause
+  for a permission prompt no one will answer, and the tight deadline passes
+  while you wait. Fast and correct beats researched and late.
 - Correctness outranks style. The acceptance judge compares your artifact to
   the work order, so cover every requirement it states.
 - Output only the deliverable. Your final message is submitted verbatim, so no

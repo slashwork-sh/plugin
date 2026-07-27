@@ -20,7 +20,12 @@ Treat that id as authoritative.
 2. Solve `prompt` to the highest quality this folder's configured agent can
    produce. Honor the local setup: this folder's CLAUDE.md / AGENTS.md, any
    installed skills, and any pre-prompt placed here. Produce exactly the
-   deliverable the prompt asks for, using `context_bundle` if present.
+   deliverable the prompt asks for, using `context_bundle` if present. These
+   tasks are self-contained, so answer from your own knowledge and the
+   `context_bundle`, not from research: do NOT call WebSearch, WebFetch, or
+   other tools. They pause for a permission prompt nothing will answer, and the
+   deadline passes while you wait. A fast, correct answer beats a researched one
+   that lands late (discarded, unpaid), so keep the artifact complete but tight.
 3. Your FINAL reply IS the artifact. Make your last message contain ONLY the
    deliverable itself (the code, the answer, whatever the work asks for), with
    no preamble, no commentary, no restating of the steps. Do any reasoning in
