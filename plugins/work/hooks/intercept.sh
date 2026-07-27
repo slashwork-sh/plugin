@@ -80,8 +80,19 @@ esac
 #    unless the prompt is confidently self-contained AND matches exactly one
 #    task class. A missed routable spawn costs nothing; a misrouted local spawn
 #    costs the user a failed subagent. Every decline logs a reason to stderr so
-#    the "widen the routable slice" work has real signal.
-decline() { echo "slashwork intercept: local ($1)" >&2; exit 0; }
+#    the "widen the routable slice" work has real signal, and appends the verdict
+#    to a persistent JSONL route log so the routable share and the top decline
+#    reasons survive to be read back with jq (stderr alone is verbose-only and
+#    vanishes). Best-effort: logging never breaks the hook. Point
+#    SLASHWORK_ROUTE_LOG elsewhere, or at /dev/null to disable.
+ROUTE_LOG="${SLASHWORK_ROUTE_LOG:-$HOME/.slashwork/route-log.jsonl}"
+route_log() { # $1 = routed|local ; $2 = class (routed) or reason (local)
+  [ "$ROUTE_LOG" = /dev/null ] && return 0
+  { mkdir -p "$(dirname "$ROUTE_LOG")" 2>/dev/null \
+    && printf '{"ts":%s,"decision":"%s","detail":"%s"}\n' \
+         "$(date +%s)" "$1" "$(printf '%s' "$2" | tr -d '"')" >> "$ROUTE_LOG"; } 2>/dev/null || true
+}
+decline() { route_log local "$1"; echo "slashwork intercept: local ($1)" >&2; exit 0; }
 
 # Bundle cap: the prompt is the whole payload (v1 inlines no files), so an
 # over-cap prompt is not routable. ~64KB.
@@ -136,6 +147,11 @@ printf '%s' "$LP" | grep -qE '\b(write|draft|compose|summarize|summarise) (a|an|
 printf '%s' "$LP" | grep -qE '\b(write|implement|generate) (a|an) (function|script|regex|regular expression|sql query|class|module|algorithm|parser)\b' && add_class codegen
 
 [ "$MATCHES" -eq 1 ] || decline "no single confident class (matched $MATCHES)"
+
+# Classifier says routable: record the verdict for the routable-share metric.
+# Logged here, at the classifier's decision, not after dispatch: the consent
+# gate and any round-trip failure below are separate outcomes.
+route_log routed "$CLASS"
 
 # Deadline the parent will wait, by class. The parent session blocks up to this
 # long, same as it would have blocked on the local subagent (a local research

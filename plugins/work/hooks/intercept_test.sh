@@ -16,6 +16,10 @@ PORT="${MOCK_PORT:-8747}"
 BASE="http://127.0.0.1:$PORT"
 LOG="/tmp/slashwork-intercepttest-req.log"
 TOKEN="testtoken"
+# Route log to a temp file so the hook's verdict logging is assertable and never
+# touches the real ~/.slashwork/route-log.jsonl. Exported so every inline
+# `VAR=x bash "$INTERCEPT"` invocation below inherits it.
+export SLASHWORK_ROUTE_LOG="/tmp/slashwork-intercepttest-routelog.jsonl"
 PASS=0
 
 fail() { echo "FAIL: $1"; [ -n "${2:-}" ] && { echo "--- detail ---"; echo "$2"; }; exit 1; }
@@ -104,7 +108,7 @@ PY
   sleep 0.6
 }
 stop_mock() { kill "$MOCK" 2>/dev/null || true; }
-trap 'stop_mock; rm -f "$LOG" "$LOG.flip" "$LOG.ctr" "$MODEFILE" /tmp/slashwork-intercept-consent-*' EXIT
+trap 'stop_mock; rm -f "$LOG" "$LOG.flip" "$LOG.ctr" "$MODEFILE" "$SLASHWORK_ROUTE_LOG" /tmp/slashwork-intercept-consent-*' EXIT
 start_mock
 
 # A fixed session id whose consent marker the routing scenarios pre-create, so
@@ -371,5 +375,18 @@ for P in \
   [ ! -s "$LOG" ] || fail "must not route real file / deep path: $P" "$(cat "$LOG")"
 done
 ok "real files (.csv, .h) and deep paths (a/b/c) still decline"
+
+# 20. Route log: every intercepted spawn records its verdict to
+#     SLASHWORK_ROUTE_LOG (routed with its class, or local with the decline
+#     reason), so the routable share and the top decline reasons are readable
+#     from data. stderr alone is verbose-only and vanishes.
+: > "$SLASHWORK_ROUTE_LOG"
+run returned "Research and compare the leading rate limiting algorithms; give the pros and cons of each."
+grep -q '"decision":"routed","detail":"research"' "$SLASHWORK_ROUTE_LOG" \
+  || fail "route log missing the routed research verdict" "$(cat "$SLASHWORK_ROUTE_LOG")"
+run returned "Please refactor the code in this file and run the tests."
+grep -q '"decision":"local"' "$SLASHWORK_ROUTE_LOG" \
+  || fail "route log missing a local decline verdict" "$(cat "$SLASHWORK_ROUTE_LOG")"
+ok "route log records routed (class) and local (reason) verdicts"
 
 echo "ALL PASS ($PASS scenarios)"
