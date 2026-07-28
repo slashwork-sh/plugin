@@ -1,0 +1,4 @@
+# Product and brand names that read as CamelCase but are not code identifiers,
+# so clippy::doc_markdown (pedantic) should not demand backticks around them.
+# ".." keeps clippy's built-in list (GitHub, etc.) and extends it.
+doc-valid-idents = ["OpenClaw", "ClawHub", ".."]
