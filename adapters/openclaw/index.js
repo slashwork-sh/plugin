@@ -18,6 +18,9 @@
 // below are pure and unit-tested.
 
 import { spawn } from "node:child_process";
+import { accessSync, constants } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export const HARNESS = "openclaw";
 export const SPAWN_TOOL = "sessions_spawn";
@@ -25,10 +28,19 @@ export const SPAWN_TOOL = "sessions_spawn";
 // core returns `local` on its own first; this only catches a wedged process.
 const ROUTE_TIMEOUT_MS = 210_000;
 
-/** Locate the `slashwork-offload` binary: `SLASHWORK_OFFLOAD_BIN`, else the bare
- * name (resolved on PATH by spawn; a miss surfaces as a spawn error -> local). */
+/** Locate the `slashwork-offload` binary: `SLASHWORK_OFFLOAD_BIN`, then the
+ * install dir `~/.slashwork/bin` that `offload/dist/install.sh` populates, else
+ * the bare name (resolved on PATH by spawn; a miss surfaces as a spawn error ->
+ * local). */
 export function coreBinary() {
-  return process.env.SLASHWORK_OFFLOAD_BIN || "slashwork-offload";
+  if (process.env.SLASHWORK_OFFLOAD_BIN) return process.env.SLASHWORK_OFFLOAD_BIN;
+  const installed = join(homedir(), ".slashwork", "bin", "slashwork-offload");
+  try {
+    accessSync(installed, constants.X_OK);
+    return installed;
+  } catch {
+    return "slashwork-offload";
+  }
 }
 
 /** Build the core `route` envelope from a `sessions_spawn` args object. v1 sends

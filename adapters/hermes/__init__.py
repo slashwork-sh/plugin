@@ -34,8 +34,15 @@ _ROUTE_TIMEOUT_SECS = 210
 
 def core_binary():
     """Locate the ``slashwork-offload`` binary: ``SLASHWORK_OFFLOAD_BIN`` first,
-    then ``PATH``. Returns ``None`` when it is not installed."""
-    return os.environ.get("SLASHWORK_OFFLOAD_BIN") or shutil.which("slashwork-offload")
+    then the install dir ``~/.slashwork/bin`` that ``offload/dist/install.sh``
+    populates, then ``PATH``. Returns ``None`` when it is not installed."""
+    override = os.environ.get("SLASHWORK_OFFLOAD_BIN")
+    if override:
+        return override
+    installed = os.path.join(os.path.expanduser("~"), ".slashwork", "bin", "slashwork-offload")
+    if os.access(installed, os.X_OK):
+        return installed
+    return shutil.which("slashwork-offload")
 
 
 def is_leaf(args):

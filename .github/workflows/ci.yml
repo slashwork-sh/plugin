@@ -40,6 +40,10 @@ jobs:
         run: cargo clippy --all-targets -- -W clippy::pedantic -D warnings
       - name: Test
         run: cargo test
+      - name: Shellcheck the distribution scripts
+        run: shellcheck dist/install.sh dist/install_test.sh
+      - name: Install-script platform resolver test
+        run: bash dist/install_test.sh
 
   hermes:
     runs-on: ubuntu-latest
