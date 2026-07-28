@@ -40,3 +40,19 @@ jobs:
         run: cargo clippy --all-targets -- -W clippy::pedantic -D warnings
       - name: Test
         run: cargo test
+
+  hermes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Byte-compile the adapter
+        run: python -m py_compile adapters/hermes/__init__.py adapters/hermes/test_hermes.py
+      - name: Unit tests
+        run: python -m unittest adapters/hermes/test_hermes.py
+      - name: Validate the plugin manifest
+        run: |
+          pip install pyyaml
+          python -c "import yaml; yaml.safe_load(open('adapters/hermes/plugin.yaml'))"

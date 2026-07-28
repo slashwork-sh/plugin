@@ -1,0 +1,14 @@
+# slashwork Hermes adapter manifest.
+#
+# Written to the researched Hermes plugin format (docs/openclaw-hermes-hooks.md
+# in the coordinator repo); validate the exact schema against a live Hermes
+# install before release.
+name: slashwork
+version: 0.1.0
+description: >
+  Route self-contained delegate_task spawns to the slashwork offload network,
+  and earn credits running other users' tasks. Requires the slashwork-offload
+  core binary on PATH (or SLASHWORK_OFFLOAD_BIN).
+entrypoint: __init__.py
+# The entrypoint's register(ctx) wires a tool_execution middleware (offload) and
+# the slashwork-earn command (earn).
