@@ -6,7 +6,8 @@
 use crate::classify::Class;
 use crate::dispatch::{Artifact, Coordinator, PollOutcome, PostOutcome};
 use serde_json::Value;
-use std::time::Duration;
+use std::io::{BufRead, BufReader};
+use std::time::{Duration, Instant};
 
 /// Resolve the bearer token: `SLASHWORK_TOKEN`, else `~/.slashwork/token`.
 #[must_use]
@@ -75,12 +76,33 @@ impl UreqCoordinator {
     fn auth(&self) -> String {
         format!("Bearer {}", self.token)
     }
+}
 
-    fn agent(read_timeout: Duration) -> ureq::Agent {
-        ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(read_timeout)
-            .build()
+/// Build a short-lived agent with the given per-read timeout (connect capped at
+/// 10s). A hung server errors instead of hanging.
+fn build_agent(read_timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(read_timeout)
+        .build()
+}
+
+/// `Bearer <token>` for the authorization header.
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+/// Run a prepared request and return `(status, body)`. A non-2xx status is a
+/// normal outcome here, not an error; a transport failure maps to `(0, "")`.
+fn run(req: ureq::Request, body: Option<&str>) -> (u16, String) {
+    let result = match body {
+        Some(b) => req.send_string(b),
+        None => req.call(),
+    };
+    match result {
+        Ok(resp) => (resp.status(), resp.into_string().unwrap_or_default()),
+        Err(ureq::Error::Status(code, resp)) => (code, resp.into_string().unwrap_or_default()),
+        Err(_) => (0, String::new()),
     }
 }
 
@@ -94,7 +116,7 @@ impl Coordinator for UreqCoordinator {
             "deadline_secs": deadline_secs,
         })
         .to_string();
-        let agent = Self::agent(Duration::from_secs(15));
+        let agent = build_agent(Duration::from_secs(15));
         match agent
             .post(&url)
             .set("authorization", &self.auth())
@@ -119,7 +141,7 @@ impl Coordinator for UreqCoordinator {
             "{}/api/tasks/{task_id}/result?wait_secs={wait_secs}",
             self.base
         );
-        let agent = Self::agent(Duration::from_secs(wait_secs + 5));
+        let agent = build_agent(Duration::from_secs(wait_secs + 5));
         match agent.get(&url).set("authorization", &self.auth()).call() {
             Ok(resp) => parse_poll(&resp.into_string().unwrap_or_default()),
             Err(_) => PollOutcome::Error,
@@ -128,7 +150,7 @@ impl Coordinator for UreqCoordinator {
 
     fn cancel(&self, task_id: &str) {
         let url = format!("{}/api/tasks/{task_id}", self.base);
-        let agent = Self::agent(Duration::from_secs(8));
+        let agent = build_agent(Duration::from_secs(8));
         let _ = agent.delete(&url).set("authorization", &self.auth()).call();
     }
 }
@@ -196,8 +218,123 @@ fn parse_poll(text: &str) -> PollOutcome {
 }
 
 /// A 36-char hyphenated hex string, the coordinator's task id shape.
-fn is_uuid(s: &str) -> bool {
+pub(crate) fn is_uuid(s: &str) -> bool {
     s.len() == 36 && s.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
+// --- Earner side: claim, submit, login. ---
+
+/// `GET /api/me`: a cheap auth + reachability probe. Returns the HTTP status,
+/// or 0 when the coordinator is unreachable.
+#[must_use]
+pub fn probe_auth(base: &str, token: &str) -> u16 {
+    let agent = build_agent(Duration::from_secs(10));
+    run(
+        agent
+            .get(&format!("{base}/api/me"))
+            .set("authorization", &bearer(token)),
+        None,
+    )
+    .0
+}
+
+/// `POST /api/tasks/{task_id}/claim`. Returns `(status, body)`; the body on 200
+/// is the staged job JSON.
+#[must_use]
+pub fn post_claim(base: &str, token: &str, task_id: &str) -> (u16, String) {
+    let agent = build_agent(Duration::from_secs(20));
+    run(
+        agent
+            .post(&format!("{base}/api/tasks/{task_id}/claim"))
+            .set("authorization", &bearer(token)),
+        None,
+    )
+}
+
+/// `POST /api/tasks/{task_id}/submit` with `{artifact, tokens_used}`. Returns
+/// `(status, body)`; 201 means accepted for review.
+#[must_use]
+pub fn submit_task(
+    base: &str,
+    token: &str,
+    task_id: &str,
+    artifact: &str,
+    tokens_used: i64,
+) -> (u16, String) {
+    let body = serde_json::json!({ "artifact": artifact, "tokens_used": tokens_used }).to_string();
+    let agent = build_agent(Duration::from_secs(30));
+    run(
+        agent
+            .post(&format!("{base}/api/tasks/{task_id}/submit"))
+            .set("authorization", &bearer(token))
+            .set("content-type", "application/json"),
+        Some(&body),
+    )
+}
+
+/// `POST /auth/cli/start` (no auth). Returns `(request_id, verify_url)` on
+/// success. The user opens the verify URL and approves in the browser.
+#[must_use]
+pub fn login_start(base: &str) -> Option<(String, String)> {
+    let agent = build_agent(Duration::from_secs(15));
+    let (code, body) = run(agent.post(&format!("{base}/auth/cli/start")), None);
+    if code != 200 {
+        return None;
+    }
+    let v: Value = serde_json::from_str(&body).ok()?;
+    let request_id = v.get("request_id").and_then(Value::as_str)?.to_string();
+    let verify_url = v.get("verify_url").and_then(Value::as_str)?.to_string();
+    Some((request_id, verify_url))
+}
+
+/// One poll of `GET /auth/cli/{request_id}/token`. Returns `(status, body)` for
+/// `earn::login_poll`.
+#[must_use]
+pub fn login_poll_once(base: &str, request_id: &str) -> (u16, String) {
+    let agent = build_agent(Duration::from_secs(10));
+    run(
+        agent.get(&format!("{base}/auth/cli/{request_id}/token")),
+        None,
+    )
+}
+
+/// What to do after handling one SSE line.
+pub enum LineAction {
+    Continue,
+    Stop,
+}
+
+/// Open the queue SSE feed and call `on_line` for each line (trailing CR
+/// stripped) until it returns `Stop`, the stream ends, or `max_secs` elapses. A
+/// connect error returns immediately so the caller can reconnect.
+pub fn stream_queue(
+    base: &str,
+    token: &str,
+    max_secs: u64,
+    mut on_line: impl FnMut(&str) -> LineAction,
+) {
+    // Per-read timeout above the coordinator's 15s heartbeat, so a healthy
+    // stream is never cut mid-wait; the total is bounded by `max_secs` below.
+    let agent = build_agent(Duration::from_secs(20));
+    let Ok(resp) = agent
+        .get(&format!("{base}/api/queue/stream"))
+        .set("authorization", &bearer(token))
+        .call()
+    else {
+        return;
+    };
+    let start = Instant::now();
+    let reader = BufReader::new(resp.into_reader());
+    for line in reader.lines() {
+        if start.elapsed().as_secs() >= max_secs {
+            break;
+        }
+        let Ok(line) = line else { break };
+        let line = line.strip_suffix('\r').unwrap_or(line.as_str());
+        if matches!(on_line(line), LineAction::Stop) {
+            break;
+        }
+    }
 }
 
 #[cfg(test)]

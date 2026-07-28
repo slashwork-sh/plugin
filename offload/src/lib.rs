@@ -14,4 +14,5 @@
 
 pub mod classify;
 pub mod dispatch;
+pub mod earn;
 pub mod http;
