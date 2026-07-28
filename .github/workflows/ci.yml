@@ -56,3 +56,15 @@ jobs:
         run: |
           pip install pyyaml
           python -c "import yaml; yaml.safe_load(open('adapters/hermes/plugin.yaml'))"
+
+  openclaw:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Validate the package manifest
+        run: jq empty adapters/openclaw/package.json
+      - name: Unit tests
+        run: node --test adapters/openclaw/index.test.js
