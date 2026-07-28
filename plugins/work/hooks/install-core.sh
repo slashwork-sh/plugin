@@ -65,7 +65,11 @@ install() {
         return 0
     fi
 
+    # The archive is slashwork-offload-<target>.tar.gz; its checksum ships as a
+    # sibling named slashwork-offload-<target>.sha256 (the archive stem plus
+    # .sha256, NOT <archive>.tar.gz.sha256), matching taiki-e's `checksum: sha256`.
     asset="slashwork-offload-${target}.tar.gz"
+    checksum="slashwork-offload-${target}.sha256"
     base="https://github.com/${REPO}/releases/download/${VERSION}"
     tmp=$(mktemp -d) || return 1
     trap 'rm -rf "$tmp"' EXIT
@@ -74,12 +78,12 @@ install() {
         log "download failed: $base/$asset"
         return 1
     }
-    curl -fsSL -o "$tmp/$asset.sha256" "$base/$asset.sha256" || {
-        log "checksum download failed"
+    curl -fsSL -o "$tmp/$checksum" "$base/$checksum" || {
+        log "checksum download failed: $base/$checksum"
         return 1
     }
 
-    want=$(cut -d' ' -f1 <"$tmp/$asset.sha256")
+    want=$(cut -d' ' -f1 <"$tmp/$checksum")
     got=$(sha256_of "$tmp/$asset") || { log "no sha256 tool"; return 1; }
     [ "$want" = "$got" ] || { log "checksum mismatch (want $want, got $got)"; return 1; }
 
