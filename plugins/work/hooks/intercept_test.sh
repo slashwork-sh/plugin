@@ -1,120 +1,68 @@
 #!/usr/bin/env bash
-# Integration test for the PreToolUse(Task) intercept hook.
+# Integration test for the PreToolUse(Task|Agent) intercept hook.
 #
-# Drives intercept.sh with realistic PreToolUse envelopes against a scripted
-# mock coordinator and asserts the decision every time: a returned artifact
-# becomes a `deny` carrying the result, and every other path (cold pool, wrong
-# tool, self-worker, local prompt, secret, opt-out) falls through to the local
-# spawn (exit 0, no decision) and sends nothing it should not.
+# The classifier, secret scan, and dispatch loop now live in the shared
+# slashwork-offload core (unit-tested in offload/src/*.rs and end to end in
+# offload/tests/classify_cli.rs). This test covers what stays in the hook: the
+# opt-out gate, envelope parsing, the self-worker fast path, the token presence
+# gate, the once-per-session consent disclosure, and rendering the core's
+# decision as a `deny` (with the savings receipt) or a clean local fall-through.
+#
+# It drives the hook against a FAKE core: a stub that records each subcommand it
+# is called with and echoes a canned decision from the environment. So the test
+# needs no coordinator and no Rust build, and asserts exactly the bash contract:
+# which subcommand ran, and what the hook emitted.
 #
 # Run: bash plugins/work/hooks/intercept_test.sh
 set -uo pipefail
 
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 INTERCEPT="$HOOK_DIR/intercept.sh"
-PORT="${MOCK_PORT:-8747}"
-BASE="http://127.0.0.1:$PORT"
-LOG="/tmp/slashwork-intercepttest-req.log"
 TOKEN="testtoken"
-# Route log to a temp file so the hook's verdict logging is assertable and never
-# touches the real ~/.slashwork/route-log.jsonl. Exported so every inline
-# `VAR=x bash "$INTERCEPT"` invocation below inherits it.
-export SLASHWORK_ROUTE_LOG="/tmp/slashwork-intercepttest-routelog.jsonl"
+SESS="itest-fixed"
 PASS=0
 
 fail() { echo "FAIL: $1"; [ -n "${2:-}" ] && { echo "--- detail ---"; echo "$2"; }; exit 1; }
 ok() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 
-# Mock coordinator. Behavior is set per-scenario by the MODE file it reads on
-# each request, so one long-lived server serves every case. It appends each
-# request path to $LOG so a scenario can assert "nothing was POSTed."
-MODEFILE="/tmp/slashwork-intercepttest-mode"
-start_mock() {
-  python3 - "$PORT" "$LOG" "$MODEFILE" <<'PY' &
-import sys, json, http.server, socketserver
-port, logf, modef = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-def mode():
-    try:
-        return open(modef).read().strip()
-    except FileNotFoundError:
-        return "cold"
-class H(http.server.BaseHTTPRequestHandler):
-    def _log(self):
-        open(logf, "a").write(self.command + " " + self.path + "\n")
-    def do_POST(self):
-        self._log()
-        n = int(self.headers.get('content-length', 0)); self.rfile.read(n)
-        if mode() == "no-credits":
-            # POST /api/tasks -> the requester cannot pay; nothing is created.
-            self.send_response(400); self.send_header("content-type","application/json"); self.end_headers()
-            self.wfile.write(json.dumps({"error":{"code":"validation_failed","message":"not enough credits to route this task: you have 3, it costs 50"}}).encode())
-            return
-        # POST /api/tasks -> create a task
-        self.send_response(201); self.send_header("content-type","application/json"); self.end_headers()
-        self.wfile.write(json.dumps({"task_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","status":"queued","cost":50}).encode())
-    def do_GET(self):
-        self._log()
-        m = mode()
-        if m == "returned":
-            body = {"status":"returned","artifact":"OFFLOAD ARTIFACT: the answer.","tokens_used":123,"class":"research","cost":50,"settled":12,"tokens_saved_total":4560}
-        elif m == "returned-multiline":
-            body = {"status":"returned","artifact":"LINE ONE of the report\nLINE TWO details\nLINE THREE conclusion","tokens_used":200}
-        elif m == "review-then-return":
-            # First poll: the gate is running (reviewing). Next poll: accepted.
-            # Proves the hook waits through review instead of cancelling local.
-            import os
-            flip = logf + ".flip"
-            if not os.path.exists(flip):
-                open(flip, "w").write("1"); body = {"status":"reviewing"}
-            else:
-                body = {"status":"returned","artifact":"GRACE ARTIFACT: accepted late.","tokens_used":77}
-        elif m == "claim-then-die":
-            # First poll: claimed. Then the coordinator dies (500) mid-wait, so
-            # the hook must cancel and fall back local rather than hang.
-            import os
-            flip = logf + ".flip"
-            if not os.path.exists(flip):
-                open(flip, "w").write("1"); body = {"status":"claimed"}
-            else:
-                self.send_response(500); self.end_headers(); self.wfile.write(b'{"error":"down"}'); return
-        elif m == "review-then-expire":
-            # Reviewing for the first few polls, then expired: exercises the
-            # deadline grace loop ending in a local fallback, not a stale emit.
-            import os
-            ctrf = logf + ".ctr"
-            try:
-                c = int(open(ctrf).read().strip())
-            except Exception:
-                c = 0
-            c += 1
-            open(ctrf, "w").write(str(c))
-            body = {"status":"reviewing"} if c <= 3 else {"status":"expired"}
-        elif m == "claimed":
-            body = {"status":"claimed"}
-        else:  # cold: nobody claims
-            body = {"status":"queued"}
-        self.send_response(200); self.send_header("content-type","application/json"); self.end_headers()
-        self.wfile.write(json.dumps(body).encode())
-    def do_DELETE(self):
-        self._log()
-        self.send_response(200); self.end_headers(); self.wfile.write(b'{"refunded":true}')
-    def log_message(self, *a): pass
-socketserver.TCPServer.allow_reuse_address = True
-with socketserver.TCPServer(("127.0.0.1", port), H) as s:
-    s.serve_forever()
-PY
-  MOCK=$!
-  disown "$MOCK" 2>/dev/null || true   # keep job control from printing "Terminated" at exit
-  sleep 0.6
-}
-stop_mock() { kill "$MOCK" 2>/dev/null || true; }
-trap 'stop_mock; rm -f "$LOG" "$LOG.flip" "$LOG.ctr" "$MODEFILE" "$SLASHWORK_ROUTE_LOG" /tmp/slashwork-intercept-consent-*' EXIT
-start_mock
+# A sandbox HOME so the hook's ~/.slashwork writes (savings.log) and the token
+# presence check never touch the real home or a dev's real token.
+SANDBOX="$(mktemp -d)"
+export HOME="$SANDBOX"
+export SLASHWORK_ROUTE_LOG="$SANDBOX/route-log.jsonl"
+FAKE_CORE_LOG="$SANDBOX/core-calls.log"
+export FAKE_CORE_LOG
 
-# A fixed session id whose consent marker the routing scenarios pre-create, so
-# they exercise the dispatch path rather than the once-per-session consent gate
-# (which is tested on its own in the last scenario, with a fresh session).
-SESS="itest-fixed"
+# The fake core: record each subcommand to FAKE_CORE_LOG, drain the envelope on
+# stdin (so the hook's pipe never breaks), and echo the canned decision for that
+# subcommand from the environment. Always exits 0, like the real core.
+CORE="$SANDBOX/slashwork-offload"
+cat > "$CORE" <<'FAKE'
+#!/usr/bin/env bash
+# Emit the canned decision the test set for this subcommand. Empty (var unset)
+# reads to the hook as no decision -> local, which is a valid outcome to assert.
+{ printf '%s\n' "$1" >> "${FAKE_CORE_LOG:-/dev/null}"; } 2>/dev/null
+cat >/dev/null
+case "$1" in
+  classify) printf '%s\n' "${FAKE_CLASSIFY:-}" ;;
+  route)    printf '%s\n' "${FAKE_ROUTE:-}" ;;
+  *)        printf '{}\n' ;;
+esac
+exit 0
+FAKE
+chmod +x "$CORE"
+export SLASHWORK_OFFLOAD_BIN="$CORE"
+
+trap 'rm -rf "$SANDBOX" /tmp/slashwork-intercept-consent-* 2>/dev/null' EXIT
+
+# Canned decisions the fake core echoes (the JSON \n stay escaped: the hook's jq
+# reads them as real newlines).
+ART='{"decision":"artifact","task_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","class":"research","artifact":"OFFLOAD ARTIFACT: the answer.","wrapped":"UNTRUSTED third-party content.\n\nOFFLOAD ARTIFACT: the answer.","tokens_used":123,"settled":12,"tokens_saved_total":4560}'
+ART_ML='{"decision":"artifact","task_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","class":"prose","artifact":"LINE ONE of the report\nLINE TWO details\nLINE THREE conclusion","tokens_used":200,"settled":20,"tokens_saved_total":200}'
+LOCAL_COLD='{"decision":"local","reason":"no earner claimed within 5s"}'
+LOCAL_CREDITS='{"decision":"local","reason":"not enough credits: you have 3, it costs 50"}'
+ROUTABLE='{"decision":"routable","class":"research"}'
+NOTROUTABLE='{"decision":"local","reason":"no single confident class (matched 0)"}'
 
 # envelope <prompt> <tool_name> <session> -> a PreToolUse envelope on stdout
 envelope() {
@@ -123,270 +71,180 @@ envelope() {
       tool_input:{subagent_type:"general-purpose", description:"d", prompt:$p}}'
 }
 
-run() { # run <mode> <prompt> [tool] ; echoes hook stdout, sets RC
-  printf '%s' "$1" > "$MODEFILE"
-  : > "$LOG"
-  : > "/tmp/slashwork-intercept-consent-$SESS"   # consent already given this session
-  OUT=$(envelope "$2" "${3:-Task}" | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+consent_given() { : > "/tmp/slashwork-intercept-consent-${1:-$SESS}"; }
+core_called() { grep -qx "$1" "$FAKE_CORE_LOG" 2>/dev/null; }
+decision() { printf '%s' "$1" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null; }
+reason() { printf '%s' "$1" | jq -r '.hookSpecificOutput.permissionDecisionReason // empty' 2>/dev/null; }
+sysmsg() { printf '%s' "$1" | jq -r '.systemMessage // empty' 2>/dev/null; }
+
+# invoke <prompt> [tool] [session] -> sets OUT, RC. Signed in, interception on.
+# The caller sets FAKE_ROUTE / FAKE_CLASSIFY (exported) first.
+invoke() {
+  : > "$FAKE_CORE_LOG"
+  OUT=$(envelope "$1" "${2:-Task}" "${3:-$SESS}" \
+    | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" bash "$INTERCEPT" 2>/dev/null)
   RC=$?
 }
 
-# 1. Routable research task, an earner returns -> deny carrying the artifact.
-run returned "Research and compare the leading approaches to rate limiting; give pros and cons of each."
-[ "$RC" = "0" ] || fail "routed-return exit code $RC"
-DEC=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
-[ "$DEC" = "deny" ] || fail "routed return should deny local spawn" "$OUT"
-printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -q "OFFLOAD ARTIFACT" \
-  || fail "deny reason missing the artifact" "$OUT"
-printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -qi "untrusted" \
-  || fail "deny reason must mark the artifact untrusted" "$OUT"
-# The user's receipt: tokens saved, credits settled, the ASCII plot, and the
-# /earn pointer.
-SM=$(printf '%s' "$OUT" | jq -r '.systemMessage // empty' 2>/dev/null)
+# 1. Routable spawn, the core returns an artifact -> deny carrying the wrapped
+#    (untrusted) artifact, plus the savings receipt.
+consent_given
+export FAKE_ROUTE="$ART"
+invoke "Research and compare the leading approaches to rate limiting; give pros and cons of each."
+[ "$RC" = 0 ] || fail "artifact exit code $RC" "$OUT"
+[ "$(decision "$OUT")" = "deny" ] || fail "artifact must deny the local spawn" "$OUT"
+reason "$OUT" | grep -q "OFFLOAD ARTIFACT" || fail "deny reason missing the artifact" "$OUT"
+reason "$OUT" | grep -qi "untrusted" || fail "deny reason must mark the artifact untrusted" "$OUT"
+SM=$(sysmsg "$OUT")
 printf '%s' "$SM" | grep -q "123 tokens" || fail "systemMessage missing tokens saved" "$OUT"
 printf '%s' "$SM" | grep -q "12 cr" || fail "systemMessage missing settled credits" "$OUT"
 printf '%s' "$SM" | grep -q "tokens saved" || fail "systemMessage missing the plot header" "$OUT"
 printf '%s' "$SM" | grep -q "/earn" || fail "systemMessage missing the /earn pointer" "$OUT"
-grep -q "POST /api/tasks" "$LOG" || fail "should have POSTed the task" "$(cat "$LOG")"
-ok "routable task returns -> deny with untrusted artifact + saved-tokens receipt"
+core_called route || fail "the hook should have called the core's route" "$(cat "$FAKE_CORE_LOG")"
+ok "routable artifact -> deny with untrusted artifact + saved-tokens receipt"
 
-# 1b. Reviewing (the gate is running) must keep waiting, not cancel to local;
-#     when the gate accepts inside the grace, the artifact is emitted. This
-#     guards the double-charge path: cancelling here while an accept can still
-#     pay the earner would charge the requester credits AND run local.
-printf review-then-return > "$MODEFILE"; : > "$LOG"; rm -f "$LOG.flip"
-: > "/tmp/slashwork-intercept-consent-$SESS"
-OUT=$(envelope "Research and compare the options; pros and cons of each." \
-  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
-DEC=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
-[ "$DEC" = "deny" ] || fail "reviewing then accepted should deny local and emit the artifact" "$OUT"
-printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' | grep -q "GRACE ARTIFACT" \
-  || fail "should emit the accepted artifact after review" "$OUT"
-if grep -q "DELETE /api/tasks/" "$LOG"; then fail "must NOT cancel while reviewing (would double-charge)" "$(cat "$LOG")"; fi
-ok "reviewing keeps waiting -> emits accepted artifact, no cancel"
+# 2. Multi-line artifact returned whole (not truncated to line 1); with no
+#    `wrapped` field the hook falls back to the raw artifact.
+export FAKE_ROUTE="$ART_ML"
+invoke "Draft a report summarizing the quarterly numbers; revenue up, costs flat."
+R=$(reason "$OUT")
+printf '%s' "$R" | grep -q "LINE ONE" || fail "multiline: line 1 missing" "$R"
+printf '%s' "$R" | grep -q "LINE THREE" || fail "multiline artifact truncated (line 3 dropped)" "$R"
+ok "multi-line artifact (no wrapped) returned whole via .artifact fallback"
 
-# 2. Cold pool: nobody claims within the window -> cancel + local spawn.
-run cold "Draft a report summarizing the quarterly numbers below: revenue up, costs flat."
-[ "$RC" = "0" ] || fail "cold-pool exit code $RC"
-[ -z "$OUT" ] || fail "cold pool must emit no decision (local spawn)" "$OUT"
-grep -q "POST /api/tasks" "$LOG" || fail "cold pool should still POST then cancel" "$(cat "$LOG")"
-grep -q "DELETE /api/tasks/" "$LOG" || fail "cold pool should cancel the task for a refund" "$(cat "$LOG")"
-ok "cold pool -> cancel + local fallback"
+# 3. The core returns local (cold pool, decline, any dispatch failure) -> clean
+#    fall-through: no decision, no output, local spawn.
+export FAKE_ROUTE="$LOCAL_COLD"
+invoke "Research and compare the options; pros and cons of each."
+if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "a local decision must fall through silently" "$OUT"; fi
+core_called route || fail "should still have called route" "$(cat "$FAKE_CORE_LOG")"
+ok "core returns local -> silent local fall-through"
 
-# 3. Non-Task tool -> untouched, nothing sent.
-run cold "anything" Bash
-if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "non-Task tool should be a no-op" "$OUT"; fi
-[ ! -s "$LOG" ] || fail "non-Task tool must not contact the coordinator" "$(cat "$LOG")"
-ok "non-Task tool -> no-op"
+# 4. Non-subagent tool -> no-op, the core is never called.
+export FAKE_ROUTE="$ART"
+invoke "anything" Bash
+if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "non-subagent tool should be a no-op" "$OUT"; fi
+[ ! -s "$FAKE_CORE_LOG" ] || fail "non-subagent tool must not call the core" "$(cat "$FAKE_CORE_LOG")"
+ok "non-subagent tool -> no-op, core untouched"
 
-# 4. Self-worker (prompt carries task_id:) -> never routed.
-run cold "task_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+# 5. Self-worker (prompt carries task_id:) -> fast-path pass-through, core never
+#    called (never repost our own work, and skip the subprocess).
+invoke "task_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
 Read the job and solve it."
-if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "self-worker should pass through" "$OUT"; fi
-[ ! -s "$LOG" ] || fail "self-worker must not be routed" "$(cat "$LOG")"
-ok "self-worker (task_id) -> not routed"
+if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "self-worker should pass through" "$OUT"; fi
+[ ! -s "$FAKE_CORE_LOG" ] || fail "self-worker must not call the core" "$(cat "$FAKE_CORE_LOG")"
+ok "self-worker (task_id) -> pass-through, core untouched"
 
-# 5. Local-path prompt -> declined before any network.
-run returned "Refactor the function in ./src/main.rs and run the tests."
-if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "local-path prompt should decline to local" "$OUT"; fi
-[ ! -s "$LOG" ] || fail "local-path prompt must not be routed" "$(cat "$LOG")"
-ok "local-path prompt -> declined, no network"
+# 6. Empty prompt -> no-op.
+invoke ""
+if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "empty prompt should be a no-op" "$OUT"; fi
+[ ! -s "$FAKE_CORE_LOG" ] || fail "empty prompt must not call the core" "$(cat "$FAKE_CORE_LOG")"
+ok "empty prompt -> no-op"
 
-# 6. Secret in prompt -> declined before any network.
-run returned "Write a script that authenticates with api_key sk-abcdefTOPSECRET and fetches data."
-if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "secret prompt should decline" "$OUT"; fi
-[ ! -s "$LOG" ] || fail "secret prompt must not be routed" "$(cat "$LOG")"
-ok "secret in prompt -> declined, no network"
+# 7. Not signed in (no SLASHWORK_TOKEN and no ~/.slashwork/token in the sandbox
+#    HOME) -> inert: no consent notice, core never called.
+: > "$FAKE_CORE_LOG"
+OUT=$(envelope "Research and compare the options; pros and cons of each." \
+  | env -u SLASHWORK_TOKEN SLASHWORK_INTERCEPT=1 bash "$INTERCEPT" 2>/dev/null)
+RC=$?
+if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "no token must be inert" "$OUT"; fi
+[ ! -s "$FAKE_CORE_LOG" ] || fail "no token must not call the core" "$(cat "$FAKE_CORE_LOG")"
+ok "no token -> inert, core untouched"
 
-# 7. Ambiguous / no confident class -> declined, no network.
-run returned "Do the needful with the thing."
-if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "unclassifiable prompt should decline" "$OUT"; fi
-[ ! -s "$LOG" ] || fail "unclassifiable prompt must not be routed" "$(cat "$LOG")"
-ok "no confident class -> declined, no network"
+# 8. Core binary missing/broken (bogus SLASHWORK_OFFLOAD_BIN) -> the exec fails,
+#    the hook reads no decision and falls back to a local spawn. The iron rule:
+#    a broken core never hangs or errors, it runs local.
+consent_given
+: > "$FAKE_CORE_LOG"
+OUT=$(envelope "Research and compare the options; pros and cons of each." \
+  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_OFFLOAD_BIN="/no/such/slashwork-offload" \
+      bash "$INTERCEPT" 2>/dev/null)
+RC=$?
+if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "a broken core must fall back to local" "$OUT"; fi
+ok "broken core binary -> local fall-through, no hang"
 
-# 8. Multi-line artifact is returned whole, not truncated to its first line.
-printf returned-multiline > "$MODEFILE"; : > "$LOG"; : > "/tmp/slashwork-intercept-consent-$SESS"
-OUT=$(envelope "Research and compare the leading approaches; give pros and cons of each." \
-  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
-REASON=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecisionReason' 2>/dev/null)
-printf '%s' "$REASON" | grep -q "LINE ONE"   || fail "multiline: line 1 missing" "$REASON"
-printf '%s' "$REASON" | grep -q "LINE THREE" || fail "multiline artifact truncated (line 3 dropped)" "$REASON"
-ok "multi-line artifact returned whole"
-
-# 9. First-candidate consent gate: a fresh session's first routable spawn runs
-#    local, shows the disclosure as a visible systemMessage (stderr only shows
-#    in verbose mode), and sends nothing; routing starts next time.
+# 9. First-candidate consent gate: a fresh session's first ROUTABLE spawn runs
+#    local, shows the disclosure as a visible systemMessage, and calls only
+#    classify (never route); the next spawn routes.
 FRESH="itest-fresh-$RANDOM"
 rm -f "/tmp/slashwork-intercept-consent-$FRESH"
-printf returned > "$MODEFILE"; : > "$LOG"
-OUT=$(envelope "Research and compare the options; pros and cons of each." Task "$FRESH" \
-  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
-RC=$?
-[ "$RC" = "0" ] || fail "first candidate exit code $RC" "$OUT"
-DEC=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
-[ -z "$DEC" ] || fail "first candidate must carry no decision (local spawn)" "$OUT"
-printf '%s' "$OUT" | jq -r '.systemMessage // empty' 2>/dev/null | grep -q "slashwork intercept is on" \
-  || fail "first candidate must show the disclosure as a systemMessage" "$OUT"
-[ ! -s "$LOG" ] || fail "first candidate must send nothing before consent shown" "$(cat "$LOG")"
+export FAKE_CLASSIFY="$ROUTABLE"
+export FAKE_ROUTE="$ART"
+invoke "Research and compare the options; pros and cons of each." Task "$FRESH"
+[ "$RC" = 0 ] || fail "first candidate exit code $RC" "$OUT"
+[ -z "$(decision "$OUT")" ] || fail "first candidate must carry no decision" "$OUT"
+sysmsg "$OUT" | grep -q "slashwork intercept is on" || fail "first candidate must show the disclosure" "$OUT"
+core_called classify || fail "consent gate should classify" "$(cat "$FAKE_CORE_LOG")"
+core_called route && fail "consent gate must NOT dispatch the first spawn" "$(cat "$FAKE_CORE_LOG")"
 # Second candidate in the same session now routes.
-: > "$LOG"
-OUT=$(envelope "Research and compare the options; pros and cons of each." Task "$FRESH" \
-  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
-[ "$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)" = "deny" ] \
-  || fail "second candidate should route" "$OUT"
-ok "first-candidate consent gate -> local then route"
+invoke "Research and compare the options; pros and cons of each." Task "$FRESH"
+[ "$(decision "$OUT")" = "deny" ] || fail "second candidate should route" "$OUT"
+core_called route || fail "second candidate should dispatch" "$(cat "$FAKE_CORE_LOG")"
+ok "consent gate -> disclose+local first, route second"
 
-# 10. Broadened decline filters: extensions and absolute paths outside the old set.
-for P in \
-  "Summarize the findings in q3-results.csv" \
-  "Review the following errors in /var/log/app.log" \
-  "Implement a function matching the interface in api.h" \
-  "Review the dataset in src/data.csv"; do
-  run returned "$P"
-  [ -z "$OUT" ] || fail "should decline local-file prompt: $P" "$OUT"
-  [ ! -s "$LOG" ] || fail "should not route local-file prompt: $P" "$(cat "$LOG")"
-done
-ok "broadened path/extension decline (csv, /var, .h, src/)"
+# 10. Consent gate on a NON-routable first spawn: no disclosure, and consent is
+#     not marked, so a later routable spawn still gets the notice. Classify runs,
+#     route does not.
+FRESH2="itest-fresh2-$RANDOM"
+rm -f "/tmp/slashwork-intercept-consent-$FRESH2"
+export FAKE_CLASSIFY="$NOTROUTABLE"
+invoke "Do the needful with the thing." Task "$FRESH2"
+[ -z "$OUT" ] || fail "a non-routable first spawn must be silent (no disclosure)" "$OUT"
+core_called classify || fail "should classify to decide the consent notice" "$(cat "$FAKE_CORE_LOG")"
+core_called route && fail "a non-routable spawn must not dispatch" "$(cat "$FAKE_CORE_LOG")"
+[ ! -f "/tmp/slashwork-intercept-consent-$FRESH2" ] || fail "a non-routable spawn must not consume consent" ""
+ok "non-routable first spawn -> silent, consent not consumed"
 
-# 11. Broadened secret scan: key families beyond the old set.
-for P in \
-  "Write a function that charges a card with key sk_live_51abcdEFGHijklMNOP" \
-  "Implement a script using github_pat_11ABCDEFG0abcdefghij" \
-  "Write a function that calls the API with AIzaSyD-abcdefghijklmnopqrstuvwxyz012"; do
-  run returned "$P"
-  [ -z "$OUT" ] || fail "should decline secret-bearing prompt: $P" "$OUT"
-  [ ! -s "$LOG" ] || fail "should not route secret-bearing prompt: $P" "$(cat "$LOG")"
-done
-ok "broadened secret scan (sk_live_, github_pat_, AIza)"
-
-# 12. Default-on: SLASHWORK_INTERCEPT unset -> intercepts (install + token is
-#     the opt-in; env -u guarantees the var is absent regardless of the
-#     caller's environment).
-: > "$LOG"; printf returned > "$MODEFILE"; : > "/tmp/slashwork-intercept-consent-$SESS"
-OUT=$(envelope "Research and compare the options; pros and cons of each." \
-  | env -u SLASHWORK_INTERCEPT SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
-[ "$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision' 2>/dev/null)" = "deny" ] \
-  || fail "unset must intercept (interception is default-on)" "$OUT"
-ok "SLASHWORK_INTERCEPT unset -> intercepts (default-on)"
-
-# 13. Opt-out: SLASHWORK_INTERCEPT=0 -> total no-op, nothing sent. The hook
-#     exits at the opt-out gate BEFORE reading stdin, so a piped producer (jq in
-#     envelope) would get SIGPIPE and, under `set -o pipefail`, fail the whole
-#     pipeline spuriously. Feed the envelope as a here-string so there is no
-#     upstream producer to break.
-: > "$LOG"; printf returned > "$MODEFILE"
-ENV_OPTOUT=$(envelope "Research and compare the options.")
-OUT=$(SLASHWORK_INTERCEPT=0 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" \
-  bash "$INTERCEPT" 2>/dev/null <<< "$ENV_OPTOUT")
-RC=$?
-if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "opted out must be a no-op" "$OUT"; fi
-[ ! -s "$LOG" ] || fail "opted out must not contact the coordinator" "$(cat "$LOG")"
-ok "SLASHWORK_INTERCEPT=0 -> no-op"
-
-# 14. Non-https base -> decline before any network (the token must not leave for
-#     an arbitrary host). The base check runs before the classifier, so even a
-#     routable prompt is declined.
-: > "$LOG"; printf returned > "$MODEFILE"; : > "/tmp/slashwork-intercept-consent-$SESS"
-OUT=$(envelope "Research and compare the options; pros and cons of each." \
-  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="http://evil.example" bash "$INTERCEPT" 2>/dev/null)
-RC=$?
-if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "non-https base must decline to local" "$OUT"; fi
-[ ! -s "$LOG" ] || fail "non-https base must not contact any coordinator" "$(cat "$LOG")"
-ok "non-https base -> declined, no network"
-
-# 15. Coordinator dies after the claim: the next poll errors (500) mid-wait, so
-#     the hook cancels (refund) and falls back local instead of hanging.
-printf claim-then-die > "$MODEFILE"; : > "$LOG"; rm -f "$LOG.flip"; : > "/tmp/slashwork-intercept-consent-$SESS"
-OUT=$(envelope "Research and compare the options; pros and cons of each." \
-  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
-RC=$?
-if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "a dying coordinator must fall back to local" "$OUT"; fi
-grep -q "DELETE /api/tasks/" "$LOG" || fail "should cancel the task when the poll errors" "$(cat "$LOG")"
-ok "coordinator dies after claim -> cancel + local, no hang"
-
-# 16. Reviewing then expired (the gate rejected within the grace): the hook rides
-#     the grace poll loop, then falls back local, never emitting a stale artifact.
-printf review-then-expire > "$MODEFILE"; : > "$LOG"; rm -f "$LOG.ctr"; : > "/tmp/slashwork-intercept-consent-$SESS"
-OUT=$(envelope "Research and compare the options; pros and cons of each." \
-  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
-RC=$?
-if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "reviewing that expires must fall back to local" "$OUT"; fi
-grep -q "DELETE /api/tasks/" "$LOG" || fail "should cancel after the grace loop ends expired" "$(cat "$LOG")"
-ok "reviewing then expired -> local fallback after the grace loop"
-
-# 16b. Out of credits: the POST is rejected before any task exists, so the
-#      spawn runs locally (no decision, no cancel) and the user gets a visible
-#      systemMessage pointing at /earn.
-printf no-credits > "$MODEFILE"; : > "$LOG"; : > "/tmp/slashwork-intercept-consent-$SESS"
-OUT=$(envelope "Research and compare the options; pros and cons of each." \
-  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
-RC=$?
-[ "$RC" = "0" ] || fail "out-of-credits exit code $RC" "$OUT"
-DEC=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
-[ -z "$DEC" ] || fail "out of credits must carry no decision (local spawn)" "$OUT"
-SM=$(printf '%s' "$OUT" | jq -r '.systemMessage // empty' 2>/dev/null)
+# 11. Out of credits: the core returns a local decision whose reason names it, so
+#     the hook shows a visible /earn nudge and runs local (no decision).
+consent_given
+export FAKE_ROUTE="$LOCAL_CREDITS"
+invoke "Research and compare the options; pros and cons of each."
+[ "$RC" = 0 ] || fail "out-of-credits exit code $RC" "$OUT"
+[ -z "$(decision "$OUT")" ] || fail "out of credits must carry no decision" "$OUT"
+SM=$(sysmsg "$OUT")
 printf '%s' "$SM" | grep -q "not enough credits" || fail "out-of-credits message missing the reason" "$OUT"
 printf '%s' "$SM" | grep -q "/earn" || fail "out-of-credits message missing the /earn pointer" "$OUT"
-if grep -q "DELETE /api/tasks/" "$LOG"; then fail "no task was created, nothing to cancel" "$(cat "$LOG")"; fi
 ok "out of credits -> local spawn + visible /earn nudge"
 
-# 17. The subagent tool is named Agent on newer Claude Code builds. An
-#     Agent-named envelope must route exactly like a Task-named one; pinning
-#     this to Task made interception silently inert on those builds.
-printf returned > "$MODEFILE"; : > "$LOG"; : > "/tmp/slashwork-intercept-consent-$SESS"
-OUT=$(envelope "Research and compare the options; pros and cons of each." Agent \
-  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
-DEC=$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)
-[ "$DEC" = "deny" ] || fail "an Agent-named spawn must route like a Task one" "$OUT"
-grep -q "POST /api/tasks" "$LOG" || fail "Agent-named spawn should have POSTed the task" "$(cat "$LOG")"
+# 12. Agent tool name routes like Task (newer Claude Code builds rename it).
+export FAKE_ROUTE="$ART"
+invoke "Research and compare the options; pros and cons of each." Agent
+[ "$(decision "$OUT")" = "deny" ] || fail "an Agent-named spawn must route like a Task one" "$OUT"
+core_called route || fail "Agent-named spawn should dispatch" "$(cat "$FAKE_CORE_LOG")"
 ok "Agent tool name routes like Task"
 
-# 18. An unrelated tool name stays a no-op: nothing sent, no output.
-: > "$LOG"
-OUT=$(envelope "Research and compare the options; pros and cons of each." Bash \
-  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_BASE_URL="$BASE" bash "$INTERCEPT" 2>/dev/null)
+# 13. Default-on: SLASHWORK_INTERCEPT unset -> intercepts (install + token is the
+#     opt-in). env -u guarantees the var is absent.
+export FAKE_ROUTE="$ART"
+: > "$FAKE_CORE_LOG"
+OUT=$(envelope "Research and compare the options; pros and cons of each." \
+  | env -u SLASHWORK_INTERCEPT SLASHWORK_TOKEN="$TOKEN" bash "$INTERCEPT" 2>/dev/null)
+[ "$(decision "$OUT")" = "deny" ] || fail "unset must intercept (default-on)" "$OUT"
+ok "SLASHWORK_INTERCEPT unset -> intercepts (default-on)"
+
+# 14. Opt-out: SLASHWORK_INTERCEPT=0 -> total no-op, core never called. The hook
+#     exits at the opt-out gate before reading stdin, so feed the envelope as a
+#     here-string (no upstream producer to SIGPIPE under pipefail).
+ENV_OPTOUT=$(envelope "Research and compare the options.")
+: > "$FAKE_CORE_LOG"
+OUT=$(SLASHWORK_INTERCEPT=0 SLASHWORK_TOKEN="$TOKEN" bash "$INTERCEPT" 2>/dev/null <<< "$ENV_OPTOUT")
 RC=$?
-if ! { [ "$RC" = "0" ] && [ -z "$OUT" ]; }; then fail "a non-subagent tool must be a no-op" "$OUT"; fi
-[ ! -s "$LOG" ] || fail "a non-subagent tool must not contact the coordinator" "$(cat "$LOG")"
-ok "non-subagent tool names stay untouched"
+if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "opted out must be a no-op" "$OUT"; fi
+[ ! -s "$FAKE_CORE_LOG" ] || fail "opted out must not call the core" "$(cat "$FAKE_CORE_LOG")"
+ok "SLASHWORK_INTERCEPT=0 -> no-op"
 
-# 19. Prose punctuation and rate terms are not local files. Research prose with
-#     "e.g."/"i.e." or a single-slash rate term ("requests/second") reads as a
-#     filename/path to a naive check but is ordinary prose; it must route.
-for P in \
-  "Research and compare rate limiting algorithms, e.g. token bucket and leaky bucket; give the pros and cons of each." \
-  "Research the leading caching strategies, i.e. write-through and write-back, and compare the pros and cons of each." \
-  "Research and compare API gateway designs that sustain 5000 requests/second; give the pros and cons of each."; do
-  run returned "$P"
-  [ "$(printf '%s' "$OUT" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null)" = "deny" ] \
-    || fail "prose punctuation / rate term should route: $P" "$OUT"
-  grep -q "POST /api/tasks" "$LOG" || fail "should have POSTed for: $P" "$(cat "$LOG")"
-done
-ok "prose punctuation (e.g./i.e.) and rate terms (requests/second) route"
-
-# 19b. Over-widening guard: real files (a known extension) and deep relative
-#      paths (2+ separators) still decline before any network.
-for P in \
-  "Research and compare the schemas defined in src/models/user/schema; give pros and cons." \
-  "Research and compare the numbers captured in benchmark.csv; give the pros and cons of each." \
-  "Research and compare the interfaces declared in api.h; give the pros and cons of each."; do
-  run returned "$P"
-  [ -z "$OUT" ] || fail "real file / deep path must still decline: $P" "$OUT"
-  [ ! -s "$LOG" ] || fail "must not route real file / deep path: $P" "$(cat "$LOG")"
-done
-ok "real files (.csv, .h) and deep paths (a/b/c) still decline"
-
-# 20. Route log: every intercepted spawn records its verdict to
-#     SLASHWORK_ROUTE_LOG (routed with its class, or local with the decline
-#     reason), so the routable share and the top decline reasons are readable
-#     from data. stderr alone is verbose-only and vanishes.
+# 15. Route log records the verdict the hook observes: routed (with the class) on
+#     an artifact, local (with the reason) on a local decision.
 : > "$SLASHWORK_ROUTE_LOG"
-run returned "Research and compare the leading rate limiting algorithms; give the pros and cons of each."
+export FAKE_ROUTE="$ART"
+invoke "Research and compare the leading rate limiting algorithms; give the pros and cons of each."
 grep -q '"decision":"routed","detail":"research"' "$SLASHWORK_ROUTE_LOG" \
   || fail "route log missing the routed research verdict" "$(cat "$SLASHWORK_ROUTE_LOG")"
-run returned "Please refactor the code in this file and run the tests."
+export FAKE_ROUTE="$LOCAL_COLD"
+invoke "Research and compare the options; pros and cons of each."
 grep -q '"decision":"local"' "$SLASHWORK_ROUTE_LOG" \
-  || fail "route log missing a local decline verdict" "$(cat "$SLASHWORK_ROUTE_LOG")"
+  || fail "route log missing a local verdict" "$(cat "$SLASHWORK_ROUTE_LOG")"
 ok "route log records routed (class) and local (reason) verdicts"
 
 echo "ALL PASS ($PASS scenarios)"
