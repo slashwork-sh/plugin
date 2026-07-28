@@ -6,9 +6,12 @@
 //! `slashwork-offload <route|login|claim|submit>`; adapters shell out over
 //! JSON on stdin/stdout and stay thin.
 //!
-//! v1 ships the classifier (this module). The network protocol (POST
-//! `/api/tasks`, the claim window, and the deadline long-poll) is the next
-//! build-order increment; see `docs/openclaw-hermes-hooks.md` in the
-//! coordinator repo.
+//! The classifier ([`classify`]) decides whether a spawn is routable; the
+//! dispatch state machine ([`dispatch`]) posts a routable task and waits out the
+//! claim window and deadline. Both are pure. The real HTTP client that drives
+//! dispatch lives in [`http`]. See `docs/openclaw-hermes-hooks.md` in the
+//! coordinator repo for the full design.
 
 pub mod classify;
+pub mod dispatch;
+pub mod http;
