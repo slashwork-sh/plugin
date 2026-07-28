@@ -43,10 +43,11 @@ trap 'rm -f "/tmp/slashwork-intercept-decision-$$.json" 2>/dev/null' EXIT
 
 command -v jq >/dev/null 2>&1 || exit 0
 
-# Locate the shared core binary: SLASHWORK_OFFLOAD_BIN, then the install dir
-# offload/dist/install.sh populates, then PATH. No binary => inert (local),
-# exactly as the hook behaves before sign-in. This core must be recent enough to
-# have the `classify` subcommand; the pinned distribution ships them together.
+# Locate the shared core binary: SLASHWORK_OFFLOAD_BIN, then the install dir the
+# sibling install-core.sh SessionStart hook populates, then PATH. No binary =>
+# inert (local), exactly as the hook behaves before sign-in. This core must be
+# recent enough to have the `classify` subcommand; the pinned distribution ships
+# the hook and its core together.
 CORE="${SLASHWORK_OFFLOAD_BIN:-}"
 if [ -z "$CORE" ] && [ -x "$HOME/.slashwork/bin/slashwork-offload" ]; then
   CORE="$HOME/.slashwork/bin/slashwork-offload"

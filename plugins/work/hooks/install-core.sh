@@ -1,12 +1,15 @@
 #!/usr/bin/env sh
 # Fetch and install the pinned slashwork-offload core binary into
 # ~/.slashwork/bin. Idempotent: re-running with the same pinned version is a
-# no-op, so it is safe to call from a plugin's SessionStart hook on every start.
+# no-op, so the slashwork-work plugin's SessionStart hook runs it on every start
+# and it does real work only on the first start after a version bump.
 #
 # The binaries are published by .github/workflows/release.yml on an `offload-v*`
-# tag. Until the first release is cut, the download 404s and this exits non-zero;
-# the offloader then stays inert, exactly as it does without a token. Any failure
-# here must leave the caller a clean "no binary" state, never a hang.
+# tag. Until the first release is cut, the download 404s; the offloader then
+# stays inert, exactly as it does without a token. This script ALWAYS exits 0 (a
+# SessionStart hook must never surface an error or block the session); any
+# failure just leaves the caller a clean "no binary" state, and intercept.sh
+# falls back to a local spawn.
 set -u
 
 VERSION="offload-v0.1.0"
@@ -88,8 +91,10 @@ install() {
     log "installed $VERSION -> $BIN"
 }
 
-# Skip the install run when sourced for testing (install_test.sh sets this to
-# reuse the pure functions above without hitting the network).
+# Skip the install run when sourced for testing (install-core_test.sh sets this
+# to reuse the pure functions above without hitting the network). Otherwise run
+# it, but always exit 0: this is a SessionStart hook, and a non-zero exit would
+# surface a session-start error for what is a best-effort, fail-to-local install.
 if [ "${SLASHWORK_INSTALL_LIB:-}" != "1" ]; then
-    install
+    install || true
 fi

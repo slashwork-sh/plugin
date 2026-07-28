@@ -1,7 +1,8 @@
 # Build and publish the slashwork-offload core binary for every supported
 # platform, so the plugins can fetch a prebuilt binary at install time (no Rust
 # toolchain on the user's machine). Triggered by pushing a tag like
-# `offload-v0.1.0`; offload/dist/install.sh downloads the assets this produces.
+# `offload-v0.1.0`; plugins/work/hooks/install-core.sh (the slashwork-work
+# SessionStart hook) downloads the assets this produces.
 name: Release offload binaries
 
 on:

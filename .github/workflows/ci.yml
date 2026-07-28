@@ -16,6 +16,8 @@ jobs:
         run: bash plugins/earn/hooks/submit_test.sh
       - name: Intercept hook integration test
         run: bash plugins/work/hooks/intercept_test.sh
+      - name: Core installer platform resolver test
+        run: bash plugins/work/hooks/install-core_test.sh
       - name: Earn listener integration test
         run: bash plugins/earn/hooks/earn-listen_test.sh
       - name: Validate marketplace and plugin manifests
@@ -40,10 +42,6 @@ jobs:
         run: cargo clippy --all-targets -- -W clippy::pedantic -D warnings
       - name: Test
         run: cargo test
-      - name: Shellcheck the distribution scripts
-        run: shellcheck dist/install.sh dist/install_test.sh
-      - name: Install-script platform resolver test
-        run: bash dist/install_test.sh
 
   hermes:
     runs-on: ubuntu-latest
