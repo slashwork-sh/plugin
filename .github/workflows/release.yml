@@ -1,0 +1,41 @@
+# Build and publish the slashwork-offload core binary for every supported
+# platform, so the plugins can fetch a prebuilt binary at install time (no Rust
+# toolchain on the user's machine). Triggered by pushing a tag like
+# `offload-v0.1.0`; offload/dist/install.sh downloads the assets this produces.
+name: Release offload binaries
+
+on:
+  push:
+    tags: ["offload-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # Builds the release binary for the target (cross-compiling via `cross`
+      # for the Linux targets when the host differs), tars it as
+      # slashwork-offload-<target>.tar.gz with a .sha256 alongside, and uploads
+      # both to the release for the pushed tag.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: slashwork-offload
+          target: ${{ matrix.target }}
+          manifest-path: offload/Cargo.toml
+          archive: slashwork-offload-$target
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}
