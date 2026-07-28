@@ -71,7 +71,7 @@ envelope() {
       tool_input:{subagent_type:"general-purpose", description:"d", prompt:$p}}'
 }
 
-consent_given() { : > "/tmp/slashwork-intercept-consent-${1:-$SESS}"; }
+consent_given() { : > "/tmp/slashwork-intercept-consent-$SESS"; }
 core_called() { grep -qx "$1" "$FAKE_CORE_LOG" 2>/dev/null; }
 decision() { printf '%s' "$1" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null; }
 reason() { printf '%s' "$1" | jq -r '.hookSpecificOutput.permissionDecisionReason // empty' 2>/dev/null; }
