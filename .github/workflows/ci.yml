@@ -23,3 +23,20 @@ jobs:
           jq empty .claude-plugin/marketplace.json
           jq empty plugins/work/.claude-plugin/plugin.json
           jq empty plugins/earn/.claude-plugin/plugin.json
+
+  offload:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: offload
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy (pedantic)
+        run: cargo clippy --all-targets -- -W clippy::pedantic -D warnings
+      - name: Test
+        run: cargo test
