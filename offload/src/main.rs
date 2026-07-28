@@ -3,6 +3,9 @@
 //! - `route`: the offloader path. Classify a spawn and, if routable, post it and
 //!   wait out the claim window and deadline. Always exits 0, falling back to a
 //!   local spawn on any failure.
+//! - `classify`: the classifier verdict alone, no network. A harness hook calls
+//!   it to decide whether to show its one-time consent disclosure before the
+//!   first routable spawn.
 //! - `login`: the CLI browser auth flow; writes `~/.slashwork/token`.
 //! - `claim`: hold the queue feed open and claim the next task; prints the job.
 //! - `submit`: post an artifact (read from stdin) for a claimed task.
@@ -53,11 +56,12 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("route") => cmd_route(),
+        Some("classify") => cmd_classify(),
         Some("login") => cmd_login(),
         Some("claim") => cmd_claim(&args[1..]),
         Some("submit") => cmd_submit(&args[1..]),
         _ => {
-            eprintln!("usage: slashwork-offload <route|login|claim|submit>");
+            eprintln!("usage: slashwork-offload <route|classify|login|claim|submit>");
             std::process::exit(EXIT_USAGE);
         }
     }
@@ -123,6 +127,31 @@ fn emit_local(reason: &str) -> ! {
         serde_json::json!({ "decision": "local", "reason": reason })
     );
     std::process::exit(0);
+}
+
+// --- classify (offloader consent gate) ---
+
+/// Read the spawn envelope and print only the classifier's verdict, no token, no
+/// network: `{"decision":"routable","class":…}` or `{"decision":"local","reason":…}`.
+/// The Claude Code hook calls this to decide whether to show its one-time consent
+/// disclosure before the first routable spawn of a session. Always exits 0.
+fn cmd_classify() -> ! {
+    let mut buf = String::new();
+    if std::io::stdin().read_to_string(&mut buf).is_err() {
+        emit_local("could not read classify input");
+    }
+    let input: RouteInput = serde_json::from_str(&buf).unwrap_or_default();
+    match classify(&input.spawn.prompt) {
+        // A local verdict is shaped exactly like `route`'s, so reuse the emitter.
+        Decision::Local { reason } => emit_local(&reason),
+        Decision::Routable { class } => {
+            println!(
+                "{}",
+                serde_json::json!({ "decision": "routable", "class": class.as_str() })
+            );
+            std::process::exit(0);
+        }
+    }
 }
 
 // --- login ---
