@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Tests the pure platform-detection logic in install.sh with no network. Sources
-# install.sh in library mode (SLASHWORK_INSTALL_LIB=1 skips the install() run) so
+# Tests the pure platform-detection logic in install-core.sh with no network.
+# Sources it in library mode (SLASHWORK_INSTALL_LIB=1 skips the install() run) so
 # resolve_target can be exercised with fixed (os, arch) pairs.
 #
-#   bash offload/dist/install_test.sh
+#   bash plugins/work/hooks/install-core_test.sh
 set -u
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck source=offload/dist/install.sh disable=SC1091
-SLASHWORK_INSTALL_LIB=1 . "$DIR/install.sh"
+# shellcheck source=plugins/work/hooks/install-core.sh disable=SC1091
+SLASHWORK_INSTALL_LIB=1 . "$DIR/install-core.sh"
 
 fails=0
 checks=0
