@@ -13,7 +13,19 @@ permissions:
   contents: write
 
 jobs:
+  # Create the GitHub Release for the tag first. upload-rust-binary-action
+  # uploads assets to an existing release, so without this the matrix jobs race
+  # to find one and fail with "release not found". One job, no race.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   release:
+    needs: create-release
     strategy:
       matrix:
         include:
