@@ -10,7 +10,7 @@
 //! Adapters pipe JSON over stdin/stdout and stay thin.
 
 use offload::classify::{classify, Decision};
-use offload::dispatch::{dispatch, RouteOutcome};
+use offload::dispatch::{dispatch, wrap_artifact, RouteOutcome};
 use offload::earn::{
     claim_outcome, login_poll, submit_outcome, ClaimOutcome, LoginPoll, SseTaskScanner,
     SubmitOutcome,
@@ -31,12 +31,16 @@ const EXIT_AUTH: i32 = 3;
 const EXIT_TIMEOUT: i32 = 4;
 const EXIT_BASE: i32 = 5;
 
-/// The route envelope an adapter sends. Unknown fields (`harness`, `tool_name`,
-/// `cwd`) are ignored: the classifier only needs the prompt.
+/// The route envelope an adapter sends. `tool_name` and `cwd` are ignored (the
+/// classifier only needs the prompt); `harness` is forwarded to the coordinator.
 #[derive(Deserialize, Default)]
 struct RouteInput {
     #[serde(default)]
     spawn: Spawn,
+    /// Which harness is routing this spawn (the adapter sets it). Forwarded so
+    /// the coordinator attributes the task; absent posts no harness.
+    #[serde(default)]
+    harness: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -82,7 +86,7 @@ fn cmd_route() -> ! {
     match classify(&input.spawn.prompt) {
         Decision::Local { reason } => emit_local(&reason),
         Decision::Routable { class } => {
-            let coord = UreqCoordinator::new(base, token);
+            let coord = UreqCoordinator::new(base, token, input.harness);
             match dispatch(&coord, class, &input.spawn.prompt) {
                 RouteOutcome::Local { reason } => emit_local(&reason),
                 RouteOutcome::Artifact {
@@ -97,6 +101,9 @@ fn cmd_route() -> ! {
                             "task_id": task_id,
                             "class": class.as_str(),
                             "artifact": artifact.artifact,
+                            // The untrusted-content-wrapped artifact the adapter
+                            // hands to its parent model verbatim (invariant 2).
+                            "wrapped": wrap_artifact(&artifact.artifact),
                             "tokens_used": artifact.tokens_used,
                             "settled": artifact.settled,
                             "tokens_saved_total": artifact.tokens_saved_total,

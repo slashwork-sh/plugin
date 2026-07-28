@@ -65,17 +65,43 @@ pub fn is_allowed_base(base: &str) -> bool {
 pub struct UreqCoordinator {
     base: String,
     token: String,
+    /// Which harness is offloading (`hermes`, `openclaw`, `claude-code`), tagged
+    /// on every posted task so the coordinator can attribute it. `None` posts no
+    /// harness (read back as `claude-code`).
+    harness: Option<String>,
 }
 
 impl UreqCoordinator {
     #[must_use]
-    pub fn new(base: String, token: String) -> Self {
-        Self { base, token }
+    pub fn new(base: String, token: String, harness: Option<String>) -> Self {
+        Self {
+            base,
+            token,
+            harness,
+        }
     }
 
     fn auth(&self) -> String {
         format!("Bearer {}", self.token)
     }
+}
+
+/// The JSON body for `POST /api/tasks`. v1 inlines no files (empty bundle) and
+/// tags the routing harness so the coordinator can attribute the task.
+fn create_task_body(
+    class: Class,
+    prompt: &str,
+    deadline_secs: u64,
+    harness: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "class": class.as_str(),
+        "prompt": prompt,
+        "context_bundle": "",
+        "deadline_secs": deadline_secs,
+        "harness": harness,
+    })
+    .to_string()
 }
 
 /// Build a short-lived agent with the given per-read timeout (connect capped at
@@ -109,13 +135,7 @@ fn run(req: ureq::Request, body: Option<&str>) -> (u16, String) {
 impl Coordinator for UreqCoordinator {
     fn post_task(&self, class: Class, prompt: &str, deadline_secs: u64) -> PostOutcome {
         let url = format!("{}/api/tasks", self.base);
-        let body = serde_json::json!({
-            "class": class.as_str(),
-            "prompt": prompt,
-            "context_bundle": "",
-            "deadline_secs": deadline_secs,
-        })
-        .to_string();
+        let body = create_task_body(class, prompt, deadline_secs, self.harness.as_deref());
         let agent = build_agent(Duration::from_secs(15));
         match agent
             .post(&url)
@@ -339,8 +359,31 @@ pub fn stream_queue(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_base, is_uuid, parse_poll, parse_post_400, parse_post_created};
+    use super::{
+        create_task_body, is_allowed_base, is_uuid, parse_poll, parse_post_400, parse_post_created,
+    };
+    use crate::classify::Class;
     use crate::dispatch::{PollOutcome, PostOutcome};
+
+    #[test]
+    fn create_task_body_tags_the_harness() {
+        let v: serde_json::Value = serde_json::from_str(&create_task_body(
+            Class::Research,
+            "do the thing",
+            150,
+            Some("hermes"),
+        ))
+        .unwrap();
+        assert_eq!(v["class"], "research");
+        assert_eq!(v["prompt"], "do the thing");
+        assert_eq!(v["context_bundle"], "");
+        assert_eq!(v["deadline_secs"], 150);
+        assert_eq!(v["harness"], "hermes");
+        // No harness posts null (the coordinator reads it back as claude-code).
+        let v2: serde_json::Value =
+            serde_json::from_str(&create_task_body(Class::Prose, "p", 90, None)).unwrap();
+        assert!(v2["harness"].is_null());
+    }
 
     #[test]
     fn allowed_bases() {
