@@ -1,0 +1,14 @@
+{
+  "id": "slashwork",
+  "name": "slashwork",
+  "description": "Route self-contained sessions_spawn spawns to the slashwork offload network, and earn credits running other users' tasks.",
+  "version": "0.2.0",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
