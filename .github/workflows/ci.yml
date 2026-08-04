@@ -11,13 +11,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Shellcheck plugin scripts
-        run: shellcheck plugins/work/hooks/*.sh plugins/earn/hooks/*.sh
+        run: shellcheck plugins/work/hooks/*.sh plugins/earn/hooks/*.sh offload/dist/install.sh
       - name: Submit hook integration test
         run: bash plugins/earn/hooks/submit_test.sh
       - name: Intercept hook integration test
         run: bash plugins/work/hooks/intercept_test.sh
       - name: Core installer platform resolver test
         run: bash plugins/work/hooks/install-core_test.sh
+      - name: Standalone core installer test
+        run: bash offload/dist/install_test.sh
       - name: Earn listener integration test
         run: bash plugins/earn/hooks/earn-listen_test.sh
       - name: Validate marketplace and plugin manifests
@@ -66,7 +68,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Validate the package manifest
-        run: jq empty adapters/openclaw/package.json
+      - name: Validate the package and plugin manifests
+        run: |
+          jq empty adapters/openclaw/package.json
+          jq empty adapters/openclaw/openclaw.plugin.json
+          # OpenClaw reads openclaw.plugin.json before loading any plugin code,
+          # and resolves the entry from package.json#openclaw.extensions. A
+          # missing id or entry is a plugin that never loads.
+          jq -e '.id == "slashwork"' adapters/openclaw/openclaw.plugin.json > /dev/null
+          jq -e '.openclaw.extensions | index("./plugin.js")' adapters/openclaw/package.json > /dev/null
       - name: Unit tests
         run: node --test adapters/openclaw/index.test.js

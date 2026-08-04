@@ -9,17 +9,21 @@
 //! - `login`: the CLI browser auth flow; writes `~/.slashwork/token`.
 //! - `claim`: hold the queue feed open and claim the next task; prints the job.
 //! - `submit`: post an artifact (read from stdin) for a claimed task.
+//! - `goal`: parse an earn goal (`90s`, `30m`, `200cr`) into the plan an
+//!   adapter's earn loop runs to. Offline.
+//! - `credits`: the signed-in earner's credit balance, for measuring a credits
+//!   goal against its baseline.
 //!
 //! Adapters pipe JSON over stdin/stdout and stay thin.
 
 use offload::classify::{classify, Decision};
 use offload::dispatch::{dispatch, wrap_artifact, RouteOutcome};
 use offload::earn::{
-    claim_outcome, login_poll, submit_outcome, ClaimOutcome, LoginPoll, SseTaskScanner,
-    SubmitOutcome,
+    claim_outcome, credits_balance, login_poll, parse_goal, submit_outcome, ClaimOutcome, Goal,
+    LoginPoll, SseTaskScanner, SubmitOutcome, CREDITS_GOAL_CEILING_SECS,
 };
 use offload::http::{
-    login_poll_once, login_start, post_claim, probe_auth, resolve_base, resolve_token,
+    fetch_me, login_poll_once, login_start, post_claim, probe_auth, resolve_base, resolve_token,
     stream_queue, submit_task, LineAction, UreqCoordinator,
 };
 use serde::Deserialize;
@@ -60,8 +64,10 @@ fn main() {
         Some("login") => cmd_login(),
         Some("claim") => cmd_claim(&args[1..]),
         Some("submit") => cmd_submit(&args[1..]),
+        Some("goal") => cmd_goal(&args[1..]),
+        Some("credits") => cmd_credits(),
         _ => {
-            eprintln!("usage: slashwork-offload <route|classify|login|claim|submit>");
+            eprintln!("usage: slashwork-offload <route|classify|login|claim|submit|goal|credits>");
             std::process::exit(EXIT_USAGE);
         }
     }
@@ -150,6 +156,76 @@ fn cmd_classify() -> ! {
                 serde_json::json!({ "decision": "routable", "class": class.as_str() })
             );
             std::process::exit(0);
+        }
+    }
+}
+
+// --- goal / credits (shared earn-loop plumbing) ---
+
+/// `goal <spec>`: parse an earn goal and print the plan an adapter's loop runs
+/// to. Pure and offline, so every harness reads `90s` / `30m` / `200cr` the same
+/// way instead of each adapter growing its own parser.
+fn cmd_goal(rest: &[String]) -> ! {
+    let spec = rest.join(" ");
+    match parse_goal(&spec) {
+        Some(Goal::Time { seconds }) => {
+            println!(
+                "{}",
+                serde_json::json!({ "mode": "time", "seconds": seconds })
+            );
+            std::process::exit(0);
+        }
+        Some(Goal::Credits { target }) => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "mode": "credits",
+                    "target": target,
+                    // Credits only land once the acceptance gate accepts, so a
+                    // credits goal carries a wall-clock stop as well.
+                    "ceiling_seconds": CREDITS_GOAL_CEILING_SECS,
+                })
+            );
+            std::process::exit(0);
+        }
+        None => {
+            eprintln!(
+                "usage: slashwork-offload goal <90s|30m|2h|200cr>  (a positive number and a unit)"
+            );
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+}
+
+/// `credits`: print the signed-in earner's credit balance. An earn loop working
+/// to a credits goal reads this once for its baseline and again after each
+/// submit, since credits settle asynchronously behind the acceptance gate.
+fn cmd_credits() -> ! {
+    let Some(token) = resolve_token() else {
+        eprintln!("slashwork-offload credits: no slashwork token (run login)");
+        std::process::exit(EXIT_AUTH);
+    };
+    let Some(base) = resolve_base() else {
+        eprintln!("slashwork-offload credits: base url is not https");
+        std::process::exit(EXIT_BASE);
+    };
+    let (code, body) = fetch_me(&base, &token);
+    match code {
+        200 => {
+            if let Some(credits) = credits_balance(&body) {
+                println!("{}", serde_json::json!({ "credits": credits }));
+                std::process::exit(0);
+            }
+            eprintln!("slashwork-offload credits: /api/me had no credit balance");
+            std::process::exit(EXIT_FAIL);
+        }
+        401 | 403 => {
+            eprintln!("slashwork-offload credits: token rejected");
+            std::process::exit(EXIT_AUTH);
+        }
+        other => {
+            eprintln!("slashwork-offload credits: /api/me returned {other}");
+            std::process::exit(EXIT_FAIL);
         }
     }
 }

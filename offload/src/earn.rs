@@ -93,6 +93,54 @@ pub fn submit_outcome(code: u16, body: &str) -> SubmitOutcome {
     }
 }
 
+/// An earner run goal: a time budget (`90s`, `30m`, `2h`) or the credits earned
+/// this run (`200cr`). Mirrors the goal syntax `/earn` takes, and lives here so
+/// every adapter's earn loop reads the same spec the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Goal {
+    /// Run until this many seconds have elapsed.
+    Time { seconds: u64 },
+    /// Run until the credit balance has risen by `target` since the run began.
+    /// Credits only land when the acceptance gate accepts, so a credits goal
+    /// also carries `CREDITS_GOAL_CEILING_SECS` as a wall-clock stop.
+    Credits { target: i64 },
+}
+
+/// The wall-clock ceiling on a credits goal, so a cold pool or a run of
+/// rejections cannot hold the loop open forever. Matches `/earn`'s 24h ceiling.
+pub const CREDITS_GOAL_CEILING_SECS: u64 = 86_400;
+
+/// Parse an earn goal (`90s`, `30m`, `2h`, `200cr`). Returns `None` for anything
+/// without a positive number and a known unit, which the caller reports as a
+/// usage error rather than guessing at an unbounded run.
+#[must_use]
+pub fn parse_goal(spec: &str) -> Option<Goal> {
+    let spec = spec.trim().to_ascii_lowercase();
+    let split = spec.find(|c: char| !c.is_ascii_digit())?;
+    let (digits, unit) = spec.split_at(split);
+    let n: u64 = digits.parse().ok().filter(|n| *n > 0)?;
+    match unit.trim() {
+        "s" | "sec" | "secs" | "second" | "seconds" => Some(Goal::Time { seconds: n }),
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(Goal::Time { seconds: n * 60 }),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Some(Goal::Time { seconds: n * 3600 }),
+        "cr" | "credit" | "credits" => Some(Goal::Credits {
+            target: i64::try_from(n).ok()?,
+        }),
+        _ => None,
+    }
+}
+
+/// Read the credit balance out of a `GET /api/me` body. `None` when the body is
+/// not the shape we expect, which a caller treats as "cannot measure progress"
+/// rather than as zero credits.
+#[must_use]
+pub fn credits_balance(body: &str) -> Option<i64> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("credits")?
+        .as_i64()
+}
+
 /// The result of one poll of `GET /auth/cli/{id}/token`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoginPoll {
@@ -124,8 +172,8 @@ pub fn login_poll(code: u16, body: &str) -> LoginPoll {
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_outcome, login_poll, submit_outcome, ClaimOutcome, LoginPoll, SseTaskScanner,
-        SubmitOutcome,
+        claim_outcome, credits_balance, login_poll, parse_goal, submit_outcome, ClaimOutcome, Goal,
+        LoginPoll, SseTaskScanner, SubmitOutcome,
     };
 
     #[test]
@@ -214,5 +262,38 @@ mod tests {
         assert_eq!(login_poll(500, "oops"), LoginPoll::Retry);
         // A 200 without a token field is not usable; keep polling.
         assert_eq!(login_poll(200, r#"{"status":"ok"}"#), LoginPoll::Retry);
+    }
+
+    #[test]
+    fn goals_parse_every_time_unit() {
+        assert_eq!(parse_goal("90s"), Some(Goal::Time { seconds: 90 }));
+        assert_eq!(parse_goal("30m"), Some(Goal::Time { seconds: 1800 }));
+        assert_eq!(parse_goal("2h"), Some(Goal::Time { seconds: 7200 }));
+        assert_eq!(parse_goal("45 minutes"), Some(Goal::Time { seconds: 2700 }));
+        assert_eq!(parse_goal(" 2 HOURS "), Some(Goal::Time { seconds: 7200 }));
+    }
+
+    #[test]
+    fn goals_parse_credits() {
+        assert_eq!(parse_goal("200cr"), Some(Goal::Credits { target: 200 }));
+        assert_eq!(parse_goal("50 credits"), Some(Goal::Credits { target: 50 }));
+    }
+
+    #[test]
+    fn bad_goals_are_rejected_rather_than_guessed() {
+        // No unit, no number, unknown unit, and zero all have to be usage
+        // errors: guessing here would start an unbounded run.
+        assert_eq!(parse_goal("30"), None);
+        assert_eq!(parse_goal("forever"), None);
+        assert_eq!(parse_goal("10 bananas"), None);
+        assert_eq!(parse_goal("0m"), None);
+        assert_eq!(parse_goal(""), None);
+    }
+
+    #[test]
+    fn credits_balance_reads_the_me_body() {
+        assert_eq!(credits_balance(r#"{"credits":1234}"#), Some(1234));
+        assert_eq!(credits_balance(r#"{"handle":"x"}"#), None);
+        assert_eq!(credits_balance("not json"), None);
     }
 }

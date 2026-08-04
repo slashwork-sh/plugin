@@ -258,6 +258,19 @@ pub fn probe_auth(base: &str, token: &str) -> u16 {
     .0
 }
 
+/// `GET /api/me` with the body kept. Returns `(status, body)`; an earn loop
+/// working to a credits goal reads the balance out of it to measure progress.
+#[must_use]
+pub fn fetch_me(base: &str, token: &str) -> (u16, String) {
+    let agent = build_agent(Duration::from_secs(10));
+    run(
+        agent
+            .get(&format!("{base}/api/me"))
+            .set("authorization", &bearer(token)),
+        None,
+    )
+}
+
 /// `POST /api/tasks/{task_id}/claim`. Returns `(status, body)`; the body on 200
 /// is the staged job JSON.
 #[must_use]

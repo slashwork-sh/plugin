@@ -1,19 +1,33 @@
 {
   "name": "@slashwork/openclaw",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Route self-contained sessions_spawn spawns to the slashwork offload network, and earn credits running other users' tasks.",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
   "files": [
     "index.js",
+    "plugin.js",
+    "openclaw.plugin.json",
     "README.md"
   ],
+  "openclaw": {
+    "extensions": [
+      "./plugin.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.6.0"
+    }
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.6.0"
+  },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test index.test.js"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/slashwork-sh/plugin"
+    "url": "https://github.com/slashwork-sh/plugin",
+    "directory": "adapters/openclaw"
   }
 }
