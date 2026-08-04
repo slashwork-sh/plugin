@@ -4,6 +4,29 @@ Everything here is staged and tested; these are the steps that need your
 credentials. Run them in order: the core release comes first because both
 adapters shell out to it and both installers pin its version.
 
+## Status, 2026-08-04
+
+- **Step 1, core release: DONE.** `offload-v0.2.0` is tagged and released with
+  all 8 assets (4 targets, each with a `.sha256`). Verified by running the
+  published installer end to end on darwin-arm64: it downloaded, matched the
+  checksum, installed, and `slashwork-offload goal 30m` returned
+  `{"mode":"time","seconds":1800}`. A second run correctly reported "already at
+  offload-v0.2.0".
+  - This needed a CI fix first (`64bf793`). `create-gh-release-action` rejects
+    `offload-v0.2.0` with "invalid tag format" unless given `prefix: offload`.
+    The `create-release` job was added in `da5cc1f` *after* v0.1.0 shipped, so
+    the path had never run until this tag was cut.
+- **Step 2, Hermes repo: DONE.** `slashwork-sh/hermes-plugin` is public, with
+  `plugin.yaml` and `__init__.py` at the root and 35 passing tests. Still needs
+  the on-a-real-Hermes-box verification below.
+- **Step 3, npm: BLOCKED on credentials.** `npm whoami` returns `ENEEDAUTH` and
+  the `@slashwork` scope does not exist yet (`npm org ls slashwork` returns 404
+  "Scope not found"). `npm pack --dry-run` is clean: 5 files, 6.9 kB.
+- **Step 4, ClawHub: BLOCKED on credentials.** `clawhub` is not installed.
+
+So `openclaw plugins install @slashwork/openclaw` is the one command on
+`slashwork.sh/how-to-save-tokens` that still 404s.
+
 ## 0. What is already done
 
 - The core builds, lints clean under clippy pedantic, and passes 59 tests.
