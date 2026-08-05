@@ -79,3 +79,95 @@ jobs:
           jq -e '.openclaw.extensions | index("./plugin.js")' adapters/openclaw/package.json > /dev/null
       - name: Unit tests
         run: node --test adapters/openclaw/index.test.js
+
+  # The offloader shipped broken on Windows for its whole life and nobody
+  # noticed, because every other job here runs on Linux. This one runs the real
+  # Windows path: Git Bash, the cross-compiled .exe, and the shim driving it.
+  #
+  # `shell: bash` on a windows runner IS Git Bash, which is also what Claude
+  # Code uses for command hooks on native Windows, so this exercises the same
+  # interpreter a user gets.
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: offload
+
+      # Pure resolver checks, no network. Confirms the real `uname -s` on this
+      # machine maps to a target rather than falling through to unsupported,
+      # which is the bug that made the offloader inert here.
+      - name: Platform resolver
+        run: |
+          echo "uname -s: $(uname -s)  uname -m: $(uname -m)"
+          bash plugins/work/hooks/install-core_test.sh
+          SLASHWORK_INSTALL_LIB=1 . plugins/work/hooks/install-core.sh
+          target=$(resolve_target "$(uname -s)" "$(uname -m)") \
+            || { echo "this runner's platform does not resolve"; exit 1; }
+          [ "$target" = "x86_64-pc-windows-msvc" ] || { echo "wrong target: $target"; exit 1; }
+          [ "$(bin_name "$target")" = "slashwork-offload.exe" ] || { echo "wrong bin name"; exit 1; }
+
+      # Build from this commit rather than trusting the released artifact, so a
+      # source change that breaks Windows fails here instead of at the next tag.
+      - name: Build the core
+        run: cargo build --manifest-path offload/Cargo.toml --bin slashwork-offload
+
+      - name: Core test suite
+        run: cargo test --manifest-path offload/Cargo.toml
+
+      # The binary has to actually execute. Everything above would pass on a
+      # cross-compiled artifact that cannot run.
+      - name: The .exe runs and answers `hook`
+        run: |
+          CORE="offload/target/debug/slashwork-offload.exe"
+          [ -x "$CORE" ] || { echo "no .exe at $CORE"; exit 1; }
+          "$CORE" 2>&1 | grep -q 'usage:' || { echo "binary did not run"; exit 1; }
+          # A non-subagent envelope: valid input, no output, clean exit.
+          out=$(printf '%s' '{"tool_name":"Bash","tool_input":{"prompt":"ls"}}' | "$CORE" hook)
+          [ -z "$out" ] || { echo "expected no output, got: $out"; exit 1; }
+
+      # The full hook path under Git Bash, which is where it used to die on jq.
+      # No network: the consent gate returns before any dispatch, and the second
+      # call dispatches at an unreachable base and must fall through silently.
+      - name: The shim routes end to end
+        env:
+          SLASHWORK_TOKEN: fake-token-for-ci
+          SLASHWORK_BASE_URL: http://localhost:9
+        run: |
+          export SLASHWORK_OFFLOAD_BIN="$PWD/offload/target/debug/slashwork-offload.exe"
+          export TMPDIR="$(mktemp -d)"
+          export SLASHWORK_ROUTE_LOG="$TMPDIR/route.jsonl"
+          ENV='{"session_id":"ci-win","tool_name":"Task","tool_input":{"prompt":"Research and compare the leading rate-limiting approaches; give the pros and cons of each."}}'
+
+          first=$(printf '%s' "$ENV" | bash plugins/work/hooks/intercept.sh)
+          printf '%s' "$first" | grep -q 'slashwork intercept is on' \
+            || { echo "no consent disclosure on the first routable spawn: $first"; exit 1; }
+
+          second=$(printf '%s' "$ENV" | bash plugins/work/hooks/intercept.sh)
+          [ -z "$second" ] || { echo "unreachable coordinator should be silent, got: $second"; exit 1; }
+
+          grep -q '"decision":"routed"' "$SLASHWORK_ROUTE_LOG" || { echo "route log missing routed"; exit 1; }
+          grep -q '"decision":"local"'  "$SLASHWORK_ROUTE_LOG" || { echo "route log missing local"; exit 1; }
+
+      - name: Shim contract tests
+        run: bash plugins/work/hooks/intercept_test.sh
+
+      # The published installer, on a real Windows machine: resolve, download,
+      # verify the checksum, extract, and land an .exe that runs. This is the
+      # step a user's SessionStart hook takes.
+      - name: Published installer
+        run: |
+          bash plugins/work/hooks/install-core.sh
+          BIN="$HOME/.slashwork/bin/slashwork-offload.exe"
+          [ -x "$BIN" ] || { echo "installer did not land an .exe at $BIN"; ls -la "$HOME/.slashwork/bin" || true; exit 1; }
+          pinned=$(grep -m1 '^VERSION=' plugins/work/hooks/install-core.sh | cut -d'"' -f2)
+          got=$(cat "$HOME/.slashwork/bin/.version")
+          [ "$got" = "$pinned" ] || { echo "version marker $got != pinned $pinned"; exit 1; }
+          "$BIN" goal 30m | grep -q '"seconds":1800' || { echo "installed binary did not run"; exit 1; }
+          # Idempotent: a second run must not redownload.
+          bash plugins/work/hooks/install-core.sh
