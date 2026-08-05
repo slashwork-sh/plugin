@@ -9,6 +9,20 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::time::{Duration, Instant};
 
+/// The user's home directory: `HOME`, else `USERPROFILE`.
+///
+/// Native Windows sets `USERPROFILE` and not `HOME`, so a `HOME`-only lookup
+/// makes the core inert whenever it is started by anything other than Git Bash
+/// (which sets both). Every path the core reads or writes under `~/.slashwork`
+/// resolves through here, so the token lands in and is read from one place
+/// whichever shell launched the process.
+#[must_use]
+pub fn home_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+}
+
 /// Resolve the bearer token: `SLASHWORK_TOKEN`, else `~/.slashwork/token`.
 #[must_use]
 pub fn resolve_token() -> Option<String> {
@@ -18,7 +32,7 @@ pub fn resolve_token() -> Option<String> {
             return Some(t.to_string());
         }
     }
-    let home = std::env::var_os("HOME")?;
+    let home = home_dir()?;
     let path = std::path::Path::new(&home).join(".slashwork").join("token");
     let t = std::fs::read_to_string(path).ok()?;
     let t = t.trim();

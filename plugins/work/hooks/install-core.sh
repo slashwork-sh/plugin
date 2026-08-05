@@ -12,10 +12,9 @@
 # falls back to a local spawn.
 set -u
 
-VERSION="offload-v0.2.0"
+VERSION="offload-v0.3.0"
 REPO="slashwork-sh/plugin"
 BIN_DIR="${HOME}/.slashwork/bin"
-BIN="${BIN_DIR}/slashwork-offload"
 MARKER="${BIN_DIR}/.version"
 
 log() { printf 'slashwork-offload install: %s\n' "$1" >&2; }
@@ -38,7 +37,22 @@ resolve_target() {
                 *) return 1 ;;
             esac
             ;;
+        # Windows under Git Bash, MSYS2, or Cygwin, which report `uname -s` as
+        # MINGW64_NT-10.0-22631, MSYS_NT-10.0, and CYGWIN_NT-10.0 respectively.
+        # Every arch maps to the x86_64 build: the release ships no ARM64
+        # Windows binary because Windows on ARM runs x64 under emulation.
+        MINGW* | MSYS* | CYGWIN*) echo x86_64-pc-windows-msvc ;;
         *) return 1 ;;
+    esac
+}
+
+# The binary's filename, inside the release archive and on disk. Windows targets
+# carry .exe; nothing else does. Pure, and kept beside resolve_target so the two
+# platform facts live together.
+bin_name() {
+    case "$1" in
+        *-pc-windows-*) echo slashwork-offload.exe ;;
+        *) echo slashwork-offload ;;
     esac
 }
 
@@ -57,8 +71,11 @@ install() {
     command -v tar >/dev/null 2>&1 || { log "tar not found"; return 1; }
     target=$(resolve_target "$(uname -s)" "$(uname -m)") || {
         log "unsupported platform $(uname -s)/$(uname -m)"
+        log "slashwork routing stays off; subagents run locally as usual"
         return 1
     }
+    bin_file=$(bin_name "$target")
+    BIN="${BIN_DIR}/${bin_file}"
 
     # Idempotent: already at the pinned version.
     if [ -x "$BIN" ] && [ "$(cat "$MARKER" 2>/dev/null)" = "$VERSION" ]; then
@@ -89,7 +106,7 @@ install() {
 
     mkdir -p "$BIN_DIR"
     tar -xzf "$tmp/$asset" -C "$tmp" || { log "extract failed"; return 1; }
-    mv "$tmp/slashwork-offload" "$BIN" || return 1
+    mv "$tmp/$bin_file" "$BIN" || return 1
     chmod +x "$BIN"
     printf '%s\n' "$VERSION" >"$MARKER"
     log "installed $VERSION -> $BIN"
