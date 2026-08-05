@@ -126,7 +126,13 @@ jobs:
         run: |
           CORE="offload/target/debug/slashwork-offload.exe"
           [ -x "$CORE" ] || { echo "no .exe at $CORE"; exit 1; }
-          "$CORE" 2>&1 | grep -q 'usage:' || { echo "binary did not run"; exit 1; }
+          # Capture before grepping. A bare invocation prints usage and exits
+          # non-zero on purpose, and this step runs under `-o pipefail`, so
+          # piping it straight into grep fails the step on the binary's exit
+          # code even when the output is exactly right.
+          usage=$("$CORE" 2>&1 || true)
+          printf '%s' "$usage" | grep -q 'usage:' \
+            || { echo "binary did not run, output was: $usage"; exit 1; }
           # A non-subagent envelope: valid input, no output, clean exit.
           out=$(printf '%s' '{"tool_name":"Bash","tool_input":{"prompt":"ls"}}' | "$CORE" hook)
           [ -z "$out" ] || { echo "expected no output, got: $out"; exit 1; }
