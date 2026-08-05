@@ -40,29 +40,49 @@ So `openclaw plugins install @slashwork/openclaw` is the one command on
 
 ## 1. Cut the core release (do this first)
 
-Both installers pin `offload-v0.2.0`, and the adapters' earn loops call the new
-`goal` and `credits` subcommands, which only exist from this release on.
+Both installers pin `offload-v0.3.0`, and the adapters' earn loops call the
+`goal` and `credits` subcommands, which only exist from v0.2.0 on.
 
 ```
-git tag offload-v0.2.0
-git push origin offload-v0.2.0
+git tag offload-v0.3.0
+git push origin offload-v0.3.0
 ```
 
-That fires `.github/workflows/release.yml`, which builds four targets and
-attaches `slashwork-offload-<target>.tar.gz` plus a `.sha256` for each.
+That fires `.github/workflows/release.yml`, which builds five targets (two
+linux, two darwin, one windows) and attaches
+`slashwork-offload-<target>.tar.gz` plus a `.sha256` for each.
 
-Until the tag exists, `plugins/work/hooks/install-core.sh` 404s on the download
-and returns non-zero, which the SessionStart hook swallows. Existing Claude Code
-users keep the v0.1.0 binary they already have, so the offloader keeps working;
-they just do not get the new subcommands. Nothing breaks in the gap.
+**Tag v0.3.0 before or with the merge, not after.** This is a real change from
+how v0.2.0 shipped, and it is the one ordering mistake that hurts.
 
-Verify:
+Through v0.2.0 the gap was safe: a missing tag meant `install-core.sh` 404'd,
+the SessionStart hook swallowed it, users kept the binary they already had, and
+`intercept.sh` carried enough logic to keep working on an older core. It only
+missed new subcommands.
+
+That is no longer true. `intercept.sh` is a shim now, and the only thing it
+does is call `slashwork-offload hook`. That subcommand ships in v0.3.0. A core
+from v0.1.0 or v0.2.0 answers it with a usage error, so the shim falls through
+to a local spawn every time. Merging this to `main` without the tag turns the
+offloader inert **for every user on every platform**, not just the Windows ones
+it is meant to fix, and it stays inert until the tag lands and each session's
+SessionStart hook pulls the new binary.
+
+Verify, on the release and then on a machine:
 
 ```
-gh release view offload-v0.2.0
+gh release view offload-v0.3.0                  # expect 10 assets (5 targets x2)
 curl -fsSL https://raw.githubusercontent.com/slashwork-sh/plugin/main/offload/dist/install.sh | sh
 ~/.slashwork/bin/slashwork-offload goal 30m     # {"mode":"time","seconds":1800}
+echo '{}' | ~/.slashwork/bin/slashwork-offload hook; echo "exit=$?"   # no output, exit=0
 ```
+
+The last line is the one that proves the installed core is new enough for the
+shim. An older core prints a `usage:` line instead.
+
+On Windows, check the same thing from Git Bash; the binary is
+`slashwork-offload.exe` there and both installers and the shim look for that
+name.
 
 ## 2. Publish the Hermes plugin repo
 
