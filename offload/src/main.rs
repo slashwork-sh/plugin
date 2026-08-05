@@ -3,6 +3,9 @@
 //! - `route`: the offloader path. Classify a spawn and, if routable, post it and
 //!   wait out the claim window and deadline. Always exits 0, falling back to a
 //!   local spawn on any failure.
+//! - `hook`: the whole Claude Code `PreToolUse` path, raw envelope in, hook JSON
+//!   out. `route` plus the envelope parsing, consent gate, savings receipt, and
+//!   decision shaping the shell hook used to do with `jq`.
 //! - `classify`: the classifier verdict alone, no network. A harness hook calls
 //!   it to decide whether to show its one-time consent disclosure before the
 //!   first routable spawn.
@@ -22,9 +25,12 @@ use offload::earn::{
     claim_outcome, credits_balance, login_poll, parse_goal, submit_outcome, ClaimOutcome, Goal,
     LoginPoll, SseTaskScanner, SubmitOutcome, CREDITS_GOAL_CEILING_SECS,
 };
+use offload::hook::{
+    consent_marker, is_self_worker, receipt, record_saving, render_plot, route_log, Envelope,
+};
 use offload::http::{
-    fetch_me, login_poll_once, login_start, post_claim, probe_auth, resolve_base, resolve_token,
-    stream_queue, submit_task, LineAction, UreqCoordinator,
+    fetch_me, home_dir, login_poll_once, login_start, post_claim, probe_auth, resolve_base,
+    resolve_token, stream_queue, submit_task, LineAction, UreqCoordinator,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -60,6 +66,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("route") => cmd_route(),
+        Some("hook") => cmd_hook(),
         Some("classify") => cmd_classify(),
         Some("login") => cmd_login(),
         Some("claim") => cmd_claim(&args[1..]),
@@ -67,7 +74,9 @@ fn main() {
         Some("goal") => cmd_goal(&args[1..]),
         Some("credits") => cmd_credits(),
         _ => {
-            eprintln!("usage: slashwork-offload <route|classify|login|claim|submit|goal|credits>");
+            eprintln!(
+                "usage: slashwork-offload <route|hook|classify|login|claim|submit|goal|credits>"
+            );
             std::process::exit(EXIT_USAGE);
         }
     }
@@ -133,6 +142,138 @@ fn emit_local(reason: &str) -> ! {
         serde_json::json!({ "decision": "local", "reason": reason })
     );
     std::process::exit(0);
+}
+
+// --- hook (Claude Code PreToolUse, end to end) ---
+
+/// `hook`: the whole Claude Code `PreToolUse` path, from the raw envelope on stdin
+/// to the hook JSON on stdout.
+///
+/// The shell hook is a shim around this. Everything it used to do with `jq`
+/// (parse the envelope, hold the consent marker, keep the savings log, render
+/// the receipt, shape the `deny`) happens here, so routing depends on nothing
+/// but this binary. `jq` is absent from Git Bash, which is why the offloader was
+/// inert on Windows even once a binary was installed.
+///
+/// Always exits 0. Printing nothing lets Claude Code spawn the subagent
+/// normally, which is the outcome for every path except a returned artifact.
+fn cmd_hook() -> ! {
+    let mut buf = String::new();
+    if std::io::stdin().read_to_string(&mut buf).is_err() {
+        std::process::exit(0);
+    }
+    let env = Envelope::parse(&buf);
+
+    // Not a subagent spawn, or nothing to route: silent local.
+    if !env.is_subagent_spawn() || env.tool_input.prompt.is_empty() {
+        std::process::exit(0);
+    }
+    let prompt = &env.tool_input.prompt;
+
+    // Our own earner worker spawns are never reposted.
+    if is_self_worker(prompt) {
+        std::process::exit(0);
+    }
+
+    // Token presence gates whether the hook acts at all, and so whether the user
+    // ever sees the disclosure. The real calls resolve the token again below.
+    if resolve_token().is_none() {
+        std::process::exit(0);
+    }
+    let Some(base) = resolve_base() else {
+        std::process::exit(0);
+    };
+
+    // First-candidate consent gate, once per session. Installing the plugin and
+    // signing in is the standing consent, but nothing leaves the machine before
+    // the user has seen what routing does: the first *routable* spawn of a
+    // session prints the disclosure and still runs locally. Classify without a
+    // token or a network call, so a spawn that was never routable neither
+    // triggers the notice nor spends the session's one disclosure.
+    let marker = consent_marker(&env.session_key());
+    if !marker.exists() {
+        match classify(prompt) {
+            Decision::Routable { class } => {
+                route_log("routed", class.as_str());
+                let _ = std::fs::write(&marker, b"");
+                // systemMessage, not stderr: an exit-0 hook's stderr shows only
+                // in verbose mode, and a disclosure the user cannot see is not a
+                // disclosure. No decision attached, so the spawn runs locally.
+                emit(&serde_json::json!({ "systemMessage": CONSENT_NOTICE }));
+            }
+            Decision::Local { reason } => route_log("local", &reason),
+        }
+        std::process::exit(0);
+    }
+
+    // Dispatch. The core classifies, posts, waits out the claim window and class
+    // deadline, and cancels with a refund on any fall-through.
+    let class = match classify(prompt) {
+        Decision::Routable { class } => class,
+        Decision::Local { reason } => {
+            route_log("local", &reason);
+            std::process::exit(0);
+        }
+    };
+    let coord = UreqCoordinator::new(
+        base,
+        resolve_token().unwrap_or_default(),
+        Some(HARNESS.into()),
+    );
+    match dispatch(&coord, class, prompt) {
+        RouteOutcome::Artifact {
+            class, artifact, ..
+        } => {
+            route_log("routed", class.as_str());
+            let recent = record_saving(artifact.tokens_used);
+            let plot = render_plot(&recent);
+            let message = receipt(
+                artifact.tokens_used,
+                artifact.settled,
+                artifact.tokens_saved_total,
+                &plot,
+            );
+            // The deny is what hands the artifact back in place of the spawn.
+            // Its reason is the core's untrusted-content-wrapped artifact
+            // (invariant 2), so every harness and the acceptance judge agree on
+            // the wrapper.
+            emit(&serde_json::json!({
+                "systemMessage": message,
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": wrap_artifact(&artifact.artifact),
+                }
+            }));
+            std::process::exit(0);
+        }
+        RouteOutcome::Local { reason } => {
+            route_log("local", &reason);
+            // Out of credits is the one rejection the user can act on, so it
+            // gets a visible notice. Everything else stays quiet: the spawn just
+            // runs locally, as it always did.
+            if reason.contains("not enough credits") {
+                emit(&serde_json::json!({
+                    "systemMessage": format!(
+                        "slashwork: {reason}. This task ran locally. \
+                         Run /earn to earn credits by running tasks for others."
+                    )
+                }));
+            }
+            std::process::exit(0);
+        }
+    }
+}
+
+/// The harness tag the coordinator attributes routed tasks to.
+const HARNESS: &str = "claude-code";
+
+/// Shown once per session, before the first routable spawn is ever routed.
+const CONSENT_NOTICE: &str = "slashwork intercept is on: self-contained subagent tasks will be routed to the offload network, meaning the task prompt is sent to another slashwork user's session to run. This first task runs locally; routing starts with the next one. Run /work off (or set SLASHWORK_INTERCEPT=0) to stop routing.";
+
+/// Print one compact JSON object for Claude Code to read.
+fn emit(v: &serde_json::Value) {
+    println!("{v}");
 }
 
 // --- classify (offloader consent gate) ---
@@ -276,9 +417,13 @@ fn cmd_login() -> ! {
 }
 
 /// Write the token to `~/.slashwork/token` (0600 on unix). Returns the path.
+///
+/// On Windows there is no chmod; the file inherits the profile directory's ACL,
+/// which is already user-only.
 fn write_token(token: &str) -> std::io::Result<String> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no HOME"))?;
+    let home = home_dir().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no HOME or USERPROFILE")
+    })?;
     let dir = std::path::Path::new(&home).join(".slashwork");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("token");

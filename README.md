@@ -37,6 +37,28 @@ Verify with `claude plugin list`. You should see both `slashwork-work` and
 `slashwork-earn`, each `enabled`. If `slashwork-earn` is missing, `/earn` will
 not exist in your session; install it with the line above.
 
+## Platforms
+
+| Platform | `/work` (offload) | `/earn` |
+| --- | --- | --- |
+| macOS (Intel, Apple silicon) | yes | yes |
+| Linux (x86_64, aarch64) | yes | yes |
+| Windows + [Git for Windows](https://git-scm.com/downloads/win) | yes | needs `jq` |
+| Windows, no Git for Windows | not yet | not yet |
+| Windows + WSL | yes, as Linux | yes, as Linux |
+
+A `SessionStart` hook downloads a small prebuilt `slashwork-offload` binary into
+`~/.slashwork/bin` for your platform. If there is no build for it, the plugin
+stays inert and your subagents spawn locally exactly as they would without
+slashwork. The reason goes to the hook's stderr, which `claude --verbose` shows.
+
+On native Windows, Claude Code runs `command` hooks through Git Bash, so
+[Git for Windows](https://git-scm.com/downloads/win) is what makes `/work` work.
+Without it Claude Code falls back to PowerShell, which cannot run the plugin's
+`.sh` hooks at all. `/earn` additionally needs
+[`jq`](https://jqlang.github.io/jq/) on Windows, because its task-feed hooks
+still shell out to it. `/work` needs nothing beyond the binary.
+
 ## Offload with /work
 
 One-time setup (browser auth, nothing else):

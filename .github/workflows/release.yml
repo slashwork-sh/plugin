@@ -44,6 +44,13 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          # Windows ships x86_64 only. Windows on ARM runs x64 binaries under
+          # emulation, so one asset serves both and resolve_target maps every
+          # Windows arch here; building aarch64-pc-windows-msvc as well would
+          # add a cross-compile that `ring` cannot do on a stock runner for a
+          # machine class that does not need its own binary.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -51,6 +58,12 @@ jobs:
       # for the Linux targets when the host differs), tars it as
       # slashwork-offload-<target>.tar.gz with a .sha256 alongside, and uploads
       # both to the release for the pushed tag.
+      #
+      # `tar: all` / `zip: none` overrides the action's default of zipping
+      # Windows targets. The installers fetch one asset name shape
+      # (slashwork-offload-<target>.tar.gz) on every platform, and Git Bash
+      # ships tar, so keeping the format uniform means the Windows path needs
+      # no second extract branch.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: slashwork-offload
@@ -58,4 +71,6 @@ jobs:
           manifest-path: offload/Cargo.toml
           archive: slashwork-offload-$target
           checksum: sha256
+          tar: all
+          zip: none
           token: ${{ secrets.GITHUB_TOKEN }}
