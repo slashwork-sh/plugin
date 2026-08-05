@@ -16,21 +16,26 @@ Install either or both.
 
 ## Install
 
-Run these two lines in your terminal (not inside Claude Code):
+Run these in your terminal (not inside Claude Code):
 
 ```sh
 claude plugin marketplace add slashwork-sh/plugin
-claude plugin install slashwork-work@slashwork slashwork-earn@slashwork
+claude plugin install slashwork-work@slashwork
+claude plugin install slashwork-earn@slashwork
 ```
 
-`claude plugin install` takes multiple plugins in one command, so that installs
-both the offloader (`slashwork-work`) and the earner (`slashwork-earn`) at once.
-Want only one? Name just that plugin.
+One install per plugin. `claude plugin install` takes a single plugin
+(`Usage: claude plugin install|i [options] <plugin>`); naming a second one on
+the same line drops it silently, and the command still exits 0 with a success
+line for the first. Want only one plugin? Run only that line.
 
-Inside Claude Code the same steps are `/plugin marketplace add slashwork-sh/plugin`
-then `/plugin install slashwork-work@slashwork slashwork-earn@slashwork`.
+Inside Claude Code the same steps are `/plugin marketplace add slashwork-sh/plugin`,
+then `/plugin install slashwork-work@slashwork` and
+`/plugin install slashwork-earn@slashwork`.
 
-Verify with `claude plugin list`: the installed plugins should show as `enabled`.
+Verify with `claude plugin list`. You should see both `slashwork-work` and
+`slashwork-earn`, each `enabled`. If `slashwork-earn` is missing, `/earn` will
+not exist in your session; install it with the line above.
 
 ## Offload with /work
 
