@@ -1,250 +1,133 @@
 #!/usr/bin/env bash
-# Integration test for the PreToolUse(Task|Agent) intercept hook.
+# Integration test for the PreToolUse(Task|Agent) intercept shim.
 #
-# The classifier, secret scan, and dispatch loop now live in the shared
-# slashwork-offload core (unit-tested in offload/src/*.rs and end to end in
-# offload/tests/classify_cli.rs). This test covers what stays in the hook: the
-# opt-out gate, envelope parsing, the self-worker fast path, the token presence
-# gate, the once-per-session consent disclosure, and rendering the core's
-# decision as a `deny` (with the savings receipt) or a clean local fall-through.
+# The shim is thin now: honour the opt-out, locate the core binary, hand it
+# stdin, pass its stdout through. Envelope parsing, the consent gate,
+# classification, dispatch, and decision shaping all live in the core
+# (`slashwork-offload hook`, offload/src/hook.rs), unit-tested there and driven
+# end to end by offload/tests/hook_cli.rs and the coordinator repo's
+# tests/e2e_offload_test.sh.
 #
-# It drives the hook against a FAKE core: a stub that records each subcommand it
-# is called with and echoes a canned decision from the environment. So the test
-# needs no coordinator and no Rust build, and asserts exactly the bash contract:
-# which subcommand ran, and what the hook emitted.
+# So this covers exactly what stays in shell: the opt-out gate, the core
+# discovery order (including the Windows .exe), that the core is invoked with
+# the `hook` subcommand, that stdin reaches it and its stdout comes back, and
+# that a missing or broken core falls through cleanly instead of erroring.
+#
+# It drives the shim against a FAKE core, so it needs no coordinator and no Rust
+# build.
 #
 # Run: bash plugins/work/hooks/intercept_test.sh
 set -uo pipefail
 
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 INTERCEPT="$HOOK_DIR/intercept.sh"
-TOKEN="testtoken"
-SESS="itest-fixed"
 PASS=0
 
 fail() { echo "FAIL: $1"; [ -n "${2:-}" ] && { echo "--- detail ---"; echo "$2"; }; exit 1; }
 ok() { echo "PASS: $1"; PASS=$((PASS + 1)); }
 
-# A sandbox HOME so the hook's ~/.slashwork writes (savings.log) and the token
-# presence check never touch the real home or a dev's real token.
+# A sandbox HOME so core discovery never finds a dev's real install.
 SANDBOX="$(mktemp -d)"
 export HOME="$SANDBOX"
-export SLASHWORK_ROUTE_LOG="$SANDBOX/route-log.jsonl"
-FAKE_CORE_LOG="$SANDBOX/core-calls.log"
-export FAKE_CORE_LOG
+trap 'rm -rf "$SANDBOX"' EXIT
+mkdir -p "$SANDBOX/.slashwork/bin"
 
-# The fake core: record each subcommand to FAKE_CORE_LOG, drain the envelope on
-# stdin (so the hook's pipe never breaks), and echo the canned decision for that
-# subcommand from the environment. Always exits 0, like the real core.
-CORE="$SANDBOX/slashwork-offload"
-cat > "$CORE" <<'FAKE'
+ENVELOPE='{"session_id":"s1","tool_name":"Task","tool_input":{"prompt":"research X"}}'
+
+# A fake core: record argv and stdin, then echo a canned line, so we can prove
+# the shim passed both through and returned the core's stdout verbatim.
+make_core() { # make_core <path>
+    cat > "$1" <<'FAKE'
 #!/usr/bin/env bash
-# Emit the canned decision the test set for this subcommand. Empty (var unset)
-# reads to the hook as no decision -> local, which is a valid outcome to assert.
-{ printf '%s\n' "$1" >> "${FAKE_CORE_LOG:-/dev/null}"; } 2>/dev/null
-cat >/dev/null
-case "$1" in
-  classify) printf '%s\n' "${FAKE_CLASSIFY:-}" ;;
-  route)    printf '%s\n' "${FAKE_ROUTE:-}" ;;
-  *)        printf '{}\n' ;;
-esac
+printf '%s\n' "$*" > "$FAKE_CORE_ARGV"
+cat > "$FAKE_CORE_STDIN"
+printf '{"systemMessage":"from the core"}\n'
 exit 0
 FAKE
-chmod +x "$CORE"
-export SLASHWORK_OFFLOAD_BIN="$CORE"
-
-trap 'rm -rf "$SANDBOX" /tmp/slashwork-intercept-consent-* 2>/dev/null' EXIT
-
-# Canned decisions the fake core echoes (the JSON \n stay escaped: the hook's jq
-# reads them as real newlines).
-ART='{"decision":"artifact","task_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","class":"research","artifact":"OFFLOAD ARTIFACT: the answer.","wrapped":"UNTRUSTED third-party content.\n\nOFFLOAD ARTIFACT: the answer.","tokens_used":123,"settled":12,"tokens_saved_total":4560}'
-ART_ML='{"decision":"artifact","task_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","class":"prose","artifact":"LINE ONE of the report\nLINE TWO details\nLINE THREE conclusion","tokens_used":200,"settled":20,"tokens_saved_total":200}'
-LOCAL_COLD='{"decision":"local","reason":"no earner claimed within 5s"}'
-LOCAL_CREDITS='{"decision":"local","reason":"not enough credits: you have 3, it costs 50"}'
-ROUTABLE='{"decision":"routable","class":"research"}'
-NOTROUTABLE='{"decision":"local","reason":"no single confident class (matched 0)"}'
-
-# envelope <prompt> <tool_name> <session> -> a PreToolUse envelope on stdout
-envelope() {
-  jq -nc --arg p "$1" --arg t "${2:-Task}" --arg s "${3:-$SESS}" \
-    '{session_id:$s, hook_event_name:"PreToolUse", tool_name:$t,
-      tool_input:{subagent_type:"general-purpose", description:"d", prompt:$p}}'
+    chmod +x "$1"
 }
+export FAKE_CORE_ARGV="$SANDBOX/argv"
+export FAKE_CORE_STDIN="$SANDBOX/stdin"
+reset() { : > "$FAKE_CORE_ARGV"; : > "$FAKE_CORE_STDIN"; }
 
-consent_given() { : > "/tmp/slashwork-intercept-consent-$SESS"; }
-core_called() { grep -qx "$1" "$FAKE_CORE_LOG" 2>/dev/null; }
-decision() { printf '%s' "$1" | jq -r '.hookSpecificOutput.permissionDecision // empty' 2>/dev/null; }
-reason() { printf '%s' "$1" | jq -r '.hookSpecificOutput.permissionDecisionReason // empty' 2>/dev/null; }
-sysmsg() { printf '%s' "$1" | jq -r '.systemMessage // empty' 2>/dev/null; }
+# 1. Default-on: no SLASHWORK_INTERCEPT, core present at the install path. The
+#    shim calls it with `hook`, feeds it stdin, and returns its stdout.
+CORE="$SANDBOX/.slashwork/bin/slashwork-offload"
+make_core "$CORE"
+reset
+OUT=$(printf '%s' "$ENVELOPE" | env -u SLASHWORK_INTERCEPT -u SLASHWORK_OFFLOAD_BIN "$INTERCEPT" 2>/dev/null)
+[ "$(cat "$FAKE_CORE_ARGV")" = "hook" ] || fail "expected the hook subcommand" "$(cat "$FAKE_CORE_ARGV")"
+[ "$(cat "$FAKE_CORE_STDIN")" = "$ENVELOPE" ] || fail "envelope did not reach the core" "$(cat "$FAKE_CORE_STDIN")"
+[ "$OUT" = '{"systemMessage":"from the core"}' ] || fail "core stdout not passed through" "$OUT"
+ok "default-on -> core invoked with 'hook', stdin in, stdout out"
 
-# invoke <prompt> [tool] [session] -> sets OUT, RC. Signed in, interception on.
-# The caller sets FAKE_ROUTE / FAKE_CLASSIFY (exported) first.
-invoke() {
-  : > "$FAKE_CORE_LOG"
-  OUT=$(envelope "$1" "${2:-Task}" "${3:-$SESS}" \
-    | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" bash "$INTERCEPT" 2>/dev/null)
-  RC=$?
-}
+# 2. Opt-out: SLASHWORK_INTERCEPT=0 is a total no-op and the core is untouched.
+reset
+OUT=$(printf '%s' "$ENVELOPE" | SLASHWORK_INTERCEPT=0 "$INTERCEPT" 2>/dev/null)
+rc=$?
+[ "$rc" -eq 0 ] || fail "opt-out must exit 0" "rc=$rc"
+[ -z "$OUT" ] || fail "opt-out must emit nothing" "$OUT"
+[ ! -s "$FAKE_CORE_ARGV" ] || fail "opt-out must not call the core" "$(cat "$FAKE_CORE_ARGV")"
+ok "SLASHWORK_INTERCEPT=0 -> no-op, core untouched"
 
-# 1. Routable spawn, the core returns an artifact -> deny carrying the wrapped
-#    (untrusted) artifact, plus the savings receipt.
-consent_given
-export FAKE_ROUTE="$ART"
-invoke "Research and compare the leading approaches to rate limiting; give pros and cons of each."
-[ "$RC" = 0 ] || fail "artifact exit code $RC" "$OUT"
-[ "$(decision "$OUT")" = "deny" ] || fail "artifact must deny the local spawn" "$OUT"
-reason "$OUT" | grep -q "OFFLOAD ARTIFACT" || fail "deny reason missing the artifact" "$OUT"
-reason "$OUT" | grep -qi "untrusted" || fail "deny reason must mark the artifact untrusted" "$OUT"
-SM=$(sysmsg "$OUT")
-printf '%s' "$SM" | grep -q "123 tokens" || fail "systemMessage missing tokens saved" "$OUT"
-printf '%s' "$SM" | grep -q "12 cr" || fail "systemMessage missing settled credits" "$OUT"
-printf '%s' "$SM" | grep -q "tokens saved" || fail "systemMessage missing the plot header" "$OUT"
-printf '%s' "$SM" | grep -q "/earn" || fail "systemMessage missing the /earn pointer" "$OUT"
-core_called route || fail "the hook should have called the core's route" "$(cat "$FAKE_CORE_LOG")"
-ok "routable artifact -> deny with untrusted artifact + saved-tokens receipt"
+# 3. SLASHWORK_OFFLOAD_BIN wins over the install path.
+OVERRIDE="$SANDBOX/override-core"
+cat > "$OVERRIDE" <<'FAKE'
+#!/usr/bin/env bash
+cat >/dev/null
+printf '{"systemMessage":"from the override"}\n'
+FAKE
+chmod +x "$OVERRIDE"
+OUT=$(printf '%s' "$ENVELOPE" | SLASHWORK_OFFLOAD_BIN="$OVERRIDE" "$INTERCEPT" 2>/dev/null)
+[ "$OUT" = '{"systemMessage":"from the override"}' ] || fail "SLASHWORK_OFFLOAD_BIN ignored" "$OUT"
+ok "SLASHWORK_OFFLOAD_BIN overrides the install path"
 
-# 2. Multi-line artifact returned whole (not truncated to line 1); with no
-#    `wrapped` field the hook falls back to the raw artifact.
-export FAKE_ROUTE="$ART_ML"
-invoke "Draft a report summarizing the quarterly numbers; revenue up, costs flat."
-R=$(reason "$OUT")
-printf '%s' "$R" | grep -q "LINE ONE" || fail "multiline: line 1 missing" "$R"
-printf '%s' "$R" | grep -q "LINE THREE" || fail "multiline artifact truncated (line 3 dropped)" "$R"
-ok "multi-line artifact (no wrapped) returned whole via .artifact fallback"
+# 4. Windows: only slashwork-offload.exe exists in the install dir, and the shim
+#    still finds it. Without the .exe candidate the offloader stays inert on
+#    every Windows machine, which is the bug this path exists to fix.
+rm -f "$CORE"
+make_core "$SANDBOX/.slashwork/bin/slashwork-offload.exe"
+reset
+OUT=$(printf '%s' "$ENVELOPE" | env -u SLASHWORK_OFFLOAD_BIN "$INTERCEPT" 2>/dev/null)
+[ "$(cat "$FAKE_CORE_ARGV")" = "hook" ] || fail "did not find the .exe core" "$(cat "$FAKE_CORE_ARGV")"
+[ "$OUT" = '{"systemMessage":"from the core"}' ] || fail ".exe core stdout not passed through" "$OUT"
+ok "windows .exe core is discovered"
+rm -f "$SANDBOX/.slashwork/bin/slashwork-offload.exe"
 
-# 3. The core returns local (cold pool, decline, any dispatch failure) -> clean
-#    fall-through: no decision, no output, local spawn.
-export FAKE_ROUTE="$LOCAL_COLD"
-invoke "Research and compare the options; pros and cons of each."
-if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "a local decision must fall through silently" "$OUT"; fi
-core_called route || fail "should still have called route" "$(cat "$FAKE_CORE_LOG")"
-ok "core returns local -> silent local fall-through"
+# 5. No core anywhere (not installed yet, or an unsupported platform) -> silent
+#    exit 0, so Claude Code spawns the subagent normally. PATH is narrowed to the
+#    system directories, which have sh (the shim's interpreter) but no
+#    slashwork-offload, rather than emptied, which would break the shebang and
+#    test nothing.
+OUT=$(printf '%s' "$ENVELOPE" | env -u SLASHWORK_OFFLOAD_BIN PATH=/usr/bin:/bin "$INTERCEPT" 2>/dev/null)
+rc=$?
+[ "$rc" -eq 0 ] || fail "missing core must exit 0" "rc=$rc"
+[ -z "$OUT" ] || fail "missing core must emit nothing" "$OUT"
+ok "no core -> silent local fall-through"
 
-# 4. Non-subagent tool -> no-op, the core is never called.
-export FAKE_ROUTE="$ART"
-invoke "anything" Bash
-if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "non-subagent tool should be a no-op" "$OUT"; fi
-[ ! -s "$FAKE_CORE_LOG" ] || fail "non-subagent tool must not call the core" "$(cat "$FAKE_CORE_LOG")"
-ok "non-subagent tool -> no-op, core untouched"
+# 6. A core that exits non-zero must still leave the hook at exit 0. A non-zero
+#    hook surfaces an error in the session; the contract is always a clean fall
+#    through to the local spawn.
+BROKEN="$SANDBOX/broken-core"
+printf '#!/usr/bin/env bash\ncat >/dev/null\nexit 3\n' > "$BROKEN"
+chmod +x "$BROKEN"
+printf '%s' "$ENVELOPE" | SLASHWORK_OFFLOAD_BIN="$BROKEN" "$INTERCEPT" >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] || fail "a failing core must still exit 0" "rc=$rc"
+ok "core exits non-zero -> hook still exits 0"
 
-# 5. Self-worker (prompt carries task_id:) -> fast-path pass-through, core never
-#    called (never repost our own work, and skip the subprocess).
-invoke "task_id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
-Read the job and solve it."
-if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "self-worker should pass through" "$OUT"; fi
-[ ! -s "$FAKE_CORE_LOG" ] || fail "self-worker must not call the core" "$(cat "$FAKE_CORE_LOG")"
-ok "self-worker (task_id) -> pass-through, core untouched"
+# 7. A core path that is not runnable at all -> exit 0, no shell error.
+printf '%s' "$ENVELOPE" | SLASHWORK_OFFLOAD_BIN="$SANDBOX/does-not-exist" "$INTERCEPT" >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] || fail "an unrunnable core must exit 0" "rc=$rc"
+ok "unrunnable core -> hook still exits 0"
 
-# 6. Empty prompt -> no-op.
-invoke ""
-if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "empty prompt should be a no-op" "$OUT"; fi
-[ ! -s "$FAKE_CORE_LOG" ] || fail "empty prompt must not call the core" "$(cat "$FAKE_CORE_LOG")"
-ok "empty prompt -> no-op"
+# 8. The shim must not depend on jq. Git Bash ships none, and reintroducing the
+#    dependency would silently disable routing on every Windows machine. Comment
+#    lines are stripped first: the header explains the jq history on purpose.
+if grep -vE '^[[:space:]]*#' "$INTERCEPT" | grep -qE '(^|[^[:alnum:]_])jq([^[:alnum:]_]|$)'; then
+    fail "intercept.sh must not use jq (Git Bash has none)"
+fi
+ok "shim has no jq dependency"
 
-# 7. Not signed in (no SLASHWORK_TOKEN and no ~/.slashwork/token in the sandbox
-#    HOME) -> inert: no consent notice, core never called.
-: > "$FAKE_CORE_LOG"
-OUT=$(envelope "Research and compare the options; pros and cons of each." \
-  | env -u SLASHWORK_TOKEN SLASHWORK_INTERCEPT=1 bash "$INTERCEPT" 2>/dev/null)
-RC=$?
-if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "no token must be inert" "$OUT"; fi
-[ ! -s "$FAKE_CORE_LOG" ] || fail "no token must not call the core" "$(cat "$FAKE_CORE_LOG")"
-ok "no token -> inert, core untouched"
-
-# 8. Core binary missing/broken (bogus SLASHWORK_OFFLOAD_BIN) -> the exec fails,
-#    the hook reads no decision and falls back to a local spawn. The iron rule:
-#    a broken core never hangs or errors, it runs local.
-consent_given
-: > "$FAKE_CORE_LOG"
-OUT=$(envelope "Research and compare the options; pros and cons of each." \
-  | SLASHWORK_INTERCEPT=1 SLASHWORK_TOKEN="$TOKEN" SLASHWORK_OFFLOAD_BIN="/no/such/slashwork-offload" \
-      bash "$INTERCEPT" 2>/dev/null)
-RC=$?
-if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "a broken core must fall back to local" "$OUT"; fi
-ok "broken core binary -> local fall-through, no hang"
-
-# 9. First-candidate consent gate: a fresh session's first ROUTABLE spawn runs
-#    local, shows the disclosure as a visible systemMessage, and calls only
-#    classify (never route); the next spawn routes.
-FRESH="itest-fresh-$RANDOM"
-rm -f "/tmp/slashwork-intercept-consent-$FRESH"
-export FAKE_CLASSIFY="$ROUTABLE"
-export FAKE_ROUTE="$ART"
-invoke "Research and compare the options; pros and cons of each." Task "$FRESH"
-[ "$RC" = 0 ] || fail "first candidate exit code $RC" "$OUT"
-[ -z "$(decision "$OUT")" ] || fail "first candidate must carry no decision" "$OUT"
-sysmsg "$OUT" | grep -q "slashwork intercept is on" || fail "first candidate must show the disclosure" "$OUT"
-core_called classify || fail "consent gate should classify" "$(cat "$FAKE_CORE_LOG")"
-core_called route && fail "consent gate must NOT dispatch the first spawn" "$(cat "$FAKE_CORE_LOG")"
-# Second candidate in the same session now routes.
-invoke "Research and compare the options; pros and cons of each." Task "$FRESH"
-[ "$(decision "$OUT")" = "deny" ] || fail "second candidate should route" "$OUT"
-core_called route || fail "second candidate should dispatch" "$(cat "$FAKE_CORE_LOG")"
-ok "consent gate -> disclose+local first, route second"
-
-# 10. Consent gate on a NON-routable first spawn: no disclosure, and consent is
-#     not marked, so a later routable spawn still gets the notice. Classify runs,
-#     route does not.
-FRESH2="itest-fresh2-$RANDOM"
-rm -f "/tmp/slashwork-intercept-consent-$FRESH2"
-export FAKE_CLASSIFY="$NOTROUTABLE"
-invoke "Do the needful with the thing." Task "$FRESH2"
-[ -z "$OUT" ] || fail "a non-routable first spawn must be silent (no disclosure)" "$OUT"
-core_called classify || fail "should classify to decide the consent notice" "$(cat "$FAKE_CORE_LOG")"
-core_called route && fail "a non-routable spawn must not dispatch" "$(cat "$FAKE_CORE_LOG")"
-[ ! -f "/tmp/slashwork-intercept-consent-$FRESH2" ] || fail "a non-routable spawn must not consume consent" ""
-ok "non-routable first spawn -> silent, consent not consumed"
-
-# 11. Out of credits: the core returns a local decision whose reason names it, so
-#     the hook shows a visible /earn nudge and runs local (no decision).
-consent_given
-export FAKE_ROUTE="$LOCAL_CREDITS"
-invoke "Research and compare the options; pros and cons of each."
-[ "$RC" = 0 ] || fail "out-of-credits exit code $RC" "$OUT"
-[ -z "$(decision "$OUT")" ] || fail "out of credits must carry no decision" "$OUT"
-SM=$(sysmsg "$OUT")
-printf '%s' "$SM" | grep -q "not enough credits" || fail "out-of-credits message missing the reason" "$OUT"
-printf '%s' "$SM" | grep -q "/earn" || fail "out-of-credits message missing the /earn pointer" "$OUT"
-ok "out of credits -> local spawn + visible /earn nudge"
-
-# 12. Agent tool name routes like Task (newer Claude Code builds rename it).
-export FAKE_ROUTE="$ART"
-invoke "Research and compare the options; pros and cons of each." Agent
-[ "$(decision "$OUT")" = "deny" ] || fail "an Agent-named spawn must route like a Task one" "$OUT"
-core_called route || fail "Agent-named spawn should dispatch" "$(cat "$FAKE_CORE_LOG")"
-ok "Agent tool name routes like Task"
-
-# 13. Default-on: SLASHWORK_INTERCEPT unset -> intercepts (install + token is the
-#     opt-in). env -u guarantees the var is absent.
-export FAKE_ROUTE="$ART"
-: > "$FAKE_CORE_LOG"
-OUT=$(envelope "Research and compare the options; pros and cons of each." \
-  | env -u SLASHWORK_INTERCEPT SLASHWORK_TOKEN="$TOKEN" bash "$INTERCEPT" 2>/dev/null)
-[ "$(decision "$OUT")" = "deny" ] || fail "unset must intercept (default-on)" "$OUT"
-ok "SLASHWORK_INTERCEPT unset -> intercepts (default-on)"
-
-# 14. Opt-out: SLASHWORK_INTERCEPT=0 -> total no-op, core never called. The hook
-#     exits at the opt-out gate before reading stdin, so feed the envelope as a
-#     here-string (no upstream producer to SIGPIPE under pipefail).
-ENV_OPTOUT=$(envelope "Research and compare the options.")
-: > "$FAKE_CORE_LOG"
-OUT=$(SLASHWORK_INTERCEPT=0 SLASHWORK_TOKEN="$TOKEN" bash "$INTERCEPT" 2>/dev/null <<< "$ENV_OPTOUT")
-RC=$?
-if ! { [ "$RC" = 0 ] && [ -z "$OUT" ]; }; then fail "opted out must be a no-op" "$OUT"; fi
-[ ! -s "$FAKE_CORE_LOG" ] || fail "opted out must not call the core" "$(cat "$FAKE_CORE_LOG")"
-ok "SLASHWORK_INTERCEPT=0 -> no-op"
-
-# 15. Route log records the verdict the hook observes: routed (with the class) on
-#     an artifact, local (with the reason) on a local decision.
-: > "$SLASHWORK_ROUTE_LOG"
-export FAKE_ROUTE="$ART"
-invoke "Research and compare the leading rate limiting algorithms; give the pros and cons of each."
-grep -q '"decision":"routed","detail":"research"' "$SLASHWORK_ROUTE_LOG" \
-  || fail "route log missing the routed research verdict" "$(cat "$SLASHWORK_ROUTE_LOG")"
-export FAKE_ROUTE="$LOCAL_COLD"
-invoke "Research and compare the options; pros and cons of each."
-grep -q '"decision":"local"' "$SLASHWORK_ROUTE_LOG" \
-  || fail "route log missing a local verdict" "$(cat "$SLASHWORK_ROUTE_LOG")"
-ok "route log records routed (class) and local (reason) verdicts"
-
-echo "ALL PASS ($PASS scenarios)"
+printf '\nALL PASS (%d checks)\n' "$PASS"

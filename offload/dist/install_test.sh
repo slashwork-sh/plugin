@@ -42,9 +42,18 @@ check "macos x86_64"                x86_64-apple-darwin       Darwin x86_64
 check "linux x86_64"                x86_64-unknown-linux-gnu  Linux  x86_64
 check "linux aarch64"               aarch64-unknown-linux-gnu Linux  aarch64
 check "linux arm64 alias"           aarch64-unknown-linux-gnu Linux  arm64
-check "unsupported os (windows)"    "<unsupported>"           MINGW64_NT-10.0 x86_64
+# Windows: Git Bash, MSYS2, and Cygwin each report a different `uname -s`, and
+# every Windows arch takes the x86_64 build (ARM64 emulates x64).
+check "windows git bash"            x86_64-pc-windows-msvc    MINGW64_NT-10.0-22631 x86_64
+check "windows msys2"               x86_64-pc-windows-msvc    MSYS_NT-10.0    x86_64
+check "windows cygwin"              x86_64-pc-windows-msvc    CYGWIN_NT-10.0  x86_64
+check "windows on arm"              x86_64-pc-windows-msvc    MINGW64_NT-10.0 aarch64
 check "unsupported arch (riscv)"    "<unsupported>"           Linux  riscv64
 check "unsupported darwin arch"     "<unsupported>"           Darwin i386
+check "unsupported os (freebsd)"    "<unsupported>"           FreeBSD x86_64
+
+check_equal "windows binary has .exe"  slashwork-offload.exe "$(bin_name x86_64-pc-windows-msvc)"
+check_equal "macos binary has no .exe" slashwork-offload     "$(bin_name aarch64-apple-darwin)"
 
 # The version the standalone installer pins, with any env override ignored.
 standalone_version=$(grep -m1 '^VERSION=' "$DIR/install.sh" | sed 's/.*:-\([^}]*\)}.*/\1/')
@@ -63,6 +72,28 @@ for name in 'slashwork-offload-${target}.tar.gz' 'slashwork-offload-${target}.sh
         printf 'FAIL: asset name %s missing (standalone=%s hook=%s)\n' "$name" "$standalone_has" "$hook_has"
         fails=$((fails + 1))
     fi
+done
+
+# The two installers must agree on every platform they resolve, not just on the
+# version and asset names. Source the hook installer in a subshell (so its
+# functions do not clobber the standalone ones already sourced here) and compare
+# both mappings across the full matrix. Without this, adding a platform to one
+# installer and not the other silently leaves that platform working under Claude
+# Code and broken under the standalone install, or the reverse.
+for pair in \
+    "Darwin arm64" "Darwin x86_64" \
+    "Linux x86_64" "Linux aarch64" \
+    "MINGW64_NT-10.0-22631 x86_64" "MSYS_NT-10.0 x86_64" "CYGWIN_NT-10.0 x86_64" \
+    "FreeBSD x86_64"; do
+    # shellcheck disable=SC2086
+    set -- $pair
+    standalone=$(resolve_target "$1" "$2" 2>/dev/null) || standalone="<unsupported>"
+    hook=$(
+        # shellcheck source=plugins/work/hooks/install-core.sh disable=SC1091
+        SLASHWORK_INSTALL_LIB=1 . "$HOOK_INSTALLER"
+        resolve_target "$1" "$2" 2>/dev/null || echo "<unsupported>"
+    )
+    check_equal "installers agree on $1/$2" "$standalone" "$hook"
 done
 
 # A person running this wants a failure to be visible, unlike the SessionStart
