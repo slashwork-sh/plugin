@@ -3,7 +3,7 @@
 #
 # A shim. It does two things: honour the opt-out, and find the shared
 # `slashwork-offload` core binary. Everything else, parsing the PreToolUse
-# envelope, the once-per-session consent disclosure, classification, dispatch,
+# envelope, the once-per-user consent disclosure, classification, dispatch,
 # the savings receipt, and shaping the `deny` that hands an artifact back in
 # place of the local spawn, happens in `slashwork-offload hook`
 # (offload/src/hook.rs), which reads the envelope on stdin and writes the hook's

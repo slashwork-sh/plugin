@@ -184,12 +184,12 @@ fn cmd_hook() -> ! {
         std::process::exit(0);
     };
 
-    // First-candidate consent gate, once per session. Installing the plugin and
+    // First-candidate consent gate, once per user. Installing the plugin and
     // signing in is the standing consent, but nothing leaves the machine before
-    // the user has seen what routing does: the first *routable* spawn of a
-    // session prints the disclosure and still runs locally. Classify without a
-    // token or a network call, so a spawn that was never routable neither
-    // triggers the notice nor spends the session's one disclosure.
+    // the user has seen what routing does: their first *routable* spawn prints
+    // the disclosure and still runs locally. Classify without a token or a
+    // network call, so a spawn that was never routable neither triggers the
+    // notice nor spends the one disclosure.
     let marker = consent_marker(&env.session_key());
     if !marker.exists() {
         match classify(prompt) {
@@ -277,7 +277,7 @@ fn cmd_hook() -> ! {
 /// The harness tag the coordinator attributes routed tasks to.
 const HARNESS: &str = "claude-code";
 
-/// Shown once per session, before the first routable spawn is ever routed.
+/// Shown once per user, before their first routable spawn is ever routed.
 const CONSENT_NOTICE: &str = "slashwork intercept is on: self-contained subagent tasks will be routed to the offload network, meaning the task prompt is sent to another slashwork user's session to run. This first task runs locally; routing starts with the next one. Run /work off (or set SLASHWORK_INTERCEPT=0) to stop routing.";
 
 /// Print one compact JSON object for Claude Code to read.
