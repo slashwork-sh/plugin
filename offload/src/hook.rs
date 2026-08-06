@@ -1,6 +1,6 @@
 //! The offloader hook, ported off `jq`.
 //!
-//! `intercept.sh` used to parse the `PreToolUse` envelope, hold the once-per-session
+//! `intercept.sh` used to parse the `PreToolUse` envelope, hold the one-time
 //! consent marker, keep the savings log, render the receipt plot, and shape the
 //! `deny` decision, all with `jq`. That made `jq` a hard dependency of routing:
 //! Git Bash on Windows ships no `jq`, so the hook hit `command -v jq || exit 0`
@@ -195,10 +195,25 @@ pub fn route_log(decision: &str, detail: &str) {
     }
 }
 
-/// Path of this session's consent marker.
+/// Path of the consent marker: durable and per user, in the state dir.
+///
+/// It used to be per session, in the temp dir. The disclosure is a one-time
+/// explanation of what routing does, but keyed per session it was charged again
+/// in every new console, and it costs a routable spawn each time (that spawn
+/// runs locally by design). Measured on a heavy user: 11 subagent spawns in 24
+/// hours across 19 sessions, so nearly every session held exactly one routable
+/// spawn and the gate consumed it. Per session, the gate was a permanent off
+/// switch. Per user, it is what it says: shown once, then routing runs.
+///
+/// Falls back to the old per-session temp marker when there is no state dir (no
+/// resolvable home). That degrades to the previous behaviour rather than
+/// disclosing on every single spawn.
 #[must_use]
 pub fn consent_marker(session_key: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("slashwork-intercept-consent-{session_key}"))
+    match state_dir() {
+        Some(dir) => dir.join("consent"),
+        None => std::env::temp_dir().join(format!("slashwork-intercept-consent-{session_key}")),
+    }
 }
 
 #[cfg(test)]

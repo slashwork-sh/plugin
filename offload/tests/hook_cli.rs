@@ -91,6 +91,81 @@ fn without_a_token_the_hook_is_inert() {
     assert!(out.is_empty(), "got: {out}");
 }
 
+/// Run the hook against a caller-owned sandbox HOME, so several invocations can
+/// share state the way real consoles share a home directory. `base` points the
+/// dispatch path somewhere harmless: `http://127.0.0.1:1` is an allowed base
+/// (the localhost dev exception) with nothing listening, so a run that gets past
+/// the consent gate fails instantly and locally instead of reaching the network.
+fn hook_in_home(sandbox: &std::path::Path, session: &str, prompt: &str) -> String {
+    let envelope = serde_json::json!({
+        "session_id": session,
+        "tool_name": "Task",
+        "tool_input": { "prompt": prompt },
+    })
+    .to_string();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_slashwork-offload"));
+    cmd.arg("hook")
+        .env("HOME", sandbox)
+        .env("USERPROFILE", sandbox)
+        .env("SLASHWORK_ROUTE_LOG", "/dev/null")
+        .env("SLASHWORK_TOKEN", "t")
+        .env("SLASHWORK_BASE_URL", "http://127.0.0.1:1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let mut child = cmd.spawn().expect("spawn slashwork-offload");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(envelope.as_bytes())
+        .expect("write envelope");
+    let out = child.wait_with_output().expect("wait for hook");
+    assert!(out.status.success(), "hook must always exit 0");
+    String::from_utf8(out.stdout).expect("utf8 stdout")
+}
+
+#[test]
+fn the_disclosure_is_shown_once_per_user_not_once_per_session() {
+    // Keyed per session, the gate was a permanent off switch: nearly every
+    // session holds exactly one routable spawn, the disclosure consumes it, and
+    // the session ends before anything is routed. Per user it is shown once and
+    // then routing runs, in this console and every later one.
+    const ROUTABLE: &str =
+        "Research and compare the leading rate-limiting approaches; give the pros and cons of each.";
+    let sandbox = std::env::temp_dir().join(format!(
+        "slashwork-consent-home-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&sandbox).expect("sandbox");
+
+    let first = hook_in_home(&sandbox, "session-one", ROUTABLE);
+    assert!(
+        first.contains("systemMessage") && first.contains("routed to the offload network"),
+        "the first routable spawn must still disclose: {first}"
+    );
+    assert!(
+        !first.contains("permissionDecision"),
+        "the disclosed spawn must still run locally: {first}"
+    );
+    assert!(
+        sandbox.join(".slashwork").join("consent").exists(),
+        "consent must be recorded in the state dir, not the temp dir"
+    );
+
+    // A brand new session, same user. The disclosure is spent.
+    let second = hook_in_home(&sandbox, "session-two", ROUTABLE);
+    assert!(
+        !second.contains("routed to the offload network"),
+        "a new session must not re-disclose and must not spend another spawn: {second}"
+    );
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
 #[test]
 fn malformed_input_is_not_a_crash() {
     for raw in ["", "not json at all", "{}", "[]", r#"{"tool_name":null}"#] {
