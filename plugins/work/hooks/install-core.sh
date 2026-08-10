@@ -12,7 +12,7 @@
 # falls back to a local spawn.
 set -u
 
-VERSION="offload-v0.4.0"
+VERSION="offload-v0.4.1"
 REPO="slashwork-sh/plugin"
 BIN_DIR="${HOME}/.slashwork/bin"
 MARKER="${BIN_DIR}/.version"
@@ -56,6 +56,47 @@ bin_name() {
     esac
 }
 
+# Sortable rank for an `offload-vX.Y.Z` tag: major, then minor and patch in
+# three zero-padded digits each, so ordering is numeric per field and 0.10.0
+# outranks 0.9.0 the way a lexical compare would not. Any prerelease suffix is
+# dropped (0.4.1-rc1 ranks as 0.4.1). Returns non-zero for anything that does
+# not parse. Pure, so install-core_test.sh can exercise it without a network.
+version_rank() {
+    v="${1#offload-v}"
+    maj="${v%%.*}"
+    rest="${v#*.}"
+    min="${rest%%.*}"
+    pat="${rest#*.}"
+    pat="${pat%%[!0-9]*}"
+    for n in "$maj" "$min" "$pat"; do
+        case "$n" in
+            '' | *[!0-9]*) return 1 ;;
+        esac
+    done
+    printf '%d%03d%03d\n' "$maj" "$min" "$pat"
+}
+
+# True when the version pinned in this copy of the script should replace what is
+# already on disk. Only ever moves forward.
+#
+# Every console on the machine shares one ~/.slashwork/bin, and this hook re-runs
+# at every session start. The old test was "marker differs from pin", so a
+# console still running an older plugin reinstalled its own older core over a
+# newer one and silently downgraded every other console. A pin from before the
+# `hook` subcommand existed (v0.1.0, v0.2.0) went further and left the offloader
+# inert everywhere, because the shim has nothing else to call.
+#
+# An unreadable marker cannot be proven newer, so restore the pin rather than
+# trust it. An unreadable pin means this script is the broken one; leave the
+# working binary alone.
+should_install() { # should_install <marker on disk> <version pinned here>
+    [ -n "$1" ] || return 0
+    [ "$1" != "$2" ] || return 1
+    have=$(version_rank "$1") || return 0
+    want=$(version_rank "$2") || return 1
+    [ "$want" -gt "$have" ]
+}
+
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | cut -d' ' -f1
@@ -77,9 +118,13 @@ install() {
     bin_file=$(bin_name "$target")
     BIN="${BIN_DIR}/${bin_file}"
 
-    # Idempotent: already at the pinned version.
-    if [ -x "$BIN" ] && [ "$(cat "$MARKER" 2>/dev/null)" = "$VERSION" ]; then
-        return 0
+    # Idempotent, and forward-only: skip when the binary on disk is already the
+    # pinned version or a newer one.
+    if [ -x "$BIN" ]; then
+        marker=$(cat "$MARKER" 2>/dev/null || echo '')
+        if ! should_install "$marker" "$VERSION"; then
+            return 0
+        fi
     fi
 
     # The archive is slashwork-offload-<target>.tar.gz; its checksum ships as a

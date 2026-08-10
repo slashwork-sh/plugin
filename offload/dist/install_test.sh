@@ -96,6 +96,28 @@ for pair in \
     check_equal "installers agree on $1/$2" "$standalone" "$hook"
 done
 
+# Both installers write the same shared ~/.slashwork/bin, so they must also agree
+# on when to overwrite it. If only one of them learned to refuse a downgrade, the
+# other still drags every console on the machine backwards.
+for trip in \
+    "offload-v0.3.0 offload-v0.4.0" \
+    "offload-v0.4.0 offload-v0.3.0" \
+    "offload-v0.4.0 offload-v0.4.0" \
+    "offload-v0.1.0 offload-v0.4.0" \
+    "offload-v0.9.0 offload-v0.10.0" \
+    "offload-v0.10.0 offload-v0.9.0" \
+    "not-a-version offload-v0.4.0"; do
+    # shellcheck disable=SC2086
+    set -- $trip
+    if should_install "$1" "$2"; then standalone=yes; else standalone=no; fi
+    hook=$(
+        # shellcheck source=plugins/work/hooks/install-core.sh disable=SC1091
+        SLASHWORK_INSTALL_LIB=1 . "$HOOK_INSTALLER"
+        if should_install "$1" "$2"; then echo yes; else echo no; fi
+    )
+    check_equal "installers agree: on $1, pin $2" "$standalone" "$hook"
+done
+
 # A person running this wants a failure to be visible, unlike the SessionStart
 # hook which must always exit 0.
 checks=$((checks + 1))
