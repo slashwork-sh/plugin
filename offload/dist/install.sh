@@ -20,7 +20,7 @@
 #   SLASHWORK_BIN_DIR           install directory (default: ~/.slashwork/bin)
 set -u
 
-VERSION="${SLASHWORK_OFFLOAD_VERSION:-offload-v0.3.0}"
+VERSION="${SLASHWORK_OFFLOAD_VERSION:-offload-v0.4.0}"
 REPO="slashwork-sh/plugin"
 BIN_DIR="${SLASHWORK_BIN_DIR:-${HOME}/.slashwork/bin}"
 MARKER="${BIN_DIR}/.version"
