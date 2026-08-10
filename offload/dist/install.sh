@@ -16,11 +16,16 @@
 # and wants to know it did not work.
 #
 # Env:
-#   SLASHWORK_OFFLOAD_VERSION   release tag to install (default: the pin below)
+#   SLASHWORK_OFFLOAD_VERSION   release tag to install (default: the pin below).
+#                               Naming one is a deliberate choice, so it installs
+#                               that tag even if it is older than what is on disk.
 #   SLASHWORK_BIN_DIR           install directory (default: ~/.slashwork/bin)
 set -u
 
-VERSION="${SLASHWORK_OFFLOAD_VERSION:-offload-v0.4.0}"
+VERSION="${SLASHWORK_OFFLOAD_VERSION:-offload-v0.4.1}"
+# Whether the caller named a version. Without one we only ever move forward; with
+# one, they asked for that exact tag and a rollback is the point.
+VERSION_FORCED=$([ -n "${SLASHWORK_OFFLOAD_VERSION:-}" ] && echo 1 || echo 0)
 REPO="slashwork-sh/plugin"
 BIN_DIR="${SLASHWORK_BIN_DIR:-${HOME}/.slashwork/bin}"
 MARKER="${BIN_DIR}/.version"
@@ -65,6 +70,38 @@ bin_name() {
     esac
 }
 
+# Sortable rank for an `offload-vX.Y.Z` tag: major, then minor and patch in
+# three zero-padded digits each, so ordering is numeric per field and 0.10.0
+# outranks 0.9.0 the way a lexical compare would not. Any prerelease suffix is
+# dropped (0.4.1-rc1 ranks as 0.4.1). Returns non-zero for anything that does
+# not parse. Kept identical to plugins/work/hooks/install-core.sh.
+version_rank() {
+    v="${1#offload-v}"
+    maj="${v%%.*}"
+    rest="${v#*.}"
+    min="${rest%%.*}"
+    pat="${rest#*.}"
+    pat="${pat%%[!0-9]*}"
+    for n in "$maj" "$min" "$pat"; do
+        case "$n" in
+            '' | *[!0-9]*) return 1 ;;
+        esac
+    done
+    printf '%d%03d%03d\n' "$maj" "$min" "$pat"
+}
+
+# True when the pinned version should replace what is already on disk. Only ever
+# moves forward, because every console on the machine shares one
+# ~/.slashwork/bin and an older installer must not drag a newer core backwards.
+# Kept identical to plugins/work/hooks/install-core.sh.
+should_install() { # should_install <marker on disk> <version pinned here>
+    [ -n "$1" ] || return 0
+    [ "$1" != "$2" ] || return 1
+    have=$(version_rank "$1") || return 0
+    want=$(version_rank "$2") || return 1
+    [ "$want" -gt "$have" ]
+}
+
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | cut -d' ' -f1
@@ -86,9 +123,16 @@ install() {
     bin_file=$(bin_name "$target")
     BIN="${BIN_DIR}/${bin_file}"
 
-    if [ -x "$BIN" ] && [ "$(cat "$MARKER" 2>/dev/null)" = "$VERSION" ]; then
-        log "already at $VERSION -> $BIN"
-        return 0
+    if [ -x "$BIN" ] && [ "$VERSION_FORCED" = 0 ]; then
+        marker=$(cat "$MARKER" 2>/dev/null || echo '')
+        if ! should_install "$marker" "$VERSION"; then
+            if [ "$marker" = "$VERSION" ]; then
+                log "already at $VERSION -> $BIN"
+            else
+                log "keeping newer $marker -> $BIN (this installer pins $VERSION)"
+            fi
+            return 0
+        fi
     fi
 
     # The archive is slashwork-offload-<target>.tar.gz; its checksum ships as a
