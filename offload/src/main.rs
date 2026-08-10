@@ -194,7 +194,16 @@ fn cmd_hook() -> ! {
     if !marker.exists() {
         match classify(prompt) {
             Decision::Routable { class } => {
-                route_log("routed", class.as_str());
+                // The verdict is `local`: the disclosure spends this spawn and
+                // it still runs on the machine. Logging it as `routed` claimed a
+                // route that never happened, so the log read `routed` while the
+                // coordinator had no task, which is exactly the signal this log
+                // exists to keep honest. The class stays in the detail so the
+                // routable-slice work loses nothing.
+                route_log(
+                    "local",
+                    &format!("consent notice shown, routable as {}", class.as_str()),
+                );
                 let _ = std::fs::write(&marker, b"");
                 // systemMessage, not stderr: an exit-0 hook's stderr shows only
                 // in verbose mode, and a disclosure the user cannot see is not a
