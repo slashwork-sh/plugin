@@ -91,6 +91,18 @@ static REPO_VERBS: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// Words that fence a subagent off from this machine. A repo-vocabulary match
+/// inside a clause carrying one of these is the prompt saying what NOT to touch,
+/// which argues the task is self-contained rather than local.
+static NEGATION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(do not|don't|dont|never|without|no need to|avoid|refrain from)\b").unwrap()
+});
+
+/// `don't forget to run the tests` asks for the tests. The negation belongs to
+/// the verb of forgetting, not to the operation, so it is not a fence.
+static FALSE_FENCE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\W*(forget|fail|hesitate|neglect)\b").unwrap());
+
 /// Credential key families and a broad high-entropy blob. Run against the raw
 /// (case-preserving) prompt so `AKIA`, `AIza`, and `-----BEGIN` still match.
 static SECRET_KEYS: LazyLock<Regex> = LazyLock::new(|| {
@@ -136,6 +148,25 @@ static CODEGEN: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+/// True when the clause fences the machine off rather than reaching into it.
+fn is_fenced(clause: &str) -> bool {
+    NEGATION
+        .find_iter(clause)
+        .any(|m| !FALSE_FENCE.is_match(&clause[m.end()..]))
+}
+
+/// True when any clause uses the repo vocabulary without a fence around it.
+///
+/// Clause-scoped on purpose: one fenced mention does not excuse the rest of the
+/// prompt, so "do not read local files, but run the tests" still declines on its
+/// second clause. Only the repo verbs get this treatment; a literal path or a
+/// real filename stays absolute evidence, fenced or not.
+fn has_unfenced_repo_verb(prompt: &str) -> bool {
+    prompt
+        .split(['.', ';', ',', '\n'])
+        .any(|clause| REPO_VERBS.is_match(clause) && !is_fenced(clause))
+}
+
 /// Classify a subagent prompt into a routing decision. See the module docs for
 /// the invariant: unsure means local.
 #[must_use]
@@ -170,7 +201,7 @@ pub fn classify(prompt: &str) -> Decision {
     if FILE_EXT.is_match(&lp) || DEEP_PATH.is_match(&lp) {
         return local("probable local file or path");
     }
-    if REPO_VERBS.is_match(&lp) {
+    if has_unfenced_repo_verb(&lp) {
         return local("local/repo operation");
     }
 
@@ -330,6 +361,51 @@ mod tests {
         assert_local("Research and compare the schemas defined in src/models/user/schema; give pros and cons.");
         assert_local("Research and compare the numbers captured in benchmark.csv; give the pros and cons of each.");
         assert_local("Research and compare the interfaces declared in api.h; give the pros and cons of each.");
+    }
+
+    // --- Negated local context ---
+    //
+    // A careful prompt writer fences a subagent off from the machine ("do not
+    // read any local files"). Matching the repo vocabulary inside that fence
+    // read the fence itself as evidence of local work, so the more carefully a
+    // prompt was written, the more likely it declined. Only the repo verbs are
+    // negation-aware: a literal path or filename is concrete enough to keep
+    // declining on, negated or not.
+
+    #[test]
+    fn a_negated_repo_mention_still_routes() {
+        assert_routes(
+            "Research and compare the leading rate-limiting approaches; give the pros and cons of each. Do not read any local files, do not run any commands, do not reference this repository.",
+            Class::Research,
+        );
+    }
+
+    #[test]
+    fn a_real_repo_operation_still_declines() {
+        assert_local("Research and compare our options, then run the tests and commit the result.");
+    }
+
+    #[test]
+    fn one_real_repo_clause_outweighs_a_negated_one() {
+        assert_local(
+            "Research and compare the options; do not read any local files, but run the tests when you are done.",
+        );
+    }
+
+    #[test]
+    fn dont_forget_is_an_instruction_not_a_fence() {
+        // "don't forget to X" asks for X. Reading it as a negation would route a
+        // prompt whose actual instruction is a local operation.
+        assert_local("Research and compare the options; don't forget to run the tests afterwards.");
+    }
+
+    #[test]
+    fn a_negated_literal_path_still_declines() {
+        // Paths stay absolute evidence: the prompt named a real location on this
+        // machine, and the conservative rule holds regardless of the verb.
+        assert_local(
+            "Research and compare the options; do not read /Users/mvolz/notes.txt while you work.",
+        );
     }
 
     // --- Secrets (scenarios 6, 11) ---
