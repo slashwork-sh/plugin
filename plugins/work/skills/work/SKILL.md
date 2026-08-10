@@ -109,8 +109,8 @@ fi
 ```
 
 After the token is written, tell the user: interception is already on, nothing
-else to set up. Routing applies from now on in any session with the token, the
-first routable spawn per session shows a disclosure and still runs locally,
+else to set up. Routing applies from now on in any session with the token, your
+very first routable spawn shows a disclosure once and still runs locally,
 and task prompts are sent to another user's session to run, so run `/work off`
 in projects whose subagent prompts may carry anything sensitive (the hook also
 declines prompts that look local or secret-bearing, as a backstop, not a
@@ -213,8 +213,9 @@ tokens saved and lists the routed tasks). If `INTERCEPT_THIS_SESSION` and
   that reference local paths, files, repos, or anything secret-looking are
   declined and run locally; every decline logs its reason to stderr.
 - Interception is on by default once the plugin is installed and a token
-  exists; there is nothing to export. The first routable spawn in a session
-  prints a disclosure and runs locally; routing starts with the next one.
+  exists; there is nothing to export. Your first routable spawn prints a
+  disclosure once and runs locally; routing starts with the next one and stays
+  on in later sessions.
   `/work off` plus a restart (or `SLASHWORK_INTERCEPT=0` in the environment)
   stops routing.
 - The parent session waits on the network result no longer than it would have

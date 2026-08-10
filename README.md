@@ -71,8 +71,9 @@ Interception is on by default from there. A PreToolUse hook checks every
 subagent spawn; the self-contained ones run on the network and the artifact
 comes back in place. Anything that touches your repo or machine runs locally,
 and any miss, cold pool, or failure falls back to the local spawn, so the
-worst case is what happens today. The first routable spawn per session prints
-a disclosure and runs locally; routing starts with the next one.
+worst case is what happens today. Your first routable spawn prints a disclosure
+once and runs locally; every routable spawn after that routes, in this session
+and any later one.
 
 - `/work off` pauses routing for the current project; `/work on` resumes it
 - a bare `/work` shows status (token, interception, credits) and the dashboard

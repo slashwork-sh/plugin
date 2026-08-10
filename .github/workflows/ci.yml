@@ -147,6 +147,9 @@ jobs:
         run: |
           export SLASHWORK_OFFLOAD_BIN="$PWD/offload/target/debug/slashwork-offload.exe"
           export TMPDIR="$(mktemp -d)"
+          # Consent is recorded per user, in the state dir, so HOME is what makes
+          # this step hermetic (TMPDIR alone did when the marker was per session).
+          export HOME="$TMPDIR" USERPROFILE="$TMPDIR"
           export SLASHWORK_ROUTE_LOG="$TMPDIR/route.jsonl"
           ENV='{"session_id":"ci-win","tool_name":"Task","tool_input":{"prompt":"Research and compare the leading rate-limiting approaches; give the pros and cons of each."}}'
 
@@ -157,7 +160,11 @@ jobs:
           second=$(printf '%s' "$ENV" | bash plugins/work/hooks/intercept.sh)
           [ -z "$second" ] || { echo "unreachable coordinator should be silent, got: $second"; exit 1; }
 
-          grep -q '"decision":"routed"' "$SLASHWORK_ROUTE_LOG" || { echo "route log missing routed"; exit 1; }
+          # One entry per call is the invariant. Asserting the consent call's
+          # exact decision string would couple this step to how that path is
+          # labelled, which is changing separately.
+          [ "$(grep -c '"decision"' "$SLASHWORK_ROUTE_LOG")" -eq 2 ] \
+            || { echo "expected one route-log entry per call: $(cat "$SLASHWORK_ROUTE_LOG")"; exit 1; }
           grep -q '"decision":"local"'  "$SLASHWORK_ROUTE_LOG" || { echo "route log missing local"; exit 1; }
 
       - name: Shim contract tests
