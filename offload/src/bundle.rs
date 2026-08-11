@@ -184,6 +184,14 @@ pub fn gather(paths: &[String], cwd: &std::path::Path) -> Result<String, Refusal
         if !meta.is_file() {
             return Err(Refusal::UnreadablePath(named.clone()));
         }
+        // Refuse on size before reading. A char cap cannot be checked without
+        // the bytes, and reading a multi-gigabyte file to then reject it would
+        // hang the hook, which is the one failure mode the offloader must never
+        // have. Four bytes is the longest UTF-8 encoding of one char, so this
+        // can never reject a file that would have fit.
+        if meta.len() > MAX_FILE_CHARS as u64 * 4 {
+            return Err(Refusal::OverCap);
+        }
         let raw = std::fs::read(&path).map_err(|_| Refusal::UnreadablePath(named.clone()))?;
         let text = String::from_utf8(raw).map_err(|_| Refusal::BinaryFile(named.clone()))?;
         let chars = text.chars().count();
@@ -396,6 +404,19 @@ mod tests {
         let d = sandbox("big");
         std::fs::write(d.join("big.txt"), "a".repeat(MAX_FILE_CHARS + 1)).unwrap();
         let p = d.join("big.txt").display().to_string();
+        assert!(matches!(gather(&[p], &d), Err(Refusal::OverCap)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // 0xff is never a valid UTF-8 byte, in any position. If gather reads and
+    // UTF-8-validates before checking size, this file trips BinaryFile. Only a
+    // byte-length guard consulted before the read can produce OverCap here, so
+    // this proves the guard fires without a full read rather than by timing.
+    #[test]
+    fn a_huge_file_refuses_by_size_without_reading_it() {
+        let d = sandbox("huge");
+        std::fs::write(d.join("huge.bin"), vec![0xff_u8; MAX_FILE_CHARS * 4 + 1]).unwrap();
+        let p = d.join("huge.bin").display().to_string();
         assert!(matches!(gather(&[p], &d), Err(Refusal::OverCap)));
         let _ = std::fs::remove_dir_all(&d);
     }
