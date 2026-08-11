@@ -19,7 +19,8 @@
 //!
 //! Adapters pipe JSON over stdin/stdout and stay thin.
 
-use offload::classify::{classify, Decision};
+use offload::bundle::{extract_paths, gather};
+use offload::classify::{classify, single_class, Class, Decision};
 use offload::dispatch::{dispatch, wrap_artifact, RouteOutcome};
 use offload::earn::{
     claim_outcome, credits_balance, login_poll, parse_goal, submit_outcome, ClaimOutcome, Goal,
@@ -148,6 +149,34 @@ fn emit_local(reason: &str) -> ! {
 
 // --- hook (Claude Code PreToolUse, end to end) ---
 
+/// Try to build a context bundle for a prompt the classifier declined.
+///
+/// Narrow on purpose. Only a path or file decline qualifies: a prompt declined
+/// for `local/repo operation`, a secret, the size cap, or the self-worker marker
+/// wants the machine itself, not a file off it. Only `review` qualifies, because
+/// that is the one class whose earners are told the bundle is all the context
+/// there is.
+///
+/// `Err` carries the reason the caller should log; it never logs itself, so
+/// every path through `cmd_hook` writes exactly one route-log line.
+fn try_bundle(env: &Envelope, prompt: &str, decline_reason: &str) -> Result<String, String> {
+    let declined = || Err(decline_reason.to_string());
+    if !bundling_enabled() {
+        return declined();
+    }
+    if decline_reason != "local path reference" && decline_reason != "probable local file or path" {
+        return declined();
+    }
+    if single_class(prompt) != Some(Class::Review) {
+        return declined();
+    }
+    let paths = extract_paths(prompt);
+    if paths.is_empty() {
+        return declined();
+    }
+    gather(&paths, &env.cwd_path()).map_err(|refusal| refusal.reason())
+}
+
 /// `hook`: the whole Claude Code `PreToolUse` path, from the raw envelope on stdin
 /// to the hook JSON on stdout.
 ///
@@ -218,20 +247,25 @@ fn cmd_hook() -> ! {
     }
 
     // Dispatch. The core classifies, posts, waits out the claim window and class
-    // deadline, and cancels with a refund on any fall-through.
-    let class = match classify(prompt) {
-        Decision::Routable { class } => class,
-        Decision::Local { reason } => {
-            route_log("local", &reason);
-            std::process::exit(0);
-        }
+    // deadline, and cancels with a refund on any fall-through. A local decline
+    // gets one more chance: a review prompt that named a readable file can still
+    // route with the file's contents as its bundle instead of falling through.
+    let (class, bundle) = match classify(prompt) {
+        Decision::Routable { class } => (class, String::new()),
+        Decision::Local { reason } => match try_bundle(&env, prompt, &reason) {
+            Ok(bundle) => (Class::Review, bundle),
+            Err(log_reason) => {
+                route_log("local", &log_reason);
+                std::process::exit(0);
+            }
+        },
     };
     let coord = UreqCoordinator::new(
         base,
         resolve_token().unwrap_or_default(),
         Some(HARNESS.into()),
     );
-    match dispatch(&coord, class, prompt, "") {
+    match dispatch(&coord, class, prompt, &bundle) {
         RouteOutcome::Artifact {
             class, artifact, ..
         } => {

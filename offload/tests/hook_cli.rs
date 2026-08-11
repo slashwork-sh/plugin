@@ -277,3 +277,62 @@ fn bundle_on_writes_the_marker_and_off_removes_it() {
 
     let _ = std::fs::remove_dir_all(&sandbox);
 }
+
+/// The whole point of bundling: a review prompt that names a readable file must
+/// stop declining at the path gate. It still ends local here (nothing is
+/// listening on 127.0.0.1:1), but the route log proves it got past classify and
+/// tried to dispatch instead of refusing on the path.
+#[test]
+fn a_review_naming_a_readable_file_gets_past_the_path_gate() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "slashwork-bundle-hook-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(sandbox.join(".slashwork")).expect("sandbox");
+    // Consent given, bundling on.
+    std::fs::write(sandbox.join(".slashwork").join("consent"), b"").unwrap();
+    std::fs::write(sandbox.join(".slashwork").join("bundle"), b"").unwrap();
+    let diff = sandbox.join("range.diff");
+    std::fs::write(&diff, "+added line\n").unwrap();
+    let log = sandbox.join("route.jsonl");
+
+    let prompt = format!(
+        "Review the following diff and note any correctness issues: {}",
+        diff.display()
+    );
+    let envelope = serde_json::json!({
+        "session_id": "bundle-1",
+        "cwd": sandbox.display().to_string(),
+        "tool_name": "Task",
+        "tool_input": { "prompt": prompt },
+    })
+    .to_string();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_slashwork-offload"));
+    cmd.arg("hook")
+        .env("HOME", &sandbox)
+        .env("USERPROFILE", &sandbox)
+        .env("SLASHWORK_ROUTE_LOG", &log)
+        .env("SLASHWORK_TOKEN", "t")
+        .env("SLASHWORK_BASE_URL", "http://127.0.0.1:1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(envelope.as_bytes())
+        .expect("write");
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success(), "hook must always exit 0");
+
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !logged.contains("local path reference"),
+        "a bundled review must not decline at the path gate: {logged}"
+    );
+    let _ = std::fs::remove_dir_all(&sandbox);
+}

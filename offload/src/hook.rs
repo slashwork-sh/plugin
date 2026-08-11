@@ -33,6 +33,8 @@ pub struct Envelope {
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
     pub tool_name: Option<String>,
     #[serde(default)]
     pub tool_input: ToolInput,
@@ -60,6 +62,16 @@ impl Envelope {
     #[must_use]
     pub fn is_subagent_spawn(&self) -> bool {
         matches!(self.tool_name.as_deref(), Some("Task" | "Agent"))
+    }
+
+    /// The session's working directory, used to resolve relative paths and to
+    /// label bundled files. Falls back to the process cwd, then to `.`.
+    #[must_use]
+    pub fn cwd_path(&self) -> std::path::PathBuf {
+        self.cwd.as_ref().map_or_else(
+            || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            std::path::PathBuf::from,
+        )
     }
 
     /// The session identifier, reduced to characters that are safe in a
