@@ -100,18 +100,20 @@ impl UreqCoordinator {
     }
 }
 
-/// The JSON body for `POST /api/tasks`. v1 inlines no files (empty bundle) and
-/// tags the routing harness so the coordinator can attribute the task.
+/// The JSON body for `POST /api/tasks`. `context_bundle` carries any files the
+/// prompt named, empty for a self-contained task, and tags the routing harness
+/// so the coordinator can attribute the task.
 fn create_task_body(
     class: Class,
     prompt: &str,
+    bundle: &str,
     deadline_secs: u64,
     harness: Option<&str>,
 ) -> String {
     serde_json::json!({
         "class": class.as_str(),
         "prompt": prompt,
-        "context_bundle": "",
+        "context_bundle": bundle,
         "deadline_secs": deadline_secs,
         "harness": harness,
     })
@@ -147,9 +149,21 @@ fn run(req: ureq::Request, body: Option<&str>) -> (u16, String) {
 }
 
 impl Coordinator for UreqCoordinator {
-    fn post_task(&self, class: Class, prompt: &str, deadline_secs: u64) -> PostOutcome {
+    fn post_task(
+        &self,
+        class: Class,
+        prompt: &str,
+        bundle: &str,
+        deadline_secs: u64,
+    ) -> PostOutcome {
         let url = format!("{}/api/tasks", self.base);
-        let body = create_task_body(class, prompt, deadline_secs, self.harness.as_deref());
+        let body = create_task_body(
+            class,
+            prompt,
+            bundle,
+            deadline_secs,
+            self.harness.as_deref(),
+        );
         let agent = build_agent(Duration::from_secs(15));
         match agent
             .post(&url)
@@ -397,6 +411,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&create_task_body(
             Class::Research,
             "do the thing",
+            "",
             150,
             Some("hermes"),
         ))
@@ -408,8 +423,25 @@ mod tests {
         assert_eq!(v["harness"], "hermes");
         // No harness posts null (the coordinator reads it back as claude-code).
         let v2: serde_json::Value =
-            serde_json::from_str(&create_task_body(Class::Prose, "p", 90, None)).unwrap();
+            serde_json::from_str(&create_task_body(Class::Prose, "p", "", 90, None)).unwrap();
         assert!(v2["harness"].is_null());
+    }
+
+    #[test]
+    fn the_body_carries_the_bundle() {
+        let body = create_task_body(Class::Review, "review it", "--- a.diff ---\n+x", 150, None);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["context_bundle"], "--- a.diff ---\n+x");
+        assert_eq!(v["deadline_secs"], 150);
+    }
+
+    // The field was hardcoded empty, which is the only reason bundling never
+    // worked. A self-contained task must still send an empty one.
+    #[test]
+    fn a_self_contained_task_sends_an_empty_bundle() {
+        let body = create_task_body(Class::Research, "research it", "", 150, None);
+        let v: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(v["context_bundle"], "");
     }
 
     #[test]

@@ -15,6 +15,15 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+/// A unique-enough, paren-free tag for a sandbox directory name. Plain
+/// `{:?}` on a `ThreadId` prints as `ThreadId(N)`, and a sandbox path built
+/// from that is unusable inside a *prompt* a test wants path-extracted:
+/// `(`/`)` sit outside `bundle::extract_paths`'s path character class, so the
+/// match truncates right before the paren.
+fn thread_tag() -> String {
+    format!("{:?}", std::thread::current().id()).replace(['(', ')'], "")
+}
+
 /// Run `slashwork-offload hook` with `envelope` on stdin in an isolated HOME, so
 /// a developer's real `~/.slashwork/token` can never make these tests reach the
 /// network. Returns stdout. Asserts exit 0: the hook must never fail.
@@ -241,4 +250,163 @@ fn malformed_input_is_not_a_crash() {
         let out = hook(raw, Some("t"));
         assert!(out.is_empty(), "input {raw:?} produced: {out}");
     }
+}
+
+/// `/work bundle on` is the consent for reading files off the machine, so it is
+/// a switch the user sets once, not a gate that spends a spawn. The per-session
+/// consent gate cost five days of routing before it was found; that shape is not
+/// worth repeating in a new switch.
+#[test]
+fn bundle_on_writes_the_marker_and_off_removes_it() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "slashwork-bundle-cli-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&sandbox).expect("sandbox");
+    let marker = sandbox.join(".slashwork").join("bundle");
+
+    let run = |arg: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_slashwork-offload"))
+            .args(["bundle", arg])
+            .env("HOME", &sandbox)
+            .env("USERPROFILE", &sandbox)
+            .output()
+            .expect("run bundle");
+        assert!(out.status.success(), "bundle {arg} must exit 0");
+        String::from_utf8(out.stdout).expect("utf8")
+    };
+
+    assert!(run("status").contains("off"));
+    run("on");
+    assert!(marker.exists(), "on must write the marker");
+    assert!(run("status").contains("on"));
+    run("off");
+    assert!(!marker.exists(), "off must remove the marker");
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+/// The whole point of bundling: a review prompt that names a readable file must
+/// stop declining at the path gate. It still ends local here (nothing is
+/// listening on 127.0.0.1:1), but the route log proves it got past classify and
+/// tried to dispatch instead of refusing on the path.
+#[test]
+fn a_review_naming_a_readable_file_gets_past_the_path_gate() {
+    // No parens in the tag: this directory's path is named inside the prompt
+    // below, and `(`/`)` are outside `bundle::extract_paths`'s path character
+    // class, so a `ThreadId(N)`-shaped tag would truncate the extracted path
+    // before it reaches the file, and the test would pass on an unrelated
+    // "unreadable path" refusal instead of exercising the path gate at all.
+    let sandbox = std::env::temp_dir().join(format!(
+        "slashwork-bundle-hook-{}-{}",
+        std::process::id(),
+        thread_tag()
+    ));
+    std::fs::create_dir_all(sandbox.join(".slashwork")).expect("sandbox");
+    // Consent given, bundling on.
+    std::fs::write(sandbox.join(".slashwork").join("consent"), b"").unwrap();
+    std::fs::write(sandbox.join(".slashwork").join("bundle"), b"").unwrap();
+    let diff = sandbox.join("range.diff");
+    std::fs::write(&diff, "+added line\n").unwrap();
+    let log = sandbox.join("route.jsonl");
+
+    let prompt = format!(
+        "Review the following diff and note any correctness issues: {}",
+        diff.display()
+    );
+    let envelope = serde_json::json!({
+        "session_id": "bundle-1",
+        "cwd": sandbox.display().to_string(),
+        "tool_name": "Task",
+        "tool_input": { "prompt": prompt },
+    })
+    .to_string();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_slashwork-offload"));
+    cmd.arg("hook")
+        .env("HOME", &sandbox)
+        .env("USERPROFILE", &sandbox)
+        .env("SLASHWORK_ROUTE_LOG", &log)
+        .env("SLASHWORK_TOKEN", "t")
+        .env("SLASHWORK_BASE_URL", "http://127.0.0.1:1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(envelope.as_bytes())
+        .expect("write");
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success(), "hook must always exit 0");
+
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !logged.contains("local path reference"),
+        "a bundled review must not decline at the path gate: {logged}"
+    );
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+/// `classify()` runs the path gates before the secret scan, so a prompt naming
+/// both a path and a credential declines with the path reason and never
+/// reaches the scan. Bundling must not turn that ordering into a way past it:
+/// a prompt like this must still refuse, not post the credential to a
+/// stranger's session.
+#[test]
+fn a_path_prompt_carrying_a_credential_does_not_bundle() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "slashwork-bundle-secret-{}-{}",
+        std::process::id(),
+        thread_tag()
+    ));
+    std::fs::create_dir_all(sandbox.join(".slashwork")).expect("sandbox");
+    std::fs::write(sandbox.join(".slashwork").join("consent"), b"").unwrap();
+    std::fs::write(sandbox.join(".slashwork").join("bundle"), b"").unwrap();
+    let diff = sandbox.join("range.diff");
+    std::fs::write(&diff, "+added line\n").unwrap();
+    let log = sandbox.join("route.jsonl");
+
+    // Both a readable path and a credential shape the secret scan catches.
+    let prompt = format!(
+        "Review the following diff: {} sk-ABCDEFGHIJ",
+        diff.display()
+    );
+    let envelope = serde_json::json!({
+        "session_id": "bundle-secret-1",
+        "cwd": sandbox.display().to_string(),
+        "tool_name": "Task",
+        "tool_input": { "prompt": prompt },
+    })
+    .to_string();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_slashwork-offload"));
+    cmd.arg("hook")
+        .env("HOME", &sandbox)
+        .env("USERPROFILE", &sandbox)
+        .env("SLASHWORK_ROUTE_LOG", &log)
+        .env("SLASHWORK_TOKEN", "t")
+        .env("SLASHWORK_BASE_URL", "http://127.0.0.1:1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(envelope.as_bytes())
+        .expect("write");
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success(), "hook must always exit 0");
+
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        logged.contains("bundle:") && logged.contains("secret"),
+        "a prompt carrying a credential must refuse on the secret scan, not bundle: {logged}"
+    );
+    let _ = std::fs::remove_dir_all(&sandbox);
 }

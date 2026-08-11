@@ -33,6 +33,8 @@ pub struct Envelope {
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
     pub tool_name: Option<String>,
     #[serde(default)]
     pub tool_input: ToolInput,
@@ -60,6 +62,27 @@ impl Envelope {
     #[must_use]
     pub fn is_subagent_spawn(&self) -> bool {
         matches!(self.tool_name.as_deref(), Some("Task" | "Agent"))
+    }
+
+    /// The session's working directory, used to resolve relative paths and to
+    /// label bundled files. Falls back to the process cwd, then to `.`, when
+    /// `cwd` is missing, empty, or not absolute.
+    ///
+    /// An empty string is not the missing case: `Some("")` still matches
+    /// `Some`, and `Path::strip_prefix("")` succeeds against any path, so an
+    /// empty `cwd` used to make `bundle::label` treat every file as sitting
+    /// under it and emit the absolute path unstripped, leaking the requester's
+    /// username and home layout. Only an actual absolute path is trusted; the
+    /// fallback is exactly the same one used when `cwd` is absent.
+    #[must_use]
+    pub fn cwd_path(&self) -> std::path::PathBuf {
+        let fallback = || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match self.cwd.as_deref() {
+            Some(c) if !c.is_empty() && std::path::Path::new(c).is_absolute() => {
+                std::path::PathBuf::from(c)
+            }
+            _ => fallback(),
+        }
     }
 
     /// The session identifier, reduced to characters that are safe in a
@@ -216,6 +239,20 @@ pub fn consent_marker(session_key: &str) -> std::path::PathBuf {
     }
 }
 
+/// Path of the bundling opt-in marker. `None` when there is no resolvable home,
+/// which reads as off: nothing is read off a machine we cannot find state on.
+#[must_use]
+pub fn bundle_marker() -> Option<std::path::PathBuf> {
+    state_dir().map(|d| d.join("bundle"))
+}
+
+/// Whether the user has turned on reading local files into a task's bundle.
+/// Off unless the marker exists, because this ships source to a stranger.
+#[must_use]
+pub fn bundling_enabled() -> bool {
+    bundle_marker().is_some_and(|p| p.exists())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +280,37 @@ mod tests {
         assert!(!Envelope::parse(r#"{"tool_name":"Bash"}"#).is_subagent_spawn());
         assert!(!Envelope::parse("not json at all").is_subagent_spawn());
         assert!(!Envelope::parse("").is_subagent_spawn());
+    }
+
+    // `Some("")` is not the missing-`cwd` case, and `Path::strip_prefix("")`
+    // succeeds against any path, so an empty `cwd` used to make every bundled
+    // file's label the unstripped absolute path: a username-and-home-layout
+    // leak. A relative `cwd` is refused the same way, since it is never a
+    // trustworthy base to resolve or strip an absolute file path against.
+    #[test]
+    fn cwd_path_falls_back_when_cwd_is_missing_empty_or_relative() {
+        let fallback = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+        assert_eq!(Envelope::parse("{}").cwd_path(), fallback);
+        assert_eq!(Envelope::parse(r#"{"cwd":""}"#).cwd_path(), fallback);
+        assert_eq!(
+            Envelope::parse(r#"{"cwd":"relative/dir"}"#).cwd_path(),
+            fallback
+        );
+    }
+
+    #[test]
+    fn cwd_path_uses_a_real_absolute_cwd_as_given() {
+        let abs = if cfg!(windows) {
+            r"C:\Users\dev"
+        } else {
+            "/Users/dev"
+        };
+        let raw = format!(r#"{{"cwd":{abs:?}}}"#);
+        assert_eq!(
+            Envelope::parse(&raw).cwd_path(),
+            std::path::PathBuf::from(abs)
+        );
     }
 
     #[test]
