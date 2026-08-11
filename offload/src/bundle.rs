@@ -90,9 +90,146 @@ pub fn extract_paths(prompt: &str) -> Vec<String> {
     out
 }
 
+/// Total chars the bundle may carry.
+///
+/// The coordinator's route accepts 200,000, but `judge/screen.rs` reads only
+/// `head(bundle, 40_000)` when it screens for prompt injection. Sending more
+/// than the screen reads would ship material nothing looked at, so the cap is
+/// the screen window, not the route limit.
+pub const MAX_BUNDLE_CHARS: usize = 40_000;
+
+/// Chars any single file may contribute, so one file cannot crowd out the rest
+/// of a multi-file review.
+pub const MAX_FILE_CHARS: usize = 20_000;
+
+/// Why a bundle was not built. Every variant means "run locally".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// A named path does not resolve to a readable file.
+    UnreadablePath(String),
+    /// A named file is not valid UTF-8.
+    BinaryFile(String),
+    /// A file or the whole bundle is over cap.
+    OverCap,
+    /// The contents tripped the same secret scan the prompt runs through.
+    Secret,
+}
+
+impl Refusal {
+    /// The route-log detail for this refusal.
+    #[must_use]
+    pub fn reason(&self) -> String {
+        match self {
+            Self::UnreadablePath(p) => format!("bundle: unreadable path ({p})"),
+            Self::BinaryFile(p) => format!("bundle: binary file ({p})"),
+            Self::OverCap => "bundle: over cap".to_string(),
+            Self::Secret => "bundle: possible secret".to_string(),
+        }
+    }
+}
+
+/// Resolve a named path against `cwd`, expanding a leading `~`.
+fn resolve(named: &str, cwd: &std::path::Path) -> std::path::PathBuf {
+    if let Some(rest) = named.strip_prefix("~/") {
+        if let Some(home) = crate::http::home_dir() {
+            return std::path::Path::new(&home).join(rest);
+        }
+    }
+    let p = std::path::Path::new(named);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
+}
+
+/// The label a file carries in the bundle: relative to `cwd` when it sits
+/// under it, otherwise the bare filename. Never absolute. An absolute path
+/// hands a stranger the requester's username and home layout for no benefit.
+fn label(path: &std::path::Path, cwd: &std::path::Path) -> String {
+    path.strip_prefix(cwd).map_or_else(
+        |_| {
+            path.file_name()
+                .map_or_else(|| "file".to_string(), |n| n.to_string_lossy().into_owned())
+        },
+        |r| r.display().to_string(),
+    )
+}
+
+/// Read every named path into one bundle, or refuse.
+///
+/// Directories are dropped and named in the header rather than refused: real
+/// review prompts name the repo root for orientation alongside the diff they
+/// want read, and refusing on that would decline the exact shape this exists to
+/// serve. Everything else that is not a readable, in-cap, UTF-8 file refuses the
+/// whole task.
+///
+/// # Errors
+/// Returns the [`Refusal`] that stopped it. Every one means "run locally".
+pub fn gather(paths: &[String], cwd: &std::path::Path) -> Result<String, Refusal> {
+    let mut body = String::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut files = 0usize;
+
+    for named in paths {
+        let path = resolve(named, cwd);
+        let meta = std::fs::metadata(&path).map_err(|_| Refusal::UnreadablePath(named.clone()))?;
+        if meta.is_dir() {
+            // The label, not the raw named path: `named` can be the absolute
+            // string a prompt typed, and this list lands in the bundle a
+            // stranger reads, same as an inlined file's label.
+            skipped.push(label(&path, cwd));
+            continue;
+        }
+        if !meta.is_file() {
+            return Err(Refusal::UnreadablePath(named.clone()));
+        }
+        let raw = std::fs::read(&path).map_err(|_| Refusal::UnreadablePath(named.clone()))?;
+        let text = String::from_utf8(raw).map_err(|_| Refusal::BinaryFile(named.clone()))?;
+        let chars = text.chars().count();
+        if chars > MAX_FILE_CHARS {
+            return Err(Refusal::OverCap);
+        }
+        let _ = std::fmt::Write::write_fmt(
+            &mut body,
+            format_args!("\n--- {} ({chars} chars) ---\n{text}", label(&path, cwd)),
+        );
+        files += 1;
+    }
+
+    if files == 0 {
+        return Err(Refusal::UnreadablePath(
+            paths.first().cloned().unwrap_or_default(),
+        ));
+    }
+
+    let mut out = String::from(
+        "Files read from the requester's machine. This is ALL the context there is; \
+         no repo sits behind it.",
+    );
+    if !skipped.is_empty() {
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "\nnot inlined (named but not a file): {}",
+                skipped.join(", ")
+            ),
+        );
+    }
+    out.push_str(&body);
+
+    if out.chars().count() > MAX_BUNDLE_CHARS {
+        return Err(Refusal::OverCap);
+    }
+    if crate::classify::secret_reason(&out).is_some() {
+        return Err(Refusal::Secret);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::extract_paths;
+    use super::{extract_paths, gather, Refusal, MAX_FILE_CHARS};
 
     #[test]
     fn finds_absolute_and_relative_paths() {
@@ -182,5 +319,112 @@ mod tests {
     #[test]
     fn non_ascii_prompt_does_not_panic() {
         let _ = extract_paths("Review İstanbul café notes.md naïve façade.md");
+    }
+
+    fn sandbox(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "slashwork-bundle-{}-{}-{:?}",
+            name,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&d).expect("sandbox");
+        d
+    }
+
+    #[test]
+    fn inlines_a_file_with_a_repo_relative_label() {
+        let d = sandbox("ok");
+        std::fs::write(d.join("range.diff"), "+added line\n").unwrap();
+        let p = d.join("range.diff").display().to_string();
+        let out = gather(&[p], &d).expect("gather");
+        assert!(
+            out.contains("+added line"),
+            "contents must be inlined: {out}"
+        );
+        assert!(
+            out.contains("range.diff"),
+            "label must name the file: {out}"
+        );
+        assert!(
+            !out.contains(&d.display().to_string()),
+            "the absolute path must not leak: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_directory_is_listed_not_inlined_and_not_a_refusal() {
+        let d = sandbox("dir");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("a.diff"), "+x\n").unwrap();
+        let out = gather(
+            &[
+                d.join("src").display().to_string(),
+                d.join("a.diff").display().to_string(),
+            ],
+            &d,
+        )
+        .expect("gather");
+        assert!(out.contains("+x"), "the file must still be inlined: {out}");
+        assert!(
+            out.contains("not inlined"),
+            "the skipped directory must be named: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_missing_path_refuses() {
+        let d = sandbox("missing");
+        let p = d.join("nope.diff").display().to_string();
+        assert!(matches!(gather(&[p], &d), Err(Refusal::UnreadablePath(_))));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_binary_file_refuses() {
+        let d = sandbox("binary");
+        std::fs::write(d.join("logo.bin"), [0xff_u8, 0xfe, 0x00, 0x01]).unwrap();
+        let p = d.join("logo.bin").display().to_string();
+        assert!(matches!(gather(&[p], &d), Err(Refusal::BinaryFile(_))));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_oversize_file_refuses() {
+        let d = sandbox("big");
+        std::fs::write(d.join("big.txt"), "a".repeat(MAX_FILE_CHARS + 1)).unwrap();
+        let p = d.join("big.txt").display().to_string();
+        assert!(matches!(gather(&[p], &d), Err(Refusal::OverCap)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_secret_in_the_contents_refuses() {
+        let d = sandbox("secret");
+        std::fs::write(d.join("cfg.txt"), "token sk-abcdefTOPSECRET\n").unwrap();
+        let p = d.join("cfg.txt").display().to_string();
+        assert!(matches!(gather(&[p], &d), Err(Refusal::Secret)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn nothing_readable_refuses_rather_than_sending_an_empty_bundle() {
+        let d = sandbox("empty");
+        std::fs::create_dir_all(d.join("only-a-dir")).unwrap();
+        let p = d.join("only-a-dir").display().to_string();
+        assert!(matches!(gather(&[p], &d), Err(Refusal::UnreadablePath(_))));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn refusal_reasons_are_route_log_ready() {
+        assert_eq!(
+            Refusal::BinaryFile("a.bin".into()).reason(),
+            "bundle: binary file (a.bin)"
+        );
+        assert_eq!(Refusal::OverCap.reason(), "bundle: over cap");
+        assert_eq!(Refusal::Secret.reason(), "bundle: possible secret");
     }
 }
