@@ -71,7 +71,7 @@ static LOCAL_PATH: LazyLock<Regex> = LazyLock::new(|| {
 
 /// A bare filename with a known extension (`report.csv`, `api.h`). Requiring a
 /// known extension keeps ordinary prose (`i.e.`, `e.g.`) from reading as files.
-static FILE_EXT: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static FILE_EXT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\b[a-z0-9_-]+\.(csv|tsv|txt|md|rst|json|ya?ml|toml|ini|conf|cfg|env|xml|html?|css|scss|sass|less|sql|log|lock|pdf|png|jpe?g|gif|svg|webp|ico|ipynb|rs|py|js|mjs|ts|jsx|tsx|go|java|rb|php|cpp|hpp|cc|cxx|hh|cs|swift|kt|scala|clj|hs|dart|sh|bash|zsh|ps1|bat|db|sqlite|parquet|avro|proto|graphql|gz|tgz|zip|tar|xlsx|xls|docx|doc|pptx|ppt|npy|h5|pkl|wav|mp3|mp4|mov|webm|c|h)\b",
     )
@@ -167,6 +167,53 @@ fn has_unfenced_repo_verb(prompt: &str) -> bool {
         .any(|clause| REPO_VERBS.is_match(clause) && !is_fenced(clause))
 }
 
+/// The class a prompt's signatures name, or `None` when zero or more than one
+/// matched.
+///
+/// Split out of `classify` so the bundling path can ask "would this have been a
+/// review" without re-implementing the match. `classify` returns at the
+/// local-path gate and never reaches class matching, so it cannot answer that.
+/// Ambiguity is still `None`: a prompt matching two signatures is no more
+/// bundleable than it is routable.
+#[must_use]
+pub fn single_class(prompt: &str) -> Option<Class> {
+    let lp = prompt.to_lowercase();
+    let mut class = None;
+    let mut matches = 0u32;
+    for (re, c) in [
+        (&*RESEARCH, Class::Research),
+        (&*REVIEW, Class::Review),
+        (&*PROSE, Class::Prose),
+        (&*CODEGEN, Class::Codegen),
+    ] {
+        if re.is_match(&lp) {
+            matches += 1;
+            if class.is_none() {
+                class = Some(c);
+            }
+        }
+    }
+    if matches == 1 {
+        class
+    } else {
+        None
+    }
+}
+
+/// Whether text carries a credential or a high-entropy blob, and which check
+/// caught it. Exposed so the bundle gatherer runs the same scan over file
+/// contents that `classify` runs over the prompt.
+#[must_use]
+pub fn secret_reason(text: &str) -> Option<&'static str> {
+    if SECRET_KEYS.is_match(text) {
+        return Some("possible secret or high-entropy blob");
+    }
+    if SECRET_WORDS.is_match(&text.to_lowercase()) {
+        return Some("possible secret");
+    }
+    None
+}
+
 /// Classify a subagent prompt into a routing decision. See the module docs for
 /// the invariant: unsure means local.
 #[must_use]
@@ -205,44 +252,24 @@ pub fn classify(prompt: &str) -> Decision {
         return local("local/repo operation");
     }
 
-    // 4. Secret scan: never send credentials off the machine. Key families run
-    //    against the raw prompt; the prose cues against the lowercased copy.
-    if SECRET_KEYS.is_match(prompt) {
-        return local("possible secret or high-entropy blob in prompt");
-    }
-    if SECRET_WORDS.is_match(&lp) {
-        return local("possible secret in prompt");
+    // 4. Secret scan: never send credentials off the machine.
+    if let Some(reason) = secret_reason(prompt) {
+        return local(reason);
     }
 
-    // 5. Class by high-confidence signature. Require exactly one match so an
-    //    ambiguous prompt declines rather than guessing a price.
-    let mut class = None;
-    let mut matches = 0u32;
-    for (re, c) in [
-        (&*RESEARCH, Class::Research),
-        (&*REVIEW, Class::Review),
-        (&*PROSE, Class::Prose),
-        (&*CODEGEN, Class::Codegen),
-    ] {
-        if re.is_match(&lp) {
-            matches += 1;
-            if class.is_none() {
-                class = Some(c);
-            }
-        }
-    }
-
-    match (matches, class) {
-        (1, Some(c)) => Decision::Routable { class: c },
-        _ => Decision::Local {
-            reason: format!("no single confident class (matched {matches})"),
+    // 5. Class by high-confidence signature. Exactly one match, or decline
+    //    rather than guess a price.
+    single_class(prompt).map_or_else(
+        || Decision::Local {
+            reason: "no single confident class".to_string(),
         },
-    }
+        |class| Decision::Routable { class },
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, Class, Decision, BUNDLE_CAP_BYTES};
+    use super::{classify, secret_reason, single_class, Class, Decision, BUNDLE_CAP_BYTES};
 
     // Assert a prompt routes to a specific class.
     fn assert_routes(prompt: &str, class: Class) {
@@ -441,7 +468,7 @@ mod tests {
         // Both a research signature and a prose signature present: ambiguous, so
         // decline rather than guess which price to charge.
         match classify("Research the topic, then write a report summarizing it.") {
-            Decision::Local { reason } => assert!(reason.contains("matched 2")),
+            Decision::Local { reason } => assert!(reason.contains("no single confident class")),
             other @ Decision::Routable { .. } => panic!("two-class prompt must decline: {other:?}"),
         }
     }
@@ -472,5 +499,46 @@ mod tests {
         assert_eq!(Class::Prose.as_str(), "prose");
         assert_eq!(Class::Codegen.as_str(), "codegen");
         assert_eq!(Class::Review.as_str(), "review");
+    }
+
+    // --- accessors the bundling path needs ---
+
+    #[test]
+    fn single_class_names_the_one_matched_signature() {
+        assert_eq!(
+            single_class("Review the following snippet and note issues."),
+            Some(Class::Review)
+        );
+        assert_eq!(
+            single_class("Research and compare the options; pros and cons of each."),
+            Some(Class::Research)
+        );
+    }
+
+    #[test]
+    fn single_class_is_none_when_zero_or_many_match() {
+        assert_eq!(single_class("Do the needful with the thing."), None);
+        assert_eq!(
+            single_class("Research the topic, then write a report summarizing it."),
+            None
+        );
+    }
+
+    // The path that motivates the accessor: classify declines on the path, but
+    // the prompt is still recognisably a review.
+    #[test]
+    fn a_declined_path_prompt_can_still_be_a_review() {
+        assert_local("Review the following diff: /Users/dev/work/range.diff");
+        assert_eq!(
+            single_class("Review the following diff: /Users/dev/work/range.diff"),
+            Some(Class::Review)
+        );
+    }
+
+    #[test]
+    fn secret_reason_finds_keys_and_prose_cues() {
+        assert!(secret_reason("token sk-abcdefTOPSECRET here").is_some());
+        assert!(secret_reason("the api_key lives in the vault").is_some());
+        assert!(secret_reason("an ordinary paragraph about caching").is_none());
     }
 }
