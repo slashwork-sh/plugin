@@ -108,7 +108,7 @@ fn cmd_route() -> ! {
         Decision::Local { reason } => emit_local(&reason),
         Decision::Routable { class } => {
             let coord = UreqCoordinator::new(base, token, input.harness);
-            match dispatch(&coord, class, &input.spawn.prompt) {
+            match dispatch(&coord, class, &input.spawn.prompt, "") {
                 RouteOutcome::Local { reason } => emit_local(&reason),
                 RouteOutcome::Artifact {
                     task_id,
@@ -231,7 +231,7 @@ fn cmd_hook() -> ! {
         resolve_token().unwrap_or_default(),
         Some(HARNESS.into()),
     );
-    match dispatch(&coord, class, prompt) {
+    match dispatch(&coord, class, prompt, "") {
         RouteOutcome::Artifact {
             class, artifact, ..
         } => {

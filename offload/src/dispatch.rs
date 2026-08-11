@@ -28,15 +28,17 @@ pub const MAX_POLL_CHUNK_SECS: u64 = 45;
 /// Poll cadence while the acceptance gate is running past the deadline.
 pub const GRACE_POLL_SECS: u64 = 10;
 
-/// How long the parent will block for one task of this class, matching
-/// `intercept.sh`: research runs longest, review of inlined material is
-/// shortest.
+/// How long the parent will block for one task of this class.
+///
+/// Review is shortest because it was written for small inlined material. A
+/// bundled review carries files read off the requester's machine and is
+/// materially more work, so it gets the research budget instead.
 #[must_use]
-pub const fn deadline_secs(class: Class) -> u64 {
-    match class {
-        Class::Research => 150,
-        Class::Prose | Class::Codegen => 90,
-        Class::Review => 60,
+pub const fn deadline_secs(class: Class, bundled: bool) -> u64 {
+    match (class, bundled) {
+        (Class::Research, _) | (Class::Review, true) => 150,
+        (Class::Prose | Class::Codegen, _) => 90,
+        (Class::Review, false) => 60,
     }
 }
 
@@ -92,8 +94,15 @@ pub enum PollOutcome {
 /// The coordinator side of dispatch. One method per protocol call. Kept minimal
 /// so the state machine can be exercised without a network.
 pub trait Coordinator {
-    /// POST `/api/tasks`.
-    fn post_task(&self, class: Class, prompt: &str, deadline_secs: u64) -> PostOutcome;
+    /// POST `/api/tasks`. `bundle` is the `context_bundle`, empty when the task
+    /// carries no files.
+    fn post_task(
+        &self,
+        class: Class,
+        prompt: &str,
+        bundle: &str,
+        deadline_secs: u64,
+    ) -> PostOutcome;
     /// GET `/api/tasks/{id}/result?wait_secs=…` (a long-poll up to `wait_secs`).
     fn poll_result(&self, task_id: &str, wait_secs: u64) -> PollOutcome;
     /// DELETE `/api/tasks/{id}`; best effort, refunds the hold.
@@ -125,10 +134,10 @@ fn poll_retry(coord: &dyn Coordinator, task_id: &str, wait_secs: u64) -> PollOut
 
 /// Post a routable task and wait for an artifact, or cancel and fall back local.
 #[must_use]
-pub fn dispatch(coord: &dyn Coordinator, class: Class, prompt: &str) -> RouteOutcome {
-    let deadline = deadline_secs(class);
+pub fn dispatch(coord: &dyn Coordinator, class: Class, prompt: &str, bundle: &str) -> RouteOutcome {
+    let deadline = deadline_secs(class, !bundle.is_empty());
 
-    let task_id = match coord.post_task(class, prompt, deadline) {
+    let task_id = match coord.post_task(class, prompt, bundle, deadline) {
         PostOutcome::Created { task_id } => task_id,
         PostOutcome::NotEnoughCredits { message } => {
             // No task exists, so nothing to cancel.
@@ -227,7 +236,13 @@ mod tests {
     }
 
     impl Coordinator for Mock {
-        fn post_task(&self, _class: Class, _prompt: &str, _deadline: u64) -> PostOutcome {
+        fn post_task(
+            &self,
+            _class: Class,
+            _prompt: &str,
+            _bundle: &str,
+            _deadline: u64,
+        ) -> PostOutcome {
             self.posted.set(true);
             self.post.clone()
         }
@@ -255,7 +270,7 @@ mod tests {
     #[test]
     fn returns_in_claim_window() {
         let m = Mock::created(vec![PollOutcome::Returned(art())]);
-        match dispatch(&m, Class::Research, "p") {
+        match dispatch(&m, Class::Research, "p", "") {
             RouteOutcome::Artifact {
                 artifact, class, ..
             } => {
@@ -272,7 +287,7 @@ mod tests {
     #[test]
     fn cold_pool_cancels_and_falls_back() {
         let m = Mock::created(vec![PollOutcome::Idle]);
-        match dispatch(&m, Class::Prose, "p") {
+        match dispatch(&m, Class::Prose, "p", "") {
             RouteOutcome::Local { reason } => assert!(reason.contains("no earner claimed")),
             other @ RouteOutcome::Artifact { .. } => panic!("expected local, got {other:?}"),
         }
@@ -287,7 +302,7 @@ mod tests {
     fn reviewing_then_returns() {
         let m = Mock::created(vec![PollOutcome::Reviewing, PollOutcome::Returned(art())]);
         assert!(matches!(
-            dispatch(&m, Class::Research, "p"),
+            dispatch(&m, Class::Research, "p", ""),
             RouteOutcome::Artifact { .. }
         ));
         assert!(!m.cancelled.get());
@@ -302,7 +317,7 @@ mod tests {
             PollOutcome::Returned(art()),
         ]);
         assert!(matches!(
-            dispatch(&m, Class::Research, "p"),
+            dispatch(&m, Class::Research, "p", ""),
             RouteOutcome::Artifact { .. }
         ));
         assert!(!m.cancelled.get());
@@ -317,7 +332,7 @@ mod tests {
             PollOutcome::Error,
             PollOutcome::Error,
         ]);
-        match dispatch(&m, Class::Research, "p") {
+        match dispatch(&m, Class::Research, "p", "") {
             RouteOutcome::Local { reason } => assert!(reason.contains("did not return")),
             other @ RouteOutcome::Artifact { .. } => panic!("expected local, got {other:?}"),
         }
@@ -336,7 +351,7 @@ mod tests {
             PollOutcome::Returned(art()), // grace
         ]);
         assert!(matches!(
-            dispatch(&m, Class::Review, "p"),
+            dispatch(&m, Class::Review, "p", ""),
             RouteOutcome::Artifact { .. }
         ));
         assert!(!m.cancelled.get());
@@ -351,7 +366,7 @@ mod tests {
             PollOutcome::Reviewing,
             PollOutcome::Idle, // gate rejected / expired
         ]);
-        match dispatch(&m, Class::Review, "p") {
+        match dispatch(&m, Class::Review, "p", "") {
             RouteOutcome::Local { reason } => assert!(reason.contains("before the deadline")),
             other @ RouteOutcome::Artifact { .. } => panic!("expected local, got {other:?}"),
         }
@@ -368,7 +383,7 @@ mod tests {
             PollOutcome::Claimed,
         ]);
         assert!(matches!(
-            dispatch(&m, Class::Review, "p"),
+            dispatch(&m, Class::Review, "p", ""),
             RouteOutcome::Local { .. }
         ));
         assert!(m.cancelled.get());
@@ -384,7 +399,7 @@ mod tests {
             },
             vec![],
         );
-        match dispatch(&m, Class::Research, "p") {
+        match dispatch(&m, Class::Research, "p", "") {
             RouteOutcome::Local { reason } => {
                 assert!(reason.contains("not enough credits"));
                 assert!(reason.contains("it costs 50"));
@@ -405,7 +420,7 @@ mod tests {
             vec![],
         );
         assert!(matches!(
-            dispatch(&m, Class::Research, "p"),
+            dispatch(&m, Class::Research, "p", ""),
             RouteOutcome::Local { .. }
         ));
         assert!(!m.cancelled.get());
@@ -413,10 +428,23 @@ mod tests {
 
     #[test]
     fn deadlines_match_the_hook() {
-        assert_eq!(deadline_secs(Class::Research), 150);
-        assert_eq!(deadline_secs(Class::Prose), 90);
-        assert_eq!(deadline_secs(Class::Codegen), 90);
-        assert_eq!(deadline_secs(Class::Review), 60);
+        assert_eq!(deadline_secs(Class::Research, false), 150);
+        assert_eq!(deadline_secs(Class::Prose, false), 90);
+        assert_eq!(deadline_secs(Class::Codegen, false), 90);
+        assert_eq!(deadline_secs(Class::Review, false), 60);
+    }
+
+    #[test]
+    fn a_bundled_review_gets_room_to_run() {
+        // Review is the shortest deadline of the four because it was written for
+        // small inlined snippets. A bundled diff review is materially more work,
+        // and a deadline that is too tight does not surface as an error, it
+        // surfaces as expired and a silent local fallback.
+        assert_eq!(deadline_secs(Class::Review, false), 60);
+        assert_eq!(deadline_secs(Class::Review, true), 150);
+        // Bundling changes nothing for the classes that never bundle.
+        assert_eq!(deadline_secs(Class::Research, false), 150);
+        assert_eq!(deadline_secs(Class::Prose, false), 90);
     }
 
     #[test]
