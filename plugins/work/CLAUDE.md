@@ -25,6 +25,23 @@
   `~/.slashwork/bin/.version` marker short-circuits a repeat), always exits 0,
   and falls to a clean "no binary" state on any error. `hooks/install-core_test.sh`
   covers its pure platform resolver with no network.
+- `hooks/delegate-context.sh` (SessionStart): emits
+  `hookSpecificOutput.additionalContext` telling the session that installing
+  this plugin is a standing request to delegate self-contained work, and how to
+  split a mixed request so the delegated half is routable. The text lives in
+  `hooks/delegate-context.md` beside it, JSON-escaped with `sed` rather than
+  `jq` (Git Bash on Windows ships no `jq`, which is what made the intercept hook
+  inert there before the core took over parsing). `hooks/delegate-context_test.sh`
+  checks the JSON parses and that the load-bearing sentences survive.
+
+  This hook is the volume lever, not a nicety. The offloader's only trigger is a
+  subagent spawn. Measured over six headless runs on three-part independent
+  research prompts, Opus 5 and Sonnet both spawned nothing and used no tools at
+  all, because answering inline is faster than delegating. Claude Code's Opus 5
+  prompt bundle also carries "Do not call the AgentTool unless the user
+  requested it", but Sonnet does not carry that line and still did not delegate,
+  so removing a suppression was never going to be enough. A positive instruction
+  to split and delegate is what moves the number.
 
 ## Core binary distribution
 

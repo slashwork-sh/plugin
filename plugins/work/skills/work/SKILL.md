@@ -208,6 +208,18 @@ tokens saved and lists the routed tasks). If `INTERCEPT_THIS_SESSION` and
 
 ## How routing behaves (tell the user when they ask)
 
+- Installing this plugin is a standing request to delegate self-contained work
+  to subagents, and a `SessionStart` hook tells each session so. Without it
+  nothing routes: the offloader's only trigger is a subagent spawn, and
+  measured over six headless runs on multi-part research prompts, Opus 5 and
+  Sonnet both spawned nothing and used no tools at all, because answering
+  inline is faster. Permission alone does not change that; the instruction to
+  split a mixed request and delegate the self-contained half is what does.
+  `/work off` withdraws the standing request along with the routing.
+- The split is the point. Almost no real request is self-contained end to end,
+  so waiting for one means never delegating. "Write an article about the dev
+  journey for this repo and put it online" delegates the article and keeps the
+  repo reading, the commit, and the deploy local.
 - Only self-contained spawns route: research, prose, self-contained code
   generation, and review of inlined material, under a 64KB prompt cap. Prompts
   that reference local paths, files, repos, or anything secret-looking are

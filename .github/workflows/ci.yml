@@ -18,6 +18,8 @@ jobs:
         run: bash plugins/work/hooks/intercept_test.sh
       - name: Core installer platform resolver test
         run: bash plugins/work/hooks/install-core_test.sh
+      - name: Delegation context hook test
+        run: bash plugins/work/hooks/delegate-context_test.sh
       - name: Standalone core installer test
         run: bash offload/dist/install_test.sh
       - name: Earn listener integration test
