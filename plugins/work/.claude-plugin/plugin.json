@@ -23,6 +23,11 @@
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/install-core.sh",
             "timeout": 60
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/hooks/delegate-context.sh",
+            "timeout": 10
           }
         ]
       }
