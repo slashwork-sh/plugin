@@ -156,6 +156,29 @@ fn label(path: &std::path::Path, cwd: &std::path::Path) -> String {
     )
 }
 
+/// The label each named path would carry in the bundle, paired with the path
+/// string as it appeared in `paths`, for every entry that resolves to a file.
+/// A directory or a path that does not resolve is omitted, since neither one
+/// was inlined.
+///
+/// Exists so the caller can rewrite the *prompt* to use the same labels: the
+/// bundle's contents are labelled to avoid leaking an absolute path, but the
+/// raw prompt names the path directly and goes over the wire unmodified
+/// otherwise. Call this only after [`gather`] has already succeeded for the
+/// same `paths` and `cwd`, so what it reports here matches what actually went
+/// into the bundle.
+#[must_use]
+pub fn labels(paths: &[String], cwd: &std::path::Path) -> Vec<(String, String)> {
+    paths
+        .iter()
+        .filter_map(|named| {
+            let path = resolve(named, cwd);
+            let meta = std::fs::metadata(&path).ok()?;
+            meta.is_file().then(|| (named.clone(), label(&path, cwd)))
+        })
+        .collect()
+}
+
 /// Read every named path into one bundle, or refuse.
 ///
 /// Directories are dropped and named in the header rather than refused: real
@@ -237,7 +260,7 @@ pub fn gather(paths: &[String], cwd: &std::path::Path) -> Result<String, Refusal
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_paths, gather, Refusal, MAX_FILE_CHARS};
+    use super::{extract_paths, gather, labels, Refusal, MAX_FILE_CHARS};
 
     #[test]
     fn finds_absolute_and_relative_paths() {
@@ -358,6 +381,23 @@ mod tests {
             !out.contains(&d.display().to_string()),
             "the absolute path must not leak: {out}"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // `labels` exists so a caller can rewrite the *prompt* the same way the
+    // bundle already labels files, so the raw absolute path does not leave the
+    // machine through the prompt even when the bundle itself is careful.
+    #[test]
+    fn labels_maps_an_inlined_file_to_its_bundle_label_and_skips_a_directory() {
+        let d = sandbox("labels");
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::write(d.join("range.diff"), "+x\n").unwrap();
+        let file = d.join("range.diff").display().to_string();
+        let dir = d.join("src").display().to_string();
+        let missing = d.join("nope.diff").display().to_string();
+
+        let got = labels(&[file.clone(), dir, missing], &d);
+        assert_eq!(got, vec![(file, "range.diff".to_string())]);
         let _ = std::fs::remove_dir_all(&d);
     }
 

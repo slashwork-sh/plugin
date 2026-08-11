@@ -19,8 +19,8 @@
 //!
 //! Adapters pipe JSON over stdin/stdout and stay thin.
 
-use offload::bundle::{extract_paths, gather};
-use offload::classify::{classify, single_class, Class, Decision};
+use offload::bundle::{extract_paths, gather, labels as bundle_labels};
+use offload::classify::{classify, secret_reason, single_class, Class, Decision};
 use offload::dispatch::{dispatch, wrap_artifact, RouteOutcome};
 use offload::earn::{
     claim_outcome, credits_balance, login_poll, parse_goal, submit_outcome, ClaimOutcome, Goal,
@@ -149,6 +149,16 @@ fn emit_local(reason: &str) -> ! {
 
 // --- hook (Claude Code PreToolUse, end to end) ---
 
+/// A bundle built for a review prompt the classifier declined on a path,
+/// together with the same prompt rewritten so each successfully inlined path
+/// reads as its bundle label instead of the raw path text. Both directions
+/// must avoid leaking the requester's absolute path: `bundle::gather` already
+/// labels the file contents it inlines, and this is the prompt's half of that.
+struct Bundled {
+    text: String,
+    prompt: String,
+}
+
 /// Try to build a context bundle for a prompt the classifier declined.
 ///
 /// Narrow on purpose. Only a path or file decline qualifies: a prompt declined
@@ -159,7 +169,7 @@ fn emit_local(reason: &str) -> ! {
 ///
 /// `Err` carries the reason the caller should log; it never logs itself, so
 /// every path through `cmd_hook` writes exactly one route-log line.
-fn try_bundle(env: &Envelope, prompt: &str, decline_reason: &str) -> Result<String, String> {
+fn try_bundle(env: &Envelope, prompt: &str, decline_reason: &str) -> Result<Bundled, String> {
     let declined = || Err(decline_reason.to_string());
     if !bundling_enabled() {
         return declined();
@@ -174,7 +184,35 @@ fn try_bundle(env: &Envelope, prompt: &str, decline_reason: &str) -> Result<Stri
     if paths.is_empty() {
         return declined();
     }
-    gather(&paths, &env.cwd_path()).map_err(|refusal| refusal.reason())
+    // `classify` runs the path gates (step 3) before the secret scan (step 4),
+    // so a prompt naming both a path and a credential declines with a path
+    // reason and never reaches the scan. Bundling must not turn that ordering
+    // into a way past it: run the same scan here, over the raw prompt, before
+    // anything is read off the machine or sent anywhere.
+    if let Some(reason) = secret_reason(prompt) {
+        return Err(format!("bundle: {reason}"));
+    }
+    let cwd = env.cwd_path();
+    let text = gather(&paths, &cwd).map_err(|refusal| refusal.reason())?;
+    // The bundle labels each file to keep its absolute path from leaking; the
+    // raw prompt names that same path and would otherwise go over the wire
+    // unmodified. This is the prompt's half of the same protection.
+    let prompt = label_prompt(prompt, bundle_labels(&paths, &cwd));
+    Ok(Bundled { text, prompt })
+}
+
+/// Replace each named path in `prompt` with its bundle label.
+///
+/// Longest names first, so a path that is a substring of another
+/// (`a.diff` inside `dir/a.diff`) cannot get clobbered by the shorter one's
+/// replacement running first.
+fn label_prompt(prompt: &str, mut named_labels: Vec<(String, String)>) -> String {
+    named_labels.sort_by_key(|(named, _)| std::cmp::Reverse(named.len()));
+    let mut rewritten = prompt.to_string();
+    for (named, label) in named_labels {
+        rewritten = rewritten.replace(&named, &label);
+    }
+    rewritten
 }
 
 /// `hook`: the whole Claude Code `PreToolUse` path, from the raw envelope on stdin
@@ -250,10 +288,10 @@ fn cmd_hook() -> ! {
     // deadline, and cancels with a refund on any fall-through. A local decline
     // gets one more chance: a review prompt that named a readable file can still
     // route with the file's contents as its bundle instead of falling through.
-    let (class, bundle) = match classify(prompt) {
-        Decision::Routable { class } => (class, String::new()),
+    let (class, bundle, prompt) = match classify(prompt) {
+        Decision::Routable { class } => (class, String::new(), prompt.clone()),
         Decision::Local { reason } => match try_bundle(&env, prompt, &reason) {
-            Ok(bundle) => (Class::Review, bundle),
+            Ok(Bundled { text, prompt }) => (Class::Review, text, prompt),
             Err(log_reason) => {
                 route_log("local", &log_reason);
                 std::process::exit(0);
@@ -265,7 +303,7 @@ fn cmd_hook() -> ! {
         resolve_token().unwrap_or_default(),
         Some(HARNESS.into()),
     );
-    match dispatch(&coord, class, prompt, &bundle) {
+    match dispatch(&coord, class, &prompt, &bundle) {
         RouteOutcome::Artifact {
             class, artifact, ..
         } => {
@@ -725,5 +763,56 @@ fn chunk_secs(deadline: Option<Instant>, cap: u64) -> u64 {
             .as_secs()
             .clamp(1, cap),
         None => cap,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::label_prompt;
+
+    // `bundle::gather` labels a file's contents to keep its absolute path from
+    // leaking into the bundle; this proves the *prompt* half of the same
+    // protection: the string that reaches `dispatch`, and from there the JSON
+    // `prompt` field the coordinator receives (`http::tests::the_body_carries_
+    // the_bundle` already proves whatever string is passed through survives
+    // into that field verbatim), carries the label too.
+    #[test]
+    fn replaces_a_named_absolute_path_with_its_label() {
+        let prompt = "Review the following diff: /Users/dev/work/range.diff";
+        let out = label_prompt(
+            prompt,
+            vec![(
+                "/Users/dev/work/range.diff".to_string(),
+                "range.diff".to_string(),
+            )],
+        );
+        assert_eq!(out, "Review the following diff: range.diff");
+        assert!(
+            !out.contains("/Users/dev"),
+            "the absolute path must not survive: {out}"
+        );
+    }
+
+    // A named path with nothing to replace it with (never inlined, e.g. a
+    // skipped directory) is left exactly as the prompt wrote it.
+    #[test]
+    fn a_prompt_with_no_labels_is_unchanged() {
+        let prompt = "Review the following diff: /Users/dev/work/range.diff";
+        assert_eq!(label_prompt(prompt, vec![]), prompt);
+    }
+
+    // One path that is a substring of another must not have its replacement
+    // clobbered by the shorter name's replacement running first.
+    #[test]
+    fn the_longest_name_is_replaced_first() {
+        let prompt = "Review /tmp/dir/a.diff and /tmp/dir/b.diff";
+        let out = label_prompt(
+            prompt,
+            vec![
+                ("/tmp/dir/a.diff".to_string(), "a.diff".to_string()),
+                ("/tmp/dir/b.diff".to_string(), "b.diff".to_string()),
+            ],
+        );
+        assert_eq!(out, "Review a.diff and b.diff");
     }
 }
