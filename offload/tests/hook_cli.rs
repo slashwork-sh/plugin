@@ -242,3 +242,38 @@ fn malformed_input_is_not_a_crash() {
         assert!(out.is_empty(), "input {raw:?} produced: {out}");
     }
 }
+
+/// `/work bundle on` is the consent for reading files off the machine, so it is
+/// a switch the user sets once, not a gate that spends a spawn. The per-session
+/// consent gate cost five days of routing before it was found; that shape is not
+/// worth repeating in a new switch.
+#[test]
+fn bundle_on_writes_the_marker_and_off_removes_it() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "slashwork-bundle-cli-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&sandbox).expect("sandbox");
+    let marker = sandbox.join(".slashwork").join("bundle");
+
+    let run = |arg: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_slashwork-offload"))
+            .args(["bundle", arg])
+            .env("HOME", &sandbox)
+            .env("USERPROFILE", &sandbox)
+            .output()
+            .expect("run bundle");
+        assert!(out.status.success(), "bundle {arg} must exit 0");
+        String::from_utf8(out.stdout).expect("utf8")
+    };
+
+    assert!(run("status").contains("off"));
+    run("on");
+    assert!(marker.exists(), "on must write the marker");
+    assert!(run("status").contains("on"));
+    run("off");
+    assert!(!marker.exists(), "off must remove the marker");
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}

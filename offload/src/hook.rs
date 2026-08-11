@@ -216,6 +216,20 @@ pub fn consent_marker(session_key: &str) -> std::path::PathBuf {
     }
 }
 
+/// Path of the bundling opt-in marker. `None` when there is no resolvable home,
+/// which reads as off: nothing is read off a machine we cannot find state on.
+#[must_use]
+pub fn bundle_marker() -> Option<std::path::PathBuf> {
+    state_dir().map(|d| d.join("bundle"))
+}
+
+/// Whether the user has turned on reading local files into a task's bundle.
+/// Off unless the marker exists, because this ships source to a stranger.
+#[must_use]
+pub fn bundling_enabled() -> bool {
+    bundle_marker().is_some_and(|p| p.exists())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

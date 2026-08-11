@@ -26,7 +26,8 @@ use offload::earn::{
     LoginPoll, SseTaskScanner, SubmitOutcome, CREDITS_GOAL_CEILING_SECS,
 };
 use offload::hook::{
-    consent_marker, is_self_worker, receipt, record_saving, render_plot, route_log, Envelope,
+    bundle_marker, bundling_enabled, consent_marker, is_self_worker, receipt, record_saving,
+    render_plot, route_log, Envelope,
 };
 use offload::http::{
     fetch_me, home_dir, login_poll_once, login_start, post_claim, probe_auth, resolve_base,
@@ -73,9 +74,10 @@ fn main() {
         Some("submit") => cmd_submit(&args[1..]),
         Some("goal") => cmd_goal(&args[1..]),
         Some("credits") => cmd_credits(),
+        Some("bundle") => cmd_bundle(&args[1..]),
         _ => {
             eprintln!(
-                "usage: slashwork-offload <route|hook|classify|login|claim|submit|goal|credits>"
+                "usage: slashwork-offload <route|hook|classify|login|claim|submit|goal|credits|bundle>"
             );
             std::process::exit(EXIT_USAGE);
         }
@@ -378,6 +380,44 @@ fn cmd_credits() -> ! {
             std::process::exit(EXIT_FAIL);
         }
     }
+}
+
+// --- bundle (opt-in) ---
+
+/// `slashwork-offload bundle <on|off|status>`: the opt-in for reading local
+/// files into a review task's context bundle.
+///
+/// Turning it on IS the consent. There is no first-task-runs-locally gate: the
+/// per-session consent gate spent one spawn per console and, measured over a
+/// week, that meant nothing routed at all.
+fn cmd_bundle(args: &[String]) -> ! {
+    let Some(marker) = bundle_marker() else {
+        println!("bundling: off (no writable ~/.slashwork)");
+        std::process::exit(0);
+    };
+    match args.first().map(String::as_str) {
+        Some("on") => {
+            let _ = std::fs::write(&marker, b"");
+            println!(
+                "bundling: on\n\
+                 For review tasks only, slashwork will now read the files your prompt names \
+                 and send their contents to another slashwork user's session, along with the \
+                 prompt. Files are capped at {} chars total, anything binary or over cap \
+                 refuses and runs locally, and any file that trips the secret scan refuses the \
+                 whole task. Turn it off with /work bundle off.",
+                offload::bundle::MAX_BUNDLE_CHARS
+            );
+        }
+        Some("off") => {
+            let _ = std::fs::remove_file(&marker);
+            println!("bundling: off");
+        }
+        _ => println!(
+            "bundling: {}",
+            if bundling_enabled() { "on" } else { "off" }
+        ),
+    }
+    std::process::exit(0);
 }
 
 // --- login ---
