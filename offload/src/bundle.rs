@@ -7,6 +7,12 @@
 //!
 //! The classifier stays pure and I/O-free. Every filesystem touch is here.
 //!
+//! The classifier's path refusal was a blanket "never touch this machine".
+//! Reusing it as the signal to read means this module has to supply the
+//! containment that refusal gave for free: nothing outside the session's
+//! working directory is read, once symlinks and `..` are resolved, however the
+//! prompt spells the path.
+//!
 //! Conservative in the same direction as the classifier: any doubt refuses the
 //! whole task to a local spawn. A partial bundle is worse than no bundle,
 //! because an earner working from half the material returns a confidently wrong
@@ -107,6 +113,9 @@ pub const MAX_FILE_CHARS: usize = 20_000;
 pub enum Refusal {
     /// A named path does not resolve to a readable file.
     UnreadablePath(String),
+    /// A named path resolves to somewhere outside the session's working
+    /// directory, or containment could not be proven.
+    OutsideCwd(String),
     /// A named file is not valid UTF-8.
     BinaryFile(String),
     /// A file or the whole bundle is over cap.
@@ -121,6 +130,7 @@ impl Refusal {
     pub fn reason(&self) -> String {
         match self {
             Self::UnreadablePath(p) => format!("bundle: unreadable path ({p})"),
+            Self::OutsideCwd(p) => format!("bundle: outside cwd ({p})"),
             Self::BinaryFile(p) => format!("bundle: binary file ({p})"),
             Self::OverCap => "bundle: over cap".to_string(),
             Self::Secret => "bundle: possible secret".to_string(),
@@ -128,18 +138,48 @@ impl Refusal {
     }
 }
 
-/// Resolve a named path against `cwd`, expanding a leading `~`.
-fn resolve(named: &str, cwd: &std::path::Path) -> std::path::PathBuf {
-    if let Some(rest) = named.strip_prefix("~/") {
-        if let Some(home) = crate::http::home_dir() {
-            return std::path::Path::new(&home).join(rest);
+/// The session's working directory in canonical form, so containment compares
+/// like with like: `/tmp` on macOS is a symlink to `/private/tmp`, and a file
+/// under it canonicalizes to the latter. `None` when it cannot be canonicalized,
+/// in which case nothing can be proven to sit under it and nothing is read.
+fn canonical_cwd(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    std::fs::canonicalize(cwd).ok()
+}
+
+/// Resolve a named path against `cwd` and prove it sits under `cwd`.
+///
+/// This is the whole rule for what bundling may read: nothing outside the
+/// session's working directory, however the prompt spells the path. A leading
+/// `~` expands to the home directory; the result is then canonicalized, which
+/// follows every symlink and collapses `..`, and refused unless it is `cwd` or
+/// sits below it. Judging the real file rather than the spelling is what stops
+/// `../../etc/passwd`, `~/.zsh_history`, and a symlink planted under cwd alike.
+///
+/// `cwd` must already be canonical (see [`canonical_cwd`]). A path that does
+/// not exist cannot be canonicalized and refuses as unreadable before
+/// containment is judged.
+///
+/// # Errors
+/// [`Refusal::UnreadablePath`] when the path does not resolve,
+/// [`Refusal::OutsideCwd`] when it resolves to somewhere other than under `cwd`.
+fn resolve(named: &str, cwd: &std::path::Path) -> Result<std::path::PathBuf, Refusal> {
+    let home_rooted = named.strip_prefix("~/").and_then(|rest| {
+        crate::http::home_dir().map(|home| std::path::Path::new(&home).join(rest))
+    });
+    let raw = home_rooted.unwrap_or_else(|| {
+        let p = std::path::Path::new(named);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            cwd.join(p)
         }
-    }
-    let p = std::path::Path::new(named);
-    if p.is_absolute() {
-        p.to_path_buf()
+    });
+    let real =
+        std::fs::canonicalize(&raw).map_err(|_| Refusal::UnreadablePath(named.to_string()))?;
+    if real.starts_with(cwd) {
+        Ok(real)
     } else {
-        cwd.join(p)
+        Err(Refusal::OutsideCwd(named.to_string()))
     }
 }
 
@@ -157,9 +197,9 @@ fn label(path: &std::path::Path, cwd: &std::path::Path) -> String {
 }
 
 /// The label each named path would carry in the bundle, paired with the path
-/// string as it appeared in `paths`, for every entry that resolves to a file.
-/// A directory or a path that does not resolve is omitted, since neither one
-/// was inlined.
+/// string as it appeared in `paths`, for every entry that resolves to a file
+/// under `cwd`. A directory, a path that does not resolve, or one outside
+/// `cwd` is omitted, since none of those was inlined.
 ///
 /// Exists so the caller can rewrite the *prompt* to use the same labels: the
 /// bundle's contents are labelled to avoid leaking an absolute path, but the
@@ -169,17 +209,25 @@ fn label(path: &std::path::Path, cwd: &std::path::Path) -> String {
 /// into the bundle.
 #[must_use]
 pub fn labels(paths: &[String], cwd: &std::path::Path) -> Vec<(String, String)> {
+    let Some(cwd) = canonical_cwd(cwd) else {
+        return Vec::new();
+    };
     paths
         .iter()
         .filter_map(|named| {
-            let path = resolve(named, cwd);
+            let path = resolve(named, &cwd).ok()?;
             let meta = std::fs::metadata(&path).ok()?;
-            meta.is_file().then(|| (named.clone(), label(&path, cwd)))
+            meta.is_file().then(|| (named.clone(), label(&path, &cwd)))
         })
         .collect()
 }
 
 /// Read every named path into one bundle, or refuse.
+///
+/// Every path must sit under `cwd` once symlinks and `..` are resolved (see
+/// [`resolve`]); one that does not refuses the whole task, because a prompt
+/// reaching outside the working directory is reaching for something the user
+/// did not mean to offload.
 ///
 /// Directories are dropped and named in the header rather than refused: real
 /// review prompts name the repo root for orientation alongside the diff they
@@ -190,18 +238,23 @@ pub fn labels(paths: &[String], cwd: &std::path::Path) -> Vec<(String, String)> 
 /// # Errors
 /// Returns the [`Refusal`] that stopped it. Every one means "run locally".
 pub fn gather(paths: &[String], cwd: &std::path::Path) -> Result<String, Refusal> {
+    let Some(cwd) = canonical_cwd(cwd) else {
+        return Err(Refusal::OutsideCwd(
+            paths.first().cloned().unwrap_or_default(),
+        ));
+    };
     let mut body = String::new();
     let mut skipped: Vec<String> = Vec::new();
     let mut files = 0usize;
 
     for named in paths {
-        let path = resolve(named, cwd);
+        let path = resolve(named, &cwd)?;
         let meta = std::fs::metadata(&path).map_err(|_| Refusal::UnreadablePath(named.clone()))?;
         if meta.is_dir() {
             // The label, not the raw named path: `named` can be the absolute
             // string a prompt typed, and this list lands in the bundle a
             // stranger reads, same as an inlined file's label.
-            skipped.push(label(&path, cwd));
+            skipped.push(label(&path, &cwd));
             continue;
         }
         if !meta.is_file() {
@@ -223,7 +276,7 @@ pub fn gather(paths: &[String], cwd: &std::path::Path) -> Result<String, Refusal
         }
         let _ = std::fmt::Write::write_fmt(
             &mut body,
-            format_args!("\n--- {} ({chars} chars) ---\n{text}", label(&path, cwd)),
+            format_args!("\n--- {} ({chars} chars) ---\n{text}", label(&path, &cwd)),
         );
         files += 1;
     }
@@ -479,11 +532,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    // --- containment ---
+    //
+    // The classifier's path refusal used to be a blanket "never touch this
+    // machine". Bundling reuses that refusal as the signal to read, so it has
+    // to supply the containment the refusal gave for free: nothing outside
+    // the session's working directory is read, however the prompt spells it.
+
+    /// A sandbox holding `proj/` (the cwd) beside `outside/secret.txt` (a file
+    /// that must never be bundled from `proj/`).
+    fn contained_sandbox(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let d = sandbox(name);
+        let cwd = d.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(d.join("outside")).unwrap();
+        std::fs::write(d.join("outside").join("secret.txt"), "hunter2\n").unwrap();
+        (d, cwd)
+    }
+
+    #[test]
+    fn an_absolute_path_outside_cwd_refuses() {
+        let (d, cwd) = contained_sandbox("abs-outside");
+        let p = d.join("outside").join("secret.txt").display().to_string();
+        assert!(
+            matches!(gather(&[p], &cwd), Err(Refusal::OutsideCwd(_))),
+            "an absolute path outside cwd must refuse, not read"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn dot_dot_traversal_out_of_cwd_refuses() {
+        let (d, cwd) = contained_sandbox("dotdot");
+        assert!(
+            matches!(
+                gather(&["../outside/secret.txt".to_string()], &cwd),
+                Err(Refusal::OutsideCwd(_))
+            ),
+            "`..` must not climb out of cwd"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // A symlink's own path sits under cwd, so a lexical check passes it while
+    // the read lands on the target. Containment is judged on the real file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_under_cwd_pointing_outside_refuses() {
+        let (d, cwd) = contained_sandbox("symlink");
+        std::os::unix::fs::symlink(d.join("outside").join("secret.txt"), cwd.join("range.diff"))
+            .unwrap();
+        assert!(
+            matches!(
+                gather(&["range.diff".to_string()], &cwd),
+                Err(Refusal::OutsideCwd(_))
+            ),
+            "a symlink out of cwd must refuse, not read its target"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // Containment is about where the file really is, not how the path is
+    // spelled: a `..` that climbs out and straight back in is still inside.
+    #[test]
+    fn a_dot_dot_that_lands_back_under_cwd_is_read() {
+        let (d, cwd) = contained_sandbox("dotdot-inside");
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::write(cwd.join("a.diff"), "+inside\n").unwrap();
+        let out = gather(&["src/../a.diff".to_string()], &cwd).expect("gather");
+        assert!(out.contains("+inside"), "the file must be inlined: {out}");
+        assert!(
+            out.contains("--- a.diff ("),
+            "the label must be the real relative path: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn refusal_reasons_are_route_log_ready() {
         assert_eq!(
             Refusal::BinaryFile("a.bin".into()).reason(),
             "bundle: binary file (a.bin)"
+        );
+        assert_eq!(
+            Refusal::OutsideCwd("../x".into()).reason(),
+            "bundle: outside cwd (../x)"
         );
         assert_eq!(Refusal::OverCap.reason(), "bundle: over cap");
         assert_eq!(Refusal::Secret.reason(), "bundle: possible secret");

@@ -410,3 +410,60 @@ fn a_path_prompt_carrying_a_credential_does_not_bundle() {
     );
     let _ = std::fs::remove_dir_all(&sandbox);
 }
+
+/// `~/` expands to the home directory, which is exactly where the files a user
+/// never meant to offload live. A review naming one from a session whose cwd
+/// is a project directory must refuse on containment, not read it. HOME is
+/// per-process here, which is why this lives in the CLI suite and not beside
+/// the other containment tests in `bundle.rs`.
+#[test]
+fn a_tilde_path_outside_cwd_does_not_bundle() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "slashwork-bundle-tilde-{}-{}",
+        std::process::id(),
+        thread_tag()
+    ));
+    let cwd = sandbox.join("proj");
+    std::fs::create_dir_all(sandbox.join(".slashwork")).expect("sandbox");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::write(sandbox.join(".slashwork").join("consent"), b"").unwrap();
+    std::fs::write(sandbox.join(".slashwork").join("bundle"), b"").unwrap();
+    // Lives in HOME, beside the project, not under it.
+    std::fs::write(sandbox.join("history.txt"), "cd ~/secret-client\n").unwrap();
+    let log = sandbox.join("route.jsonl");
+
+    let envelope = serde_json::json!({
+        "session_id": "bundle-tilde-1",
+        "cwd": cwd.display().to_string(),
+        "tool_name": "Task",
+        "tool_input": { "prompt": "Review the following diff: ~/history.txt" },
+    })
+    .to_string();
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_slashwork-offload"));
+    cmd.arg("hook")
+        .env("HOME", &sandbox)
+        .env("USERPROFILE", &sandbox)
+        .env("SLASHWORK_ROUTE_LOG", &log)
+        .env("SLASHWORK_TOKEN", "t")
+        .env("SLASHWORK_BASE_URL", "http://127.0.0.1:1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(envelope.as_bytes())
+        .expect("write");
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success(), "hook must always exit 0");
+
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        logged.contains("bundle: outside cwd"),
+        "a `~/` path outside cwd must refuse on containment, not bundle: {logged}"
+    );
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
