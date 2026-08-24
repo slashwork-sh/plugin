@@ -93,7 +93,13 @@ pub enum PollOutcome {
 /// so the state machine can be exercised without a network.
 pub trait Coordinator {
     /// POST `/api/tasks`.
-    fn post_task(&self, class: Class, prompt: &str, deadline_secs: u64) -> PostOutcome;
+    fn post_task(
+        &self,
+        class: Class,
+        prompt: &str,
+        bundle: &str,
+        deadline_secs: u64,
+    ) -> PostOutcome;
     /// GET `/api/tasks/{id}/result?wait_secs=…` (a long-poll up to `wait_secs`).
     fn poll_result(&self, task_id: &str, wait_secs: u64) -> PollOutcome;
     /// DELETE `/api/tasks/{id}`; best effort, refunds the hold.
@@ -125,10 +131,10 @@ fn poll_retry(coord: &dyn Coordinator, task_id: &str, wait_secs: u64) -> PollOut
 
 /// Post a routable task and wait for an artifact, or cancel and fall back local.
 #[must_use]
-pub fn dispatch(coord: &dyn Coordinator, class: Class, prompt: &str) -> RouteOutcome {
+pub fn dispatch(coord: &dyn Coordinator, class: Class, prompt: &str, bundle: &str) -> RouteOutcome {
     let deadline = deadline_secs(class);
 
-    let task_id = match coord.post_task(class, prompt, deadline) {
+    let task_id = match coord.post_task(class, prompt, bundle, deadline) {
         PostOutcome::Created { task_id } => task_id,
         PostOutcome::NotEnoughCredits { message } => {
             // No task exists, so nothing to cancel.
@@ -205,6 +211,7 @@ mod tests {
         polls: RefCell<VecDeque<PollOutcome>>,
         posted: Cell<bool>,
         cancelled: Cell<bool>,
+        bundle: RefCell<String>,
     }
 
     impl Mock {
@@ -214,6 +221,7 @@ mod tests {
                 polls: RefCell::new(polls.into()),
                 posted: Cell::new(false),
                 cancelled: Cell::new(false),
+                bundle: RefCell::new(String::new()),
             }
         }
         fn created(polls: Vec<PollOutcome>) -> Self {
@@ -227,8 +235,15 @@ mod tests {
     }
 
     impl Coordinator for Mock {
-        fn post_task(&self, _class: Class, _prompt: &str, _deadline: u64) -> PostOutcome {
+        fn post_task(
+            &self,
+            _class: Class,
+            _prompt: &str,
+            bundle: &str,
+            _deadline: u64,
+        ) -> PostOutcome {
             self.posted.set(true);
+            self.bundle.replace(bundle.to_string());
             self.post.clone()
         }
         fn poll_result(&self, _task_id: &str, _wait: u64) -> PollOutcome {
@@ -255,7 +270,7 @@ mod tests {
     #[test]
     fn returns_in_claim_window() {
         let m = Mock::created(vec![PollOutcome::Returned(art())]);
-        match dispatch(&m, Class::Research, "p") {
+        match dispatch(&m, Class::Research, "p", "") {
             RouteOutcome::Artifact {
                 artifact, class, ..
             } => {
@@ -268,11 +283,22 @@ mod tests {
         assert!(!m.cancelled.get(), "a delivered task must not be cancelled");
     }
 
+    // The bundle rides the POST untouched; an empty one stays empty.
+    #[test]
+    fn the_bundle_travels_with_the_post() {
+        let m = Mock::created(vec![PollOutcome::Returned(art())]);
+        assert!(matches!(
+            dispatch(&m, Class::Review, "p", "=== diff ===\ncontent"),
+            RouteOutcome::Artifact { .. }
+        ));
+        assert_eq!(m.bundle.borrow().as_str(), "=== diff ===\ncontent");
+    }
+
     // Cold pool: nobody claims within the window, so cancel and run local.
     #[test]
     fn cold_pool_cancels_and_falls_back() {
         let m = Mock::created(vec![PollOutcome::Idle]);
-        match dispatch(&m, Class::Prose, "p") {
+        match dispatch(&m, Class::Prose, "p", "") {
             RouteOutcome::Local { reason } => assert!(reason.contains("no earner claimed")),
             other @ RouteOutcome::Artifact { .. } => panic!("expected local, got {other:?}"),
         }
@@ -287,7 +313,7 @@ mod tests {
     fn reviewing_then_returns() {
         let m = Mock::created(vec![PollOutcome::Reviewing, PollOutcome::Returned(art())]);
         assert!(matches!(
-            dispatch(&m, Class::Research, "p"),
+            dispatch(&m, Class::Research, "p", ""),
             RouteOutcome::Artifact { .. }
         ));
         assert!(!m.cancelled.get());
@@ -302,7 +328,7 @@ mod tests {
             PollOutcome::Returned(art()),
         ]);
         assert!(matches!(
-            dispatch(&m, Class::Research, "p"),
+            dispatch(&m, Class::Research, "p", ""),
             RouteOutcome::Artifact { .. }
         ));
         assert!(!m.cancelled.get());
@@ -317,7 +343,7 @@ mod tests {
             PollOutcome::Error,
             PollOutcome::Error,
         ]);
-        match dispatch(&m, Class::Research, "p") {
+        match dispatch(&m, Class::Research, "p", "") {
             RouteOutcome::Local { reason } => assert!(reason.contains("did not return")),
             other @ RouteOutcome::Artifact { .. } => panic!("expected local, got {other:?}"),
         }
@@ -336,7 +362,7 @@ mod tests {
             PollOutcome::Returned(art()), // grace
         ]);
         assert!(matches!(
-            dispatch(&m, Class::Review, "p"),
+            dispatch(&m, Class::Review, "p", ""),
             RouteOutcome::Artifact { .. }
         ));
         assert!(!m.cancelled.get());
@@ -351,7 +377,7 @@ mod tests {
             PollOutcome::Reviewing,
             PollOutcome::Idle, // gate rejected / expired
         ]);
-        match dispatch(&m, Class::Review, "p") {
+        match dispatch(&m, Class::Review, "p", "") {
             RouteOutcome::Local { reason } => assert!(reason.contains("before the deadline")),
             other @ RouteOutcome::Artifact { .. } => panic!("expected local, got {other:?}"),
         }
@@ -368,7 +394,7 @@ mod tests {
             PollOutcome::Claimed,
         ]);
         assert!(matches!(
-            dispatch(&m, Class::Review, "p"),
+            dispatch(&m, Class::Review, "p", ""),
             RouteOutcome::Local { .. }
         ));
         assert!(m.cancelled.get());
@@ -384,7 +410,7 @@ mod tests {
             },
             vec![],
         );
-        match dispatch(&m, Class::Research, "p") {
+        match dispatch(&m, Class::Research, "p", "") {
             RouteOutcome::Local { reason } => {
                 assert!(reason.contains("not enough credits"));
                 assert!(reason.contains("it costs 50"));
@@ -405,7 +431,7 @@ mod tests {
             vec![],
         );
         assert!(matches!(
-            dispatch(&m, Class::Research, "p"),
+            dispatch(&m, Class::Research, "p", ""),
             RouteOutcome::Local { .. }
         ));
         assert!(!m.cancelled.get());

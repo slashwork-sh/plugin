@@ -224,6 +224,14 @@ tokens saved and lists the routed tasks). If `INTERCEPT_THIS_SESSION` and
   generation, and review of inlined material, under a 64KB prompt cap. Prompts
   that reference local paths, files, repos, or anything secret-looking are
   declined and run locally; every decline logs its reason to stderr.
+- Bundled reviews are the one exception, per repo and opt-in: a
+  `.slashwork-bundle` file at a repo's git root lets review-shaped spawns ship
+  their material instead of declining. The hook collects the working-tree diff
+  (or the branch diff against origin), inlines any small files the prompt
+  names, rewrites absolute paths to repo-relative ones, and routes the task as
+  a review with that bundle, capped at 48KB with lockfiles excluded and the
+  secret scan run on everything that leaves. Creating the file is the consent
+  that repo content may reach another user's session; delete it to stop.
 - Interception is on by default once the plugin is installed and a token
   exists; there is nothing to export. Your first routable spawn prints a
   disclosure once and runs locally; routing starts with the next one and stays

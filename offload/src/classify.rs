@@ -167,6 +167,15 @@ fn has_unfenced_repo_verb(prompt: &str) -> bool {
         .any(|clause| REPO_VERBS.is_match(clause) && !is_fenced(clause))
 }
 
+/// The high-precision half of the secret scan, for callers vetting material
+/// other than the prompt (the review bundle): key families and high-entropy
+/// blobs only, never the prose vocabulary, which code legitimately uses
+/// ("password" in an auth module is not a leak).
+#[must_use]
+pub fn secret_key_reason(text: &str) -> Option<&'static str> {
+    SECRET_KEYS.is_match(text).then_some("secret-shaped token")
+}
+
 /// Classify a subagent prompt into a routing decision. See the module docs for
 /// the invariant: unsure means local.
 #[must_use]

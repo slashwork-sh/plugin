@@ -36,6 +36,11 @@ pub struct Envelope {
     pub tool_name: Option<String>,
     #[serde(default)]
     pub tool_input: ToolInput,
+    /// The project directory Claude Code ran the hook for. Bundled reviews
+    /// collect material relative to it; absent on older builds, where the
+    /// process working directory (also the project) stands in.
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -77,6 +82,18 @@ impl Envelope {
             "default".to_string()
         } else {
             key
+        }
+    }
+}
+
+impl Envelope {
+    /// Where bundling looks for the repo: the envelope's `cwd` when present,
+    /// the process working directory otherwise.
+    #[must_use]
+    pub fn cwd_or_process(&self) -> std::path::PathBuf {
+        match self.cwd.as_deref() {
+            Some(c) if !c.is_empty() => std::path::PathBuf::from(c),
+            _ => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         }
     }
 }
