@@ -19,7 +19,8 @@
 //!
 //! Adapters pipe JSON over stdin/stdout and stay thin.
 
-use offload::classify::{classify, Decision};
+use offload::bundle::{bundle_review, BundleOutcome};
+use offload::classify::{classify, Class, Decision};
 use offload::dispatch::{dispatch, wrap_artifact, RouteOutcome};
 use offload::earn::{
     claim_outcome, credits_balance, login_poll, parse_goal, submit_outcome, ClaimOutcome, Goal,
@@ -106,7 +107,7 @@ fn cmd_route() -> ! {
         Decision::Local { reason } => emit_local(&reason),
         Decision::Routable { class } => {
             let coord = UreqCoordinator::new(base, token, input.harness);
-            match dispatch(&coord, class, &input.spawn.prompt) {
+            match dispatch(&coord, class, &input.spawn.prompt, "") {
                 RouteOutcome::Local { reason } => emit_local(&reason),
                 RouteOutcome::Artifact {
                     task_id,
@@ -210,30 +211,51 @@ fn cmd_hook() -> ! {
                 // disclosure. No decision attached, so the spawn runs locally.
                 emit(&serde_json::json!({ "systemMessage": CONSENT_NOTICE }));
             }
-            Decision::Local { reason } => route_log("local", &reason),
+            Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
+                BundleOutcome::Bundled { .. } => {
+                    route_log("local", "consent notice shown, routable as review (bundled)");
+                    let _ = std::fs::write(&marker, b"");
+                    emit(&serde_json::json!({ "systemMessage": CONSENT_NOTICE }));
+                }
+                _ => route_log("local", &reason),
+            },
         }
         std::process::exit(0);
     }
 
     // Dispatch. The core classifies, posts, waits out the claim window and class
-    // deadline, and cancels with a refund on any fall-through.
-    let class = match classify(prompt) {
-        Decision::Routable { class } => class,
-        Decision::Local { reason } => {
-            route_log("local", &reason);
-            std::process::exit(0);
-        }
+    // deadline, and cancels with a refund on any fall-through. A local verdict
+    // gets one bundling look first: an opted-in repo's review spawn ships its
+    // material with it (see bundle.rs) instead of falling back.
+    let (class, send_prompt, bundle) = match classify(prompt) {
+        Decision::Routable { class } => (class, prompt.clone(), String::new()),
+        Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
+            BundleOutcome::Bundled { prompt, bundle } => (Class::Review, prompt, bundle),
+            BundleOutcome::Declined { reason } => {
+                route_log("local", &reason);
+                std::process::exit(0);
+            }
+            BundleOutcome::NotEligible => {
+                route_log("local", &reason);
+                std::process::exit(0);
+            }
+        },
     };
     let coord = UreqCoordinator::new(
         base,
         resolve_token().unwrap_or_default(),
         Some(HARNESS.into()),
     );
-    match dispatch(&coord, class, prompt) {
+    match dispatch(&coord, class, &send_prompt, &bundle) {
         RouteOutcome::Artifact {
             class, artifact, ..
         } => {
-            route_log("routed", class.as_str());
+            let routed_detail = if bundle.is_empty() {
+                class.as_str().to_string()
+            } else {
+                format!("{} (bundled)", class.as_str())
+            };
+            route_log("routed", &routed_detail);
             let recent = record_saving(artifact.tokens_used);
             let plot = render_plot(&recent);
             let message = receipt(
@@ -278,7 +300,7 @@ fn cmd_hook() -> ! {
 const HARNESS: &str = "claude-code";
 
 /// Shown once per user, before their first routable spawn is ever routed.
-const CONSENT_NOTICE: &str = "slashwork intercept is on: self-contained subagent tasks will be routed to the offload network, meaning the task prompt is sent to another slashwork user's session to run. This first task runs locally; routing starts with the next one. Run /work off (or set SLASHWORK_INTERCEPT=0) to stop routing.";
+const CONSENT_NOTICE: &str = "slashwork intercept is on: self-contained subagent tasks will be routed to the offload network, meaning the task prompt is sent to another slashwork user's session to run. This first task runs locally; routing starts with the next one. A repo with a .slashwork-bundle file at its root also sends its diff and any small files the task names with review tasks. Run /work off (or set SLASHWORK_INTERCEPT=0) to stop routing.";
 
 /// Print one compact JSON object for Claude Code to read.
 fn emit(v: &serde_json::Value) {

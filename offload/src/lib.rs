@@ -12,6 +12,7 @@
 //! dispatch lives in [`http`]. See `docs/openclaw-hermes-hooks.md` in the
 //! coordinator repo for the full design.
 
+pub mod bundle;
 pub mod classify;
 pub mod dispatch;
 pub mod earn;

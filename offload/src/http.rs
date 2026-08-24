@@ -100,18 +100,20 @@ impl UreqCoordinator {
     }
 }
 
-/// The JSON body for `POST /api/tasks`. v1 inlines no files (empty bundle) and
-/// tags the routing harness so the coordinator can attribute the task.
+/// The JSON body for `POST /api/tasks`: the prompt, the context bundle (empty
+/// for everything but bundled reviews), and the routing harness tag so the
+/// coordinator can attribute the task.
 fn create_task_body(
     class: Class,
     prompt: &str,
+    bundle: &str,
     deadline_secs: u64,
     harness: Option<&str>,
 ) -> String {
     serde_json::json!({
         "class": class.as_str(),
         "prompt": prompt,
-        "context_bundle": "",
+        "context_bundle": bundle,
         "deadline_secs": deadline_secs,
         "harness": harness,
     })
@@ -147,9 +149,9 @@ fn run(req: ureq::Request, body: Option<&str>) -> (u16, String) {
 }
 
 impl Coordinator for UreqCoordinator {
-    fn post_task(&self, class: Class, prompt: &str, deadline_secs: u64) -> PostOutcome {
+    fn post_task(&self, class: Class, prompt: &str, bundle: &str, deadline_secs: u64) -> PostOutcome {
         let url = format!("{}/api/tasks", self.base);
-        let body = create_task_body(class, prompt, deadline_secs, self.harness.as_deref());
+        let body = create_task_body(class, prompt, bundle, deadline_secs, self.harness.as_deref());
         let agent = build_agent(Duration::from_secs(15));
         match agent
             .post(&url)
@@ -393,10 +395,24 @@ mod tests {
     use crate::dispatch::{PollOutcome, PostOutcome};
 
     #[test]
+    fn create_task_body_carries_the_bundle() {
+        let v: serde_json::Value = serde_json::from_str(&create_task_body(
+            Class::Review,
+            "review this",
+            "=== diff ===",
+            60,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(v["context_bundle"], "=== diff ===");
+    }
+
+    #[test]
     fn create_task_body_tags_the_harness() {
         let v: serde_json::Value = serde_json::from_str(&create_task_body(
             Class::Research,
             "do the thing",
+            "",
             150,
             Some("hermes"),
         ))
@@ -408,7 +424,7 @@ mod tests {
         assert_eq!(v["harness"], "hermes");
         // No harness posts null (the coordinator reads it back as claude-code).
         let v2: serde_json::Value =
-            serde_json::from_str(&create_task_body(Class::Prose, "p", 90, None)).unwrap();
+            serde_json::from_str(&create_task_body(Class::Prose, "p", "", 90, None)).unwrap();
         assert!(v2["harness"].is_null());
     }
 

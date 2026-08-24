@@ -242,3 +242,129 @@ fn malformed_input_is_not_a_crash() {
         assert!(out.is_empty(), "input {raw:?} produced: {out}");
     }
 }
+
+/// Run the hook with a route-log capture against an unreachable-but-allowed
+/// base, from a caller-built envelope. Returns (stdout, route log).
+fn hook_raw_with_log(sandbox: &std::path::Path, envelope: &str) -> (String, String) {
+    let log = sandbox.join("route-log.jsonl");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_slashwork-offload"));
+    cmd.arg("hook")
+        .env("HOME", sandbox)
+        .env("USERPROFILE", sandbox)
+        .env("SLASHWORK_ROUTE_LOG", &log)
+        .env("SLASHWORK_TOKEN", "t")
+        .env("SLASHWORK_BASE_URL", "http://127.0.0.1:1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn slashwork-offload");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(envelope.as_bytes())
+        .expect("write envelope");
+    let out = child.wait_with_output().expect("wait for hook");
+    assert!(out.status.success(), "hook must always exit 0");
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    (String::from_utf8(out.stdout).expect("utf8 stdout"), logged)
+}
+
+/// A scratch git repo with an uncommitted change, opted in to bundling.
+fn bundling_repo(root: &std::path::Path) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["config", "user.email", "t@t"],
+        vec!["config", "user.name", "t"],
+    ] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(&args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    std::fs::write(repo.join("src.rs"), "fn a() {}\n").unwrap();
+    for args in [vec!["add", "src.rs"], vec!["commit", "-q", "-m", "init"]] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(&args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    std::fs::write(repo.join("src.rs"), "fn a() { changed() }\n").unwrap();
+    std::fs::write(repo.join(".slashwork-bundle"), "").unwrap();
+    repo.canonicalize().unwrap()
+}
+
+#[test]
+fn a_bundle_eligible_review_reaches_dispatch_after_consent() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "slashwork-hook-bundle-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&sandbox);
+    std::fs::create_dir_all(&sandbox).unwrap();
+    let repo = bundling_repo(&sandbox);
+    let envelope = serde_json::json!({
+        "session_id": "bundle-e2e",
+        "tool_name": "Agent",
+        "cwd": repo.to_str().unwrap(),
+        "tool_input": { "prompt": format!(
+            "Review the uncommitted changes in {} for correctness.",
+            repo.display()
+        ) },
+    })
+    .to_string();
+
+    // First spawn: bundle-eligible counts as routable for the consent gate, so
+    // the disclosure shows and it runs locally.
+    let (out, logged) = hook_raw_with_log(&sandbox, &envelope);
+    assert!(out.contains("slashwork intercept is on"), "stdout: {out}");
+    assert!(
+        logged.contains("consent notice shown, routable as review (bundled)"),
+        "log: {logged}"
+    );
+
+    // Second spawn: past consent, the bundled task is dispatched for real. The
+    // base is unreachable, so the proof it got past the classifier (which
+    // declines this prompt for its absolute path) is the dispatch-stage reason.
+    let (out2, logged2) = hook_raw_with_log(&sandbox, &envelope);
+    assert!(out2.is_empty(), "a local fall-through stays silent: {out2}");
+    assert!(logged2.contains("coordinator unreachable"), "log: {logged2}");
+
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn without_the_marker_the_same_spawn_declines_as_before() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "slashwork-hook-nobundle-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&sandbox);
+    std::fs::create_dir_all(&sandbox).unwrap();
+    let repo = bundling_repo(&sandbox);
+    std::fs::remove_file(repo.join(".slashwork-bundle")).unwrap();
+    let envelope = serde_json::json!({
+        "session_id": "nobundle-e2e",
+        "tool_name": "Agent",
+        "cwd": repo.to_str().unwrap(),
+        "tool_input": { "prompt": format!(
+            "Review the uncommitted changes in {} for correctness.",
+            repo.display()
+        ) },
+    })
+    .to_string();
+    let (out, logged) = hook_raw_with_log(&sandbox, &envelope);
+    assert!(out.is_empty(), "stdout: {out}");
+    assert!(logged.contains("local path reference"), "log: {logged}");
+    let _ = std::fs::remove_dir_all(&sandbox);
+}

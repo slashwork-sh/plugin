@@ -58,3 +58,16 @@ To roll the core forward: cut the new release tag, bump `VERSION` in
 `hooks/install-core.sh`, and land them together. The next session-start install
 swaps the binary in place. Until the first `offload-v0.1.0` tag exists, the
 fetch 404s and every spawn routes locally, exactly as before sign-in.
+
+## Bundled reviews
+
+Review-shaped spawns are the largest source of subagent token burn and never
+route as written (they name a diff, a branch, or a brief file). With a
+`.slashwork-bundle` file at a repo's git root, the core gives every local
+verdict one bundling look (`offload/src/bundle.rs`): review intent plus repo
+material turns into a rewritten prompt and a `context_bundle` (working-tree
+diff, else branch diff vs origin, plus small files the prompt names), posted as
+a review-class task. Caps: 48KB per bundle, 16KB per inlined file, lockfiles
+and minified assets excluded, keys-only secret scan on everything that leaves.
+The marker file is the per-repo consent and is honored by the consent gate: a
+bundle-eligible first spawn shows the disclosure like any routable one.
