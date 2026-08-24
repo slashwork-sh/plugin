@@ -49,3 +49,10 @@ Splitting, worked through:
 - "compare these three caching options and then wire the winner into the config"
   Delegate the comparison.
   Keep local: editing the config.
+
+The cleanest way to delegate is the offload agent. Spawn a subagent with
+subagent_type "slashwork-work:offload" and open its prompt with a class line,
+"class: research" (or prose, codegen, review), then the complete work order.
+The class line replaces the phrasing rules above; the no-paths, no-secrets,
+inline-everything rules still apply, and a declined spawn says why in the
+transcript so the next one can fix it.

@@ -21,6 +21,7 @@
 
 use offload::bundle::{bundle_review, BundleOutcome};
 use offload::classify::{classify, Class, Decision};
+use offload::explicit::{classify_explicit, is_offload_agent, parse_class_header};
 use offload::dispatch::{dispatch, wrap_artifact, RouteOutcome};
 use offload::earn::{
     claim_outcome, credits_balance, login_poll, parse_goal, submit_outcome, ClaimOutcome, Goal,
@@ -147,6 +148,57 @@ fn emit_local(reason: &str) -> ! {
 
 // --- hook (Claude Code PreToolUse, end to end) ---
 
+/// The routing decision for a spawn: the offload agent's explicit path when
+/// the spawn addresses it (class from the header, safety checks intact), the
+/// conservative implicit classifier otherwise.
+fn hook_decision(env: &Envelope, prompt: &str) -> Decision {
+    if is_offload_agent(env.tool_input.subagent_type.as_deref()) {
+        classify_explicit(prompt)
+    } else {
+        classify(prompt)
+    }
+}
+
+/// Resolve a spawn to (class, prompt to send, bundle), exiting local (with
+/// the right log and visibility) on every path that should not route.
+fn route_plan(env: &Envelope, prompt: &str) -> (Class, String, String) {
+    match hook_decision(env, prompt) {
+        Decision::Routable { class } => {
+            // An explicit spawn routes its work order without the class: header.
+            let send = if is_offload_agent(env.tool_input.subagent_type.as_deref()) {
+                parse_class_header(prompt).map_or_else(|| prompt.to_string(), |(_, body)| body)
+            } else {
+                prompt.to_string()
+            };
+            (class, send, String::new())
+        }
+        Decision::Local { reason } if is_offload_agent(env.tool_input.subagent_type.as_deref()) => {
+            explicit_local(&reason)
+        }
+        Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
+            BundleOutcome::Bundled { prompt, bundle } => (Class::Review, prompt, bundle),
+            BundleOutcome::Declined { reason } => {
+                route_log("local", &reason);
+                std::process::exit(0);
+            }
+            BundleOutcome::NotEligible => {
+                route_log("local", &reason);
+                std::process::exit(0);
+            }
+        },
+    }
+}
+
+/// Visible local decline for an explicit offload spawn: the model addressed
+/// the network on purpose, so a miss must teach, not vanish.
+fn explicit_local(reason: &str) -> ! {
+    route_log("local", &format!("offload agent: {reason}"));
+    emit(&serde_json::json!({ "systemMessage": format!(
+        "slashwork: this offload-agent task ran locally: {reason}"
+    ) }));
+    std::process::exit(0);
+}
+
 /// `hook`: the whole Claude Code `PreToolUse` path, from the raw envelope on stdin
 /// to the hook JSON on stdout.
 ///
@@ -193,7 +245,7 @@ fn cmd_hook() -> ! {
     // notice nor spends the one disclosure.
     let marker = consent_marker(&env.session_key());
     if !marker.exists() {
-        match classify(prompt) {
+        match hook_decision(&env, prompt) {
             Decision::Routable { class } => {
                 // The verdict is `local`: the disclosure spends this spawn and
                 // it still runs on the machine. Logging it as `routed` claimed a
@@ -211,6 +263,9 @@ fn cmd_hook() -> ! {
                 // disclosure. No decision attached, so the spawn runs locally.
                 emit(&serde_json::json!({ "systemMessage": CONSENT_NOTICE }));
             }
+            Decision::Local { reason } if is_offload_agent(env.tool_input.subagent_type.as_deref()) => {
+                explicit_local(&reason)
+            }
             Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
                 BundleOutcome::Bundled { .. } => {
                     route_log("local", "consent notice shown, routable as review (bundled)");
@@ -227,20 +282,7 @@ fn cmd_hook() -> ! {
     // deadline, and cancels with a refund on any fall-through. A local verdict
     // gets one bundling look first: an opted-in repo's review spawn ships its
     // material with it (see bundle.rs) instead of falling back.
-    let (class, send_prompt, bundle) = match classify(prompt) {
-        Decision::Routable { class } => (class, prompt.clone(), String::new()),
-        Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
-            BundleOutcome::Bundled { prompt, bundle } => (Class::Review, prompt, bundle),
-            BundleOutcome::Declined { reason } => {
-                route_log("local", &reason);
-                std::process::exit(0);
-            }
-            BundleOutcome::NotEligible => {
-                route_log("local", &reason);
-                std::process::exit(0);
-            }
-        },
-    };
+    let (class, send_prompt, bundle) = route_plan(&env, prompt);
     let coord = UreqCoordinator::new(
         base,
         resolve_token().unwrap_or_default(),

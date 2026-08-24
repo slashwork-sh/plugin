@@ -167,6 +167,33 @@ fn has_unfenced_repo_verb(prompt: &str) -> bool {
         .any(|clause| REPO_VERBS.is_match(clause) && !is_fenced(clause))
 }
 
+/// Local-context signals (step 3 of the pipeline): a path, a real file, or a
+/// repo/build verb. `lp` is the lowercased prompt.
+pub(crate) fn local_context_reason(lp: &str) -> Option<String> {
+    if LOCAL_PATH.is_match(lp) {
+        return Some("local path reference".to_string());
+    }
+    if FILE_EXT.is_match(lp) || DEEP_PATH.is_match(lp) {
+        return Some("probable local file or path".to_string());
+    }
+    if has_unfenced_repo_verb(lp) {
+        return Some("local/repo operation".to_string());
+    }
+    None
+}
+
+/// The full secret scan (step 4): key families against the raw text, prose
+/// cues against the lowercased copy.
+pub(crate) fn secret_reason(raw: &str, lp: &str) -> Option<String> {
+    if SECRET_KEYS.is_match(raw) {
+        return Some("possible secret or high-entropy blob in prompt".to_string());
+    }
+    if SECRET_WORDS.is_match(lp) {
+        return Some("possible secret in prompt".to_string());
+    }
+    None
+}
+
 /// The high-precision half of the secret scan, for callers vetting material
 /// other than the prompt (the review bundle): key families and high-entropy
 /// blobs only, never the prose vocabulary, which code legitimately uses
@@ -204,23 +231,14 @@ pub fn classify(prompt: &str) -> Decision {
 
     // 3. Local-context signals: a path, a real file, or a repo/build verb means
     //    the task reaches into this machine and cannot run on a stranger's box.
-    if LOCAL_PATH.is_match(&lp) {
-        return local("local path reference");
-    }
-    if FILE_EXT.is_match(&lp) || DEEP_PATH.is_match(&lp) {
-        return local("probable local file or path");
-    }
-    if has_unfenced_repo_verb(&lp) {
-        return local("local/repo operation");
+    if let Some(reason) = local_context_reason(&lp) {
+        return Decision::Local { reason };
     }
 
     // 4. Secret scan: never send credentials off the machine. Key families run
     //    against the raw prompt; the prose cues against the lowercased copy.
-    if SECRET_KEYS.is_match(prompt) {
-        return local("possible secret or high-entropy blob in prompt");
-    }
-    if SECRET_WORDS.is_match(&lp) {
-        return local("possible secret in prompt");
+    if let Some(reason) = secret_reason(prompt, &lp) {
+        return Decision::Local { reason };
     }
 
     // 5. Class by high-confidence signature. Require exactly one match so an

@@ -71,3 +71,14 @@ a review-class task. Caps: 48KB per bundle, 16KB per inlined file, lockfiles
 and minified assets excluded, keys-only secret scan on everything that leaves.
 The marker file is the per-repo consent and is honored by the consent gate: a
 bundle-eligible first spawn shows the disclosure like any routable one.
+
+## The offload agent
+
+`agents/offload.md` ships an agent the session can address on purpose
+(`subagent_type: slashwork-work:offload`). Its description carries the
+delegation criteria, its prompt convention is a `class:` header line naming
+research, prose, codegen, or review, and its body makes the local fallback do
+the same self-contained work when routing misses. The core's explicit path
+(`offload/src/explicit.rs`) takes the class from the header instead of the
+trigger-phrase signatures and keeps every machine-reach and secret check;
+declines emit a visible systemMessage so the model learns what to fix.
