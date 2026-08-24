@@ -213,7 +213,10 @@ fn cmd_hook() -> ! {
             }
             Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
                 BundleOutcome::Bundled { .. } => {
-                    route_log("local", "consent notice shown, routable as review (bundled)");
+                    route_log(
+                        "local",
+                        "consent notice shown, routable as review (bundled)",
+                    );
                     let _ = std::fs::write(&marker, b"");
                     emit(&serde_json::json!({ "systemMessage": CONSENT_NOTICE }));
                 }

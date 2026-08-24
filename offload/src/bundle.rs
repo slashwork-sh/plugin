@@ -72,7 +72,12 @@ pub enum BundleOutcome {
 
 /// Run git in `cwd`, returning stdout only on success.
 fn git_out(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").arg("-C").arg(cwd).args(args).output().ok()?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -117,31 +122,41 @@ fn material_diff(root: &Path) -> Option<String> {
 }
 
 /// Files the prompt names by absolute path under the repo root, as
-/// `(repo-relative path, content)`, skipping anything missing or over the
-/// per-file cap. Trailing punctuation is trimmed so a path at the end of a
-/// sentence still resolves.
-fn named_files(prompt: &str, root: &Path) -> Vec<(String, String)> {
-    let prefix = format!("{}/", root.display());
+/// `(token as written, repo-relative path, content)`. Canonical paths do the
+/// matching, so Windows separators and symlinked temp dirs compare correctly;
+/// anything missing, outside the root, or over the per-file cap is skipped.
+/// Trailing punctuation is trimmed so a path ending a sentence still resolves.
+fn named_files(prompt: &str, root: &Path) -> Vec<(String, String, String)> {
+    let Ok(root_canon) = root.canonicalize() else {
+        return Vec::new();
+    };
     let mut seen = Vec::new();
     let mut out = Vec::new();
     for token in prompt.split_whitespace() {
         let token = token.trim_matches(|c: char| ",.;:!?)('\"`".contains(c));
-        let Some(rel) = token.strip_prefix(&prefix) else {
-            continue;
-        };
-        if rel.is_empty() || rel.contains("..") || seen.contains(&rel.to_string()) {
+        let path = Path::new(token);
+        if !path.is_absolute() {
             continue;
         }
-        let path = root.join(rel);
-        let Ok(meta) = path.metadata() else { continue };
+        let Ok(canon) = path.canonicalize() else {
+            continue;
+        };
+        let Ok(rel) = canon.strip_prefix(&root_canon) else {
+            continue;
+        };
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        if rel.is_empty() || seen.contains(&rel) {
+            continue;
+        }
+        let Ok(meta) = canon.metadata() else { continue };
         if !meta.is_file() || meta.len() > INLINE_FILE_MAX_BYTES as u64 {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&path) else {
+        let Ok(content) = std::fs::read_to_string(&canon) else {
             continue;
         };
-        seen.push(rel.to_string());
-        out.push((rel.to_string(), content));
+        seen.push(rel.clone());
+        out.push((token.to_string(), rel, content));
     }
     out
 }
@@ -163,9 +178,10 @@ pub fn bundle_review(prompt: &str, cwd: &Path) -> BundleOutcome {
         return BundleOutcome::NotEligible;
     };
 
+    let files = named_files(prompt, &root);
     let mut bundle = String::from("=== diff ===\n");
     bundle.push_str(&diff);
-    for (rel, content) in named_files(prompt, &root) {
+    for (_, rel, content) in &files {
         let _ = write!(bundle, "\n=== file: {rel} ===\n{content}");
     }
     if bundle.len() > BUNDLE_MAX_BYTES {
@@ -178,9 +194,15 @@ pub fn bundle_review(prompt: &str, cwd: &Path) -> BundleOutcome {
         };
     }
 
-    // Absolute paths under the root become repo-relative, so the prompt makes
-    // sense against the bundle instead of against this machine.
-    let rewritten = prompt.replace(&format!("{}/", root.display()), "./");
+    // Named paths become repo-relative by exact-token replacement (so Windows
+    // separators rewrite correctly), then leftover absolute references under
+    // the root are made relative too: the prompt must make sense against the
+    // bundle instead of against this machine.
+    let mut rewritten = prompt.to_string();
+    for (token, rel, _) in &files {
+        rewritten = rewritten.replace(token, &format!("./{rel}"));
+    }
+    rewritten = rewritten.replace(&format!("{}/", root.display()), "./");
 
     // Keys-only secret scan over everything that would leave. The prose
     // vocabulary stays prompt-classifier territory: a diff of an auth module
@@ -218,8 +240,17 @@ mod tests {
     }
 
     fn git(cwd: &Path, args: &[&str]) {
-        let out = Command::new("git").arg("-C").arg(cwd).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn opt_in(dir: &Path) {
@@ -251,13 +282,17 @@ mod tests {
         }
     }
 
-    const REVIEW_PROMPT: &str = "Review the changes on this branch for correctness and spec compliance.";
+    const REVIEW_PROMPT: &str =
+        "Review the changes on this branch for correctness and spec compliance.";
 
     #[test]
     fn without_the_marker_nothing_is_bundled() {
         let dir = repo();
         fs::write(dir.path().join("src.rs"), "fn a() { b() }\n").unwrap();
-        assert_eq!(bundle_review(REVIEW_PROMPT, dir.path()), BundleOutcome::NotEligible);
+        assert_eq!(
+            bundle_review(REVIEW_PROMPT, dir.path()),
+            BundleOutcome::NotEligible
+        );
     }
 
     #[test]
@@ -274,7 +309,10 @@ mod tests {
     #[test]
     fn outside_a_git_repo_nothing_is_bundled() {
         let dir = tempdir::Scratch::new();
-        assert_eq!(bundle_review(REVIEW_PROMPT, dir.path()), BundleOutcome::NotEligible);
+        assert_eq!(
+            bundle_review(REVIEW_PROMPT, dir.path()),
+            BundleOutcome::NotEligible
+        );
     }
 
     #[test]
@@ -302,7 +340,10 @@ mod tests {
             .output()
             .unwrap();
         let base = String::from_utf8(head.stdout).unwrap().trim().to_string();
-        git(dir.path(), &["update-ref", "refs/remotes/origin/main", &base]);
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", &base],
+        );
         fs::write(dir.path().join("src.rs"), "fn a() { branch_work() }\n").unwrap();
         git(dir.path(), &["add", "src.rs"]);
         git(dir.path(), &["commit", "-q", "-m", "task work"]);
@@ -318,7 +359,10 @@ mod tests {
     fn a_clean_tree_with_no_branch_work_is_not_eligible() {
         let dir = repo();
         opt_in(dir.path());
-        assert_eq!(bundle_review(REVIEW_PROMPT, dir.path()), BundleOutcome::NotEligible);
+        assert_eq!(
+            bundle_review(REVIEW_PROMPT, dir.path()),
+            BundleOutcome::NotEligible
+        );
     }
 
     #[test]
@@ -326,7 +370,11 @@ mod tests {
         let dir = repo();
         opt_in(dir.path());
         fs::create_dir_all(dir.path().join("docs")).unwrap();
-        fs::write(dir.path().join("docs/brief.md"), "# Task 3 brief\nExact tests listed here.\n").unwrap();
+        fs::write(
+            dir.path().join("docs/brief.md"),
+            "# Task 3 brief\nExact tests listed here.\n",
+        )
+        .unwrap();
         fs::write(dir.path().join("src.rs"), "fn a() { changed_call() }\n").unwrap();
         let prompt = format!(
             "Review one task: spec compliance. Brief: {}/docs/brief.md",
@@ -334,10 +382,16 @@ mod tests {
         );
         match bundle_review(&prompt, dir.path()) {
             BundleOutcome::Bundled { prompt, bundle } => {
-                assert!(bundle.contains("Exact tests listed here"), "bundle: {bundle}");
+                assert!(
+                    bundle.contains("Exact tests listed here"),
+                    "bundle: {bundle}"
+                );
                 assert!(bundle.contains("docs/brief.md"), "bundle: {bundle}");
                 assert!(prompt.contains("./docs/brief.md"), "prompt: {prompt}");
-                assert!(!prompt.contains("/swbundle-"), "prompt still absolute: {prompt}");
+                assert!(
+                    !prompt.contains("/swbundle-"),
+                    "prompt still absolute: {prompt}"
+                );
             }
             other => panic!("expected Bundled, got {other:?}"),
         }
@@ -382,6 +436,9 @@ mod tests {
         git(dir.path(), &["add", "Cargo.lock"]);
         git(dir.path(), &["commit", "-q", "-m", "lockfile"]);
         fs::write(dir.path().join("Cargo.lock"), "y".repeat(2000)).unwrap();
-        assert_eq!(bundle_review(REVIEW_PROMPT, dir.path()), BundleOutcome::NotEligible);
+        assert_eq!(
+            bundle_review(REVIEW_PROMPT, dir.path()),
+            BundleOutcome::NotEligible
+        );
     }
 }
