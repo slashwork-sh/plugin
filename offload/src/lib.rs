@@ -16,5 +16,6 @@ pub mod bundle;
 pub mod classify;
 pub mod dispatch;
 pub mod earn;
+pub mod explicit;
 pub mod hook;
 pub mod http;

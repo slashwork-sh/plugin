@@ -26,6 +26,7 @@ use offload::earn::{
     claim_outcome, credits_balance, login_poll, parse_goal, submit_outcome, ClaimOutcome, Goal,
     LoginPoll, SseTaskScanner, SubmitOutcome, CREDITS_GOAL_CEILING_SECS,
 };
+use offload::explicit::{classify_explicit, is_offload_agent, parse_class_header};
 use offload::hook::{
     consent_marker, is_self_worker, receipt, record_saving, render_plot, route_log, Envelope,
 };
@@ -147,12 +148,33 @@ fn emit_local(reason: &str) -> ! {
 
 // --- hook (Claude Code PreToolUse, end to end) ---
 
+/// The routing decision for a spawn: the offload agent's explicit path when
+/// the spawn addresses it (class from the header, safety checks intact), the
+/// conservative implicit classifier otherwise.
+fn hook_decision(env: &Envelope, prompt: &str) -> Decision {
+    if is_offload_agent(env.tool_input.subagent_type.as_deref()) {
+        classify_explicit(prompt)
+    } else {
+        classify(prompt)
+    }
+}
+
 /// Resolve a spawn to (class, prompt to send, bundle), exiting local (with
-/// the right log) on every path that should not route: the classifier's
-/// verdict first, then one bundling look for an opted-in repo's review spawn.
+/// the right log and visibility) on every path that should not route.
 fn route_plan(env: &Envelope, prompt: &str) -> (Class, String, String) {
-    match classify(prompt) {
-        Decision::Routable { class } => (class, prompt.to_string(), String::new()),
+    match hook_decision(env, prompt) {
+        Decision::Routable { class } => {
+            // An explicit spawn routes its work order without the class: header.
+            let send = if is_offload_agent(env.tool_input.subagent_type.as_deref()) {
+                parse_class_header(prompt).map_or_else(|| prompt.to_string(), |(_, body)| body)
+            } else {
+                prompt.to_string()
+            };
+            (class, send, String::new())
+        }
+        Decision::Local { reason } if is_offload_agent(env.tool_input.subagent_type.as_deref()) => {
+            explicit_local(&reason)
+        }
         Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
             BundleOutcome::Bundled { prompt, bundle } => (Class::Review, prompt, bundle),
             BundleOutcome::Declined { reason } => {
@@ -165,6 +187,16 @@ fn route_plan(env: &Envelope, prompt: &str) -> (Class, String, String) {
             }
         },
     }
+}
+
+/// Visible local decline for an explicit offload spawn: the model addressed
+/// the network on purpose, so a miss must teach, not vanish.
+fn explicit_local(reason: &str) -> ! {
+    route_log("local", &format!("offload agent: {reason}"));
+    emit(&serde_json::json!({ "systemMessage": format!(
+        "slashwork: this offload-agent task ran locally: {reason}"
+    ) }));
+    std::process::exit(0);
 }
 
 /// `hook`: the whole Claude Code `PreToolUse` path, from the raw envelope on stdin
@@ -213,7 +245,7 @@ fn cmd_hook() -> ! {
     // notice nor spends the one disclosure.
     let marker = consent_marker(&env.session_key());
     if !marker.exists() {
-        match classify(prompt) {
+        match hook_decision(&env, prompt) {
             Decision::Routable { class } => {
                 // The verdict is `local`: the disclosure spends this spawn and
                 // it still runs on the machine. Logging it as `routed` claimed a
@@ -230,6 +262,11 @@ fn cmd_hook() -> ! {
                 // in verbose mode, and a disclosure the user cannot see is not a
                 // disclosure. No decision attached, so the spawn runs locally.
                 emit(&serde_json::json!({ "systemMessage": CONSENT_NOTICE }));
+            }
+            Decision::Local { reason }
+                if is_offload_agent(env.tool_input.subagent_type.as_deref()) =>
+            {
+                explicit_local(&reason)
             }
             Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
                 BundleOutcome::Bundled { .. } => {

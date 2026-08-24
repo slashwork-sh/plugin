@@ -371,3 +371,69 @@ fn without_the_marker_the_same_spawn_declines_as_before() {
     assert!(logged.contains("local path reference"), "log: {logged}");
     let _ = std::fs::remove_dir_all(&sandbox);
 }
+
+#[test]
+fn an_offload_agent_spawn_routes_a_loose_prompt_after_consent() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "slashwork-hook-explicit-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&sandbox);
+    std::fs::create_dir_all(&sandbox).unwrap();
+    let envelope = serde_json::json!({
+        "session_id": "explicit-e2e",
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": "class: research\nWhat are the tradeoffs between the common approaches to connection pooling, and when does each win?",
+            "subagent_type": "slashwork-work:offload"
+        },
+    })
+    .to_string();
+
+    // First spawn: routable via the header, so the consent disclosure shows.
+    let (out, logged) = hook_raw_with_log(&sandbox, &envelope);
+    assert!(out.contains("slashwork intercept is on"), "stdout: {out}");
+    assert!(
+        logged.contains("consent notice shown, routable as research"),
+        "log: {logged}"
+    );
+
+    // Second spawn: dispatched for real. The implicit classifier would decline
+    // this prompt (no confident signature), so reaching the dispatch-stage
+    // reason proves the explicit path carried it.
+    let (out2, logged2) = hook_raw_with_log(&sandbox, &envelope);
+    assert!(out2.is_empty(), "stdout: {out2}");
+    assert!(
+        logged2.contains("coordinator unreachable"),
+        "log: {logged2}"
+    );
+    let _ = std::fs::remove_dir_all(&sandbox);
+}
+
+#[test]
+fn an_offload_agent_spawn_without_a_header_declines_visibly() {
+    let sandbox = std::env::temp_dir().join(format!(
+        "slashwork-hook-noheader-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&sandbox);
+    std::fs::create_dir_all(&sandbox).unwrap();
+    let envelope = serde_json::json!({
+        "session_id": "noheader-e2e",
+        "tool_name": "Agent",
+        "tool_input": {
+            "prompt": "Compare the common connection pooling approaches for me.",
+            "subagent_type": "slashwork-work:offload"
+        },
+    })
+    .to_string();
+    let (out, logged) = hook_raw_with_log(&sandbox, &envelope);
+    assert!(
+        out.contains("class: header"),
+        "the decline must teach: {out}"
+    );
+    assert!(logged.contains("offload agent:"), "log: {logged}");
+    let _ = std::fs::remove_dir_all(&sandbox);
+}

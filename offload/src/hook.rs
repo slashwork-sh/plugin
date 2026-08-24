@@ -47,6 +47,10 @@ pub struct Envelope {
 pub struct ToolInput {
     #[serde(default)]
     pub prompt: String,
+    /// The agent type the spawn addresses (Claude Code's `subagent_type`).
+    /// Naming the offload agent selects the explicit routing path.
+    #[serde(default)]
+    pub subagent_type: Option<String>,
 }
 
 impl Envelope {

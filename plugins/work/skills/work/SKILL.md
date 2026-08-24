@@ -224,6 +224,13 @@ tokens saved and lists the routed tasks). If `INTERCEPT_THIS_SESSION` and
   generation, and review of inlined material, under a 64KB prompt cap. Prompts
   that reference local paths, files, repos, or anything secret-looking are
   declined and run locally; every decline logs its reason to stderr.
+- The `slashwork-work:offload` agent is the explicit path: a spawn addressed
+  to it names its own class in a `class:` header line and skips the
+  trigger-phrase strictness, while the path, file, repo-verb, and secret
+  checks still apply. Declines are visible in the transcript so the model can
+  fix the next spawn. Routed tasks ship the work order without the header;
+  when routing misses, the same spawn runs locally under the agent's own
+  self-contained instructions.
 - Bundled reviews are the one exception, per repo and opt-in: a
   `.slashwork-bundle` file at a repo's git root lets review-shaped spawns ship
   their material instead of declining. The hook collects the working-tree diff
