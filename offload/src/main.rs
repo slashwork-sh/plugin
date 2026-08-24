@@ -147,6 +147,26 @@ fn emit_local(reason: &str) -> ! {
 
 // --- hook (Claude Code PreToolUse, end to end) ---
 
+/// Resolve a spawn to (class, prompt to send, bundle), exiting local (with
+/// the right log) on every path that should not route: the classifier's
+/// verdict first, then one bundling look for an opted-in repo's review spawn.
+fn route_plan(env: &Envelope, prompt: &str) -> (Class, String, String) {
+    match classify(prompt) {
+        Decision::Routable { class } => (class, prompt.to_string(), String::new()),
+        Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
+            BundleOutcome::Bundled { prompt, bundle } => (Class::Review, prompt, bundle),
+            BundleOutcome::Declined { reason } => {
+                route_log("local", &reason);
+                std::process::exit(0);
+            }
+            BundleOutcome::NotEligible => {
+                route_log("local", &reason);
+                std::process::exit(0);
+            }
+        },
+    }
+}
+
 /// `hook`: the whole Claude Code `PreToolUse` path, from the raw envelope on stdin
 /// to the hook JSON on stdout.
 ///
@@ -230,20 +250,7 @@ fn cmd_hook() -> ! {
     // deadline, and cancels with a refund on any fall-through. A local verdict
     // gets one bundling look first: an opted-in repo's review spawn ships its
     // material with it (see bundle.rs) instead of falling back.
-    let (class, send_prompt, bundle) = match classify(prompt) {
-        Decision::Routable { class } => (class, prompt.clone(), String::new()),
-        Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
-            BundleOutcome::Bundled { prompt, bundle } => (Class::Review, prompt, bundle),
-            BundleOutcome::Declined { reason } => {
-                route_log("local", &reason);
-                std::process::exit(0);
-            }
-            BundleOutcome::NotEligible => {
-                route_log("local", &reason);
-                std::process::exit(0);
-            }
-        },
-    };
+    let (class, send_prompt, bundle) = route_plan(&env, prompt);
     let coord = UreqCoordinator::new(
         base,
         resolve_token().unwrap_or_default(),
