@@ -337,7 +337,10 @@ fn a_bundle_eligible_review_reaches_dispatch_after_consent() {
     // declines this prompt for its absolute path) is the dispatch-stage reason.
     let (out2, logged2) = hook_raw_with_log(&sandbox, &envelope);
     assert!(out2.is_empty(), "a local fall-through stays silent: {out2}");
-    assert!(logged2.contains("coordinator unreachable"), "log: {logged2}");
+    assert!(
+        logged2.contains("coordinator unreachable"),
+        "log: {logged2}"
+    );
 
     let _ = std::fs::remove_dir_all(&sandbox);
 }
@@ -401,7 +404,10 @@ fn an_offload_agent_spawn_routes_a_loose_prompt_after_consent() {
     // reason proves the explicit path carried it.
     let (out2, logged2) = hook_raw_with_log(&sandbox, &envelope);
     assert!(out2.is_empty(), "stdout: {out2}");
-    assert!(logged2.contains("coordinator unreachable"), "log: {logged2}");
+    assert!(
+        logged2.contains("coordinator unreachable"),
+        "log: {logged2}"
+    );
     let _ = std::fs::remove_dir_all(&sandbox);
 }
 
@@ -424,7 +430,10 @@ fn an_offload_agent_spawn_without_a_header_declines_visibly() {
     })
     .to_string();
     let (out, logged) = hook_raw_with_log(&sandbox, &envelope);
-    assert!(out.contains("class: header"), "the decline must teach: {out}");
+    assert!(
+        out.contains("class: header"),
+        "the decline must teach: {out}"
+    );
     assert!(logged.contains("offload agent:"), "log: {logged}");
     let _ = std::fs::remove_dir_all(&sandbox);
 }
