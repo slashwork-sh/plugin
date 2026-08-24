@@ -21,12 +21,12 @@
 
 use offload::bundle::{bundle_review, BundleOutcome};
 use offload::classify::{classify, Class, Decision};
-use offload::explicit::{classify_explicit, is_offload_agent, parse_class_header};
 use offload::dispatch::{dispatch, wrap_artifact, RouteOutcome};
 use offload::earn::{
     claim_outcome, credits_balance, login_poll, parse_goal, submit_outcome, ClaimOutcome, Goal,
     LoginPoll, SseTaskScanner, SubmitOutcome, CREDITS_GOAL_CEILING_SECS,
 };
+use offload::explicit::{classify_explicit, is_offload_agent, parse_class_header};
 use offload::hook::{
     consent_marker, is_self_worker, receipt, record_saving, render_plot, route_log, Envelope,
 };
@@ -263,12 +263,17 @@ fn cmd_hook() -> ! {
                 // disclosure. No decision attached, so the spawn runs locally.
                 emit(&serde_json::json!({ "systemMessage": CONSENT_NOTICE }));
             }
-            Decision::Local { reason } if is_offload_agent(env.tool_input.subagent_type.as_deref()) => {
+            Decision::Local { reason }
+                if is_offload_agent(env.tool_input.subagent_type.as_deref()) =>
+            {
                 explicit_local(&reason)
             }
             Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
                 BundleOutcome::Bundled { .. } => {
-                    route_log("local", "consent notice shown, routable as review (bundled)");
+                    route_log(
+                        "local",
+                        "consent notice shown, routable as review (bundled)",
+                    );
                     let _ = std::fs::write(&marker, b"");
                     emit(&serde_json::json!({ "systemMessage": CONSENT_NOTICE }));
                 }

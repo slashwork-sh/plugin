@@ -93,7 +93,13 @@ pub enum PollOutcome {
 /// so the state machine can be exercised without a network.
 pub trait Coordinator {
     /// POST `/api/tasks`.
-    fn post_task(&self, class: Class, prompt: &str, bundle: &str, deadline_secs: u64) -> PostOutcome;
+    fn post_task(
+        &self,
+        class: Class,
+        prompt: &str,
+        bundle: &str,
+        deadline_secs: u64,
+    ) -> PostOutcome;
     /// GET `/api/tasks/{id}/result?wait_secs=…` (a long-poll up to `wait_secs`).
     fn poll_result(&self, task_id: &str, wait_secs: u64) -> PollOutcome;
     /// DELETE `/api/tasks/{id}`; best effort, refunds the hold.
@@ -229,7 +235,13 @@ mod tests {
     }
 
     impl Coordinator for Mock {
-        fn post_task(&self, _class: Class, _prompt: &str, bundle: &str, _deadline: u64) -> PostOutcome {
+        fn post_task(
+            &self,
+            _class: Class,
+            _prompt: &str,
+            bundle: &str,
+            _deadline: u64,
+        ) -> PostOutcome {
             self.posted.set(true);
             self.bundle.replace(bundle.to_string());
             self.post.clone()

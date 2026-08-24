@@ -149,9 +149,21 @@ fn run(req: ureq::Request, body: Option<&str>) -> (u16, String) {
 }
 
 impl Coordinator for UreqCoordinator {
-    fn post_task(&self, class: Class, prompt: &str, bundle: &str, deadline_secs: u64) -> PostOutcome {
+    fn post_task(
+        &self,
+        class: Class,
+        prompt: &str,
+        bundle: &str,
+        deadline_secs: u64,
+    ) -> PostOutcome {
         let url = format!("{}/api/tasks", self.base);
-        let body = create_task_body(class, prompt, bundle, deadline_secs, self.harness.as_deref());
+        let body = create_task_body(
+            class,
+            prompt,
+            bundle,
+            deadline_secs,
+            self.harness.as_deref(),
+        );
         let agent = build_agent(Duration::from_secs(15));
         match agent
             .post(&url)

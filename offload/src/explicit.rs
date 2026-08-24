@@ -48,8 +48,9 @@ pub fn parse_class_header(prompt: &str) -> Option<(Class, String)> {
 pub fn classify_explicit(prompt: &str) -> Decision {
     let Some((class, body)) = parse_class_header(prompt) else {
         return Decision::Local {
-            reason: "offload agent prompt has no class: header (research, prose, codegen, or review)"
-                .to_string(),
+            reason:
+                "offload agent prompt has no class: header (research, prose, codegen, or review)"
+                    .to_string(),
         };
     };
     if body.trim().is_empty() {
@@ -95,7 +96,8 @@ mod tests {
 
     #[test]
     fn header_case_and_whitespace_are_forgiven() {
-        let (class, _) = parse_class_header("  class:  PROSE\nWrite about caching.").expect("parses");
+        let (class, _) =
+            parse_class_header("  class:  PROSE\nWrite about caching.").expect("parses");
         assert_eq!(class, Class::Prose);
     }
 
@@ -132,7 +134,8 @@ mod tests {
 
     #[test]
     fn a_path_still_declines_an_explicit_prompt() {
-        match classify_explicit("class: review\nReview the code in /Users/me/project/src for bugs.") {
+        match classify_explicit("class: review\nReview the code in /Users/me/project/src for bugs.")
+        {
             Decision::Local { reason } => assert!(reason.contains("path"), "{reason}"),
             other @ Decision::Routable { .. } => panic!("must decline: {other:?}"),
         }
