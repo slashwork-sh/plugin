@@ -337,7 +337,10 @@ fn a_bundle_eligible_review_reaches_dispatch_after_consent() {
     // declines this prompt for its absolute path) is the dispatch-stage reason.
     let (out2, logged2) = hook_raw_with_log(&sandbox, &envelope);
     assert!(out2.is_empty(), "a local fall-through stays silent: {out2}");
-    assert!(logged2.contains("coordinator unreachable"), "log: {logged2}");
+    assert!(
+        logged2.contains("coordinator unreachable"),
+        "log: {logged2}"
+    );
 
     let _ = std::fs::remove_dir_all(&sandbox);
 }

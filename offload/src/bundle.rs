@@ -134,7 +134,16 @@ fn named_files(prompt: &str, root: &Path) -> Vec<(String, String, String)> {
     let mut out = Vec::new();
     for token in prompt.split_whitespace() {
         let token = token.trim_matches(|c: char| ",.;:!?)('\"`".contains(c));
-        let path = Path::new(token);
+        // Windows prompts mix separators, and the canonical temp dir is a
+        // verbatim \\?\ path where a forward slash is not a separator, so
+        // the lookup uses a native-separator copy; the rewrite later keeps
+        // the token exactly as written.
+        let lookup = if cfg!(windows) {
+            token.replace('/', "\\")
+        } else {
+            token.to_string()
+        };
+        let path = Path::new(&lookup);
         if !path.is_absolute() {
             continue;
         }
