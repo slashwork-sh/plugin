@@ -1,6 +1,6 @@
 [package]
 name = "slashwork-offload"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 description = "Shared cross-platform core for the slashwork offload network: classify a subagent spawn, scan for secrets, bundle, POST, and long-poll. Harness adapters (Claude Code, OpenClaw, Hermes) shell out to this one binary so the routing logic never drifts."
 license = "MIT"
