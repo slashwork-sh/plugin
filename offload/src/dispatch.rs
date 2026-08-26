@@ -29,14 +29,25 @@ pub const MAX_POLL_CHUNK_SECS: u64 = 45;
 pub const GRACE_POLL_SECS: u64 = 10;
 
 /// How long the parent will block for one task of this class, matching
-/// `intercept.sh`: research runs longest, review of inlined material is
-/// shortest.
+/// `intercept.sh`: research runs longest, everything else shares one budget.
+///
+/// Sized against measured passes, not against how long the work ought to take.
+/// Through 2026-08-10 every returned task landed in 35-46s whatever its class,
+/// and these were 60/90/150. From 2026-08-24 the same ~39K-token pass took 51s,
+/// then 89s, and every class budgeted under ~90s stopped landing at all while
+/// research kept working: the earner had slowed, the constants had not moved.
+///
+/// Two things follow. A deadline close to the fastest pass on one reference box
+/// is not a deadline, it is a guarantee that any slower earner falls back local
+/// forever and silently. And the old per-class tiering below research was never
+/// visible in the data, so prose, codegen and review now share one budget; the
+/// gap that does survive is research, which searches before it writes. Bundled
+/// reviews only push the same way, since they hand the worker more to read.
 #[must_use]
 pub const fn deadline_secs(class: Class) -> u64 {
     match class {
-        Class::Research => 150,
-        Class::Prose | Class::Codegen => 90,
-        Class::Review => 60,
+        Class::Research => 180,
+        Class::Prose | Class::Codegen | Class::Review => 120,
     }
 }
 
@@ -198,6 +209,7 @@ pub fn dispatch(coord: &dyn Coordinator, class: Class, prompt: &str, bundle: &st
 mod tests {
     use super::{
         deadline_secs, dispatch, Artifact, Coordinator, PollOutcome, PostOutcome, RouteOutcome,
+        CLAIM_WINDOW_SECS, HARD_CAP_SECS,
     };
     use crate::classify::Class;
     use std::cell::{Cell, RefCell};
@@ -353,12 +365,13 @@ mod tests {
     // Reviewing past the deadline, then accepted inside the grace: deliver.
     #[test]
     fn reviewing_accepted_in_grace() {
-        // Review deadline is 60s: claim(5) + one 45s chunk + one 10s chunk hits
-        // the deadline while still reviewing, then the grace poll returns.
+        // Review deadline is 120s: claim(5) + 45 + 45 + 25 reaches the deadline
+        // while still reviewing, then the grace poll returns.
         let m = Mock::created(vec![
-            PollOutcome::Reviewing,       // claim window
-            PollOutcome::Reviewing,       // deadline chunk 1
-            PollOutcome::Reviewing,       // deadline chunk 2 (waited == 60)
+            PollOutcome::Reviewing,       // claim window (waited == 5)
+            PollOutcome::Reviewing,       // deadline chunk 1 (waited == 50)
+            PollOutcome::Reviewing,       // deadline chunk 2 (waited == 95)
+            PollOutcome::Reviewing,       // deadline chunk 3 (waited == 120)
             PollOutcome::Returned(art()), // grace
         ]);
         assert!(matches!(
@@ -372,6 +385,7 @@ mod tests {
     #[test]
     fn reviewing_expires_in_grace() {
         let m = Mock::created(vec![
+            PollOutcome::Reviewing,
             PollOutcome::Reviewing,
             PollOutcome::Reviewing,
             PollOutcome::Reviewing,
@@ -389,6 +403,7 @@ mod tests {
     #[test]
     fn claimed_but_never_submitted() {
         let m = Mock::created(vec![
+            PollOutcome::Claimed,
             PollOutcome::Claimed,
             PollOutcome::Claimed,
             PollOutcome::Claimed,
@@ -439,10 +454,43 @@ mod tests {
 
     #[test]
     fn deadlines_match_the_hook() {
-        assert_eq!(deadline_secs(Class::Research), 150);
-        assert_eq!(deadline_secs(Class::Prose), 90);
-        assert_eq!(deadline_secs(Class::Codegen), 90);
-        assert_eq!(deadline_secs(Class::Review), 60);
+        assert_eq!(deadline_secs(Class::Research), 180);
+        assert_eq!(deadline_secs(Class::Prose), 120);
+        assert_eq!(deadline_secs(Class::Codegen), 120);
+        assert_eq!(deadline_secs(Class::Review), 120);
+    }
+
+    // Every class must clear the slowest pass we have actually measured, plus
+    // the claim window, or that class silently never lands. 89s is the 08-24
+    // research pass; the review and codegen overruns the same week are censored
+    // (they were cut off at 60s and 90s), so the true tail is at least this.
+    #[test]
+    fn every_deadline_clears_the_slowest_measured_pass() {
+        const SLOWEST_MEASURED_PASS_SECS: u64 = 89;
+        for class in [Class::Research, Class::Prose, Class::Codegen, Class::Review] {
+            let budget = deadline_secs(class);
+            assert!(
+                budget >= SLOWEST_MEASURED_PASS_SECS + CLAIM_WINDOW_SECS,
+                "{class:?} gets {budget}s, which does not clear a {SLOWEST_MEASURED_PASS_SECS}s pass plus the {CLAIM_WINDOW_SECS}s claim window"
+            );
+        }
+    }
+
+    // The grace loop runs between the longest deadline and the wall-clock cap,
+    // and has to cover the coordinator's own acceptance grace. Raising a
+    // deadline without checking this throws away artifacts that were submitted
+    // in time; raising the cap instead breaks the adapters, whose route and hook
+    // timeouts are layered above it.
+    #[test]
+    fn the_longest_deadline_leaves_room_for_the_acceptance_grace() {
+        const COORDINATOR_REVIEW_GRACE_SECS: u64 = 15;
+        let longest = deadline_secs(Class::Research);
+        assert!(longest < HARD_CAP_SECS, "no grace budget left at all");
+        assert!(
+            HARD_CAP_SECS - longest >= COORDINATOR_REVIEW_GRACE_SECS,
+            "{}s of grace does not cover the coordinator's {COORDINATOR_REVIEW_GRACE_SECS}s",
+            HARD_CAP_SECS - longest
+        );
     }
 
     #[test]
