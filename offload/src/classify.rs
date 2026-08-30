@@ -105,9 +105,15 @@ static FALSE_FENCE: LazyLock<Regex> =
 
 /// Credential key families and a broad high-entropy blob. Run against the raw
 /// (case-preserving) prompt so `AKIA`, `AIza`, and `-----BEGIN` still match.
+///
+/// The `sk-` families require a run of at least 20 characters after the prefix.
+/// A one-character lookahead matched any hyphen-then-alphanumeric word, so
+/// ordinary filenames (`task-1-brief.md`, carrying `sk-1`) read as credentials
+/// and declined the bundles that name them. A real key runs to 48 characters
+/// and the legacy form is caught twice over by the trailing high-entropy blob.
 static SECRET_KEYS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(sk-[A-Za-z0-9]|sk_(live|test)_|rk_live_|ghp_[A-Za-z0-9]|gho_[A-Za-z0-9]|github_pat_|glpat-|AKIA[0-9A-Z]{12}|AIza[0-9A-Za-z_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|-----BEGIN|xox[baprs]-|SLASHWORK_TOKEN|[A-Za-z0-9+/]{40,}={0,2})",
+        r"(sk-[A-Za-z0-9]{20,}|sk-(proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|sk_(live|test)_|rk_live_|ghp_[A-Za-z0-9]|gho_[A-Za-z0-9]|github_pat_|glpat-|AKIA[0-9A-Z]{12}|AIza[0-9A-Za-z_-]{20,}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|-----BEGIN|xox[baprs]-|SLASHWORK_TOKEN|[A-Za-z0-9+/]{40,}={0,2})",
     )
     .unwrap()
 });
@@ -269,7 +275,7 @@ pub fn classify(prompt: &str) -> Decision {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, Class, Decision, BUNDLE_CAP_BYTES};
+    use super::{classify, secret_key_reason, Class, Decision, BUNDLE_CAP_BYTES};
 
     // Assert a prompt routes to a specific class.
     fn assert_routes(prompt: &str, class: Class) {
@@ -451,6 +457,31 @@ mod tests {
         assert_local(
             "Write a function that calls the API with AIzaSyD-abcdefghijklmnopqrstuvwxyz012",
         );
+    }
+
+    #[test]
+    fn ordinary_hyphen_digit_words_are_not_secret_shaped() {
+        // A task-numbered filename carries the literal substring "sk-1", which
+        // is not a key: a real one runs on for tens of characters. Bundled
+        // reviews name these files, so a match here declines the whole bundle.
+        for text in [
+            "=== file: task-1-brief.md ===",
+            "review task-14-brief.md against task-2-report.md",
+            "the disk-2 volume and the risk-3 register",
+        ] {
+            assert_eq!(secret_key_reason(text), None, "false positive on: {text}");
+        }
+    }
+
+    #[test]
+    fn real_openai_keys_are_still_secret_shaped() {
+        for text in [
+            "sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV",
+            "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789",
+            "sk-svcacct-abcdefghijklmnopqrstuvwxyz0123456789",
+        ] {
+            assert!(secret_key_reason(text).is_some(), "missed key: {text}");
+        }
     }
 
     // --- Ambiguity (scenario 7) ---
