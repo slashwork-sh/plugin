@@ -22,7 +22,7 @@
 #   SLASHWORK_BIN_DIR           install directory (default: ~/.slashwork/bin)
 set -u
 
-VERSION="${SLASHWORK_OFFLOAD_VERSION:-offload-v0.6.1}"
+VERSION="${SLASHWORK_OFFLOAD_VERSION:-offload-v0.6.2}"
 # Whether the caller named a version. Without one we only ever move forward; with
 # one, they asked for that exact tag and a rollback is the point.
 VERSION_FORCED=$([ -n "${SLASHWORK_OFFLOAD_VERSION:-}" ] && echo 1 || echo 0)
