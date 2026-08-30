@@ -5,10 +5,10 @@
 //! correct and also why review spawns (the largest source of subagent token
 //! burn) never route: they name a diff, a branch, or a brief file. This module
 //! turns an eligible review spawn into a self-contained task: it collects the
-//! repo material (the working-tree diff, or the branch diff, plus any small
-//! files the prompt names), rewrites the prompt's absolute paths to
-//! repo-relative ones, and hands back a prompt + context bundle pair the
-//! coordinator already accepts.
+//! repo material (a diff the prompt names, else the working-tree diff, else the
+//! branch diff, plus any small files the prompt names), rewrites the prompt's
+//! absolute paths to repo-relative ones, and hands back a prompt + context
+//! bundle pair the coordinator already accepts.
 //!
 //! Nothing here loosens the classifier. Eligibility is explicit and narrow:
 //!
@@ -183,14 +183,37 @@ pub fn bundle_review(prompt: &str, cwd: &Path) -> BundleOutcome {
     if !REVIEW_INTENT.is_match(&prompt.to_lowercase()) {
         return BundleOutcome::NotEligible;
     }
-    let Some(diff) = material_diff(&root) else {
-        return BundleOutcome::NotEligible;
+    let files = named_files(prompt, &root);
+
+    // A diff the prompt names is the material the review is actually about.
+    // Prefer it: the branch diff is everything since the base, so it grows with
+    // every task that landed before this one and buries the change under review
+    // (and on a plan of any length, pushes the bundle over the cap).
+    let named_diff = files
+        .iter()
+        .find(|(_, rel, _)| {
+            Path::new(rel.as_str()).extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("diff") || ext.eq_ignore_ascii_case("patch")
+            })
+        })
+        .map(|(_, rel, content)| (rel.clone(), content.clone()));
+
+    let diff = if let Some((_, content)) = &named_diff {
+        content.clone()
+    } else {
+        let Some(material) = material_diff(&root) else {
+            return BundleOutcome::NotEligible;
+        };
+        material
     };
 
-    let files = named_files(prompt, &root);
     let mut bundle = String::from("=== diff ===\n");
     bundle.push_str(&diff);
     for (_, rel, content) in &files {
+        // The named diff became the material above; do not ship it twice.
+        if named_diff.as_ref().is_some_and(|(r, _)| r == rel) {
+            continue;
+        }
         let _ = write!(bundle, "\n=== file: {rel} ===\n{content}");
     }
     if bundle.len() > BUNDLE_MAX_BYTES {
@@ -359,6 +382,50 @@ mod tests {
         match bundle_review(REVIEW_PROMPT, dir.path()) {
             BundleOutcome::Bundled { bundle, .. } => {
                 assert!(bundle.contains("branch_work"), "bundle: {bundle}");
+            }
+            other => panic!("expected Bundled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_named_diff_file_replaces_the_branch_diff() {
+        let dir = repo();
+        opt_in(dir.path());
+        // Freeze "origin/main" at the initial commit, then commit work from an
+        // earlier task. The branch diff now carries material this review is
+        // not about, which is what the named diff has to displace.
+        let head = Command::new("git")
+            .args(["-C", dir.path().to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let base = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        git(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/main", &base],
+        );
+        fs::write(
+            dir.path().join("src.rs"),
+            "fn a() { earlier_task_work() }\n",
+        )
+        .unwrap();
+        git(dir.path(), &["add", "src.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "earlier task"]);
+        fs::write(
+            dir.path().join("review-task7.diff"),
+            "--- a/src.rs\n+++ b/src.rs\n@@\n+fn this_task_only() {}\n",
+        )
+        .unwrap();
+        let prompt = format!(
+            "Review this task against its brief. The diff: {}/review-task7.diff",
+            dir.path().display()
+        );
+        match bundle_review(&prompt, dir.path()) {
+            BundleOutcome::Bundled { bundle, .. } => {
+                assert!(bundle.contains("this_task_only"), "bundle: {bundle}");
+                assert!(
+                    !bundle.contains("earlier_task_work"),
+                    "branch diff should have been displaced: {bundle}"
+                );
             }
             other => panic!("expected Bundled, got {other:?}"),
         }
