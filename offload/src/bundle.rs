@@ -44,12 +44,16 @@ pub const INLINE_FILE_MAX_BYTES: usize = 16 * 1024;
 
 /// Diff paths never worth shipping: lockfiles and minified bundles carry
 /// high-entropy runs that trip the secret scan and say nothing a reviewer
-/// needs.
+/// needs, and the opt-in marker is this feature's own plumbing. The marker is
+/// usually untracked (opting in does not require committing it), so without
+/// this it would ride along in every bundle. Keep in step with
+/// [`BUNDLE_MARKER`].
 const DIFF_EXCLUDES: &[&str] = &[
     ":(exclude)*.lock",
     ":(exclude)package-lock.json",
     ":(exclude)*.min.js",
     ":(exclude)*.min.css",
+    ":(exclude).slashwork-bundle",
 ];
 
 /// Review-shaped work, matched loosely on purpose: this gate only decides
@@ -96,13 +100,55 @@ fn repo_root(cwd: &Path) -> Option<PathBuf> {
     }
 }
 
-/// The uncommitted diff (staged and unstaged, tracked files), or on a clean
-/// tree the branch diff against the frozen origin default branch. Lockfiles
-/// and minified assets are excluded from both.
+/// Unified diffs for the files that exist only in the working tree.
+///
+/// `git diff HEAD` reports tracked changes only, so a task that just ADDS
+/// files reads as a clean tree and falls through to the branch diff, which on
+/// a long-lived branch is both the wrong material and usually over the cap.
+/// `--exclude-standard` applies `.gitignore`, so an ignored file never ships,
+/// and the real index is never touched: these diffs are synthesized here
+/// rather than staged with `add --intent-to-add`.
+///
+/// Anything over [`INLINE_FILE_MAX_BYTES`] or not valid UTF-8 is skipped.
+/// Neither is review material, and one large stray file would push an
+/// otherwise fine bundle over the cap.
+fn untracked_diff(root: &Path) -> String {
+    let mut args = vec!["ls-files", "--others", "--exclude-standard", "--", "."];
+    args.extend_from_slice(DIFF_EXCLUDES);
+    let Some(list) = git_out(root, &args) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for rel in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let path = root.join(rel);
+        let Ok(meta) = path.metadata() else { continue };
+        if !meta.is_file() || meta.len() > INLINE_FILE_MAX_BYTES as u64 {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let _ = write!(
+            out,
+            "diff --git a/{rel} b/{rel}\nnew file mode 100644\n--- /dev/null\n+++ b/{rel}\n@@ -0,0 +1,{} @@\n",
+            content.lines().count()
+        );
+        for line in content.lines() {
+            let _ = writeln!(out, "+{line}");
+        }
+    }
+    out
+}
+
+/// The uncommitted diff (tracked changes plus files that exist only in the
+/// working tree), or on a genuinely clean tree the branch diff against the
+/// frozen origin default branch. Lockfiles and minified assets are excluded
+/// from all of them.
 fn material_diff(root: &Path) -> Option<String> {
     let mut args = vec!["diff", "HEAD", "--", "."];
     args.extend_from_slice(DIFF_EXCLUDES);
-    let working = git_out(root, &args)?;
+    let mut working = git_out(root, &args)?;
+    working.push_str(&untracked_diff(root));
     if !working.trim().is_empty() {
         return Some(working);
     }
@@ -425,6 +471,85 @@ mod tests {
                 assert!(
                     !bundle.contains("earlier_task_work"),
                     "branch diff should have been displaced: {bundle}"
+                );
+            }
+            other => panic!("expected Bundled, got {other:?}"),
+        }
+    }
+
+    /// Freeze `origin/main` at HEAD, then commit work on top, so the branch
+    /// diff carries `earlier_task_work` and the tree is clean.
+    fn branch_with_earlier_work(dir: &Path) {
+        let head = Command::new("git")
+            .args(["-C", dir.to_str().unwrap(), "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let base = String::from_utf8(head.stdout).unwrap().trim().to_string();
+        git(dir, &["update-ref", "refs/remotes/origin/main", &base]);
+        fs::write(dir.join("src.rs"), "fn a() { earlier_task_work() }\n").unwrap();
+        git(dir, &["add", "src.rs"]);
+        git(dir, &["commit", "-q", "-m", "earlier task"]);
+    }
+
+    #[test]
+    fn a_new_untracked_file_is_material() {
+        let dir = repo();
+        opt_in(dir.path());
+        branch_with_earlier_work(dir.path());
+        // The task under review only ADDS a file. `git diff HEAD` cannot see
+        // it, so without help this reads as a clean tree.
+        fs::write(
+            dir.path().join("added.rs"),
+            "fn brand_new_work() { todo!() }\n",
+        )
+        .unwrap();
+        match bundle_review(REVIEW_PROMPT, dir.path()) {
+            BundleOutcome::Bundled { bundle, .. } => {
+                assert!(bundle.contains("brand_new_work"), "bundle: {bundle}");
+                assert!(bundle.contains("added.rs"), "bundle: {bundle}");
+                assert!(
+                    !bundle.contains("earlier_task_work"),
+                    "fell through to the branch diff: {bundle}"
+                );
+            }
+            other => panic!("expected Bundled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_opt_in_marker_is_not_review_material() {
+        // The marker is usually untracked, so once untracked files became
+        // material it would otherwise ride along in every single bundle.
+        let dir = repo();
+        opt_in(dir.path());
+        fs::write(dir.path().join("added.rs"), "fn shipped() {}\n").unwrap();
+        match bundle_review(REVIEW_PROMPT, dir.path()) {
+            BundleOutcome::Bundled { bundle, .. } => {
+                assert!(bundle.contains("shipped"), "bundle: {bundle}");
+                assert!(
+                    !bundle.contains(BUNDLE_MARKER),
+                    "the marker shipped: {bundle}"
+                );
+            }
+            other => panic!("expected Bundled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gitignored_files_never_reach_the_bundle() {
+        let dir = repo();
+        opt_in(dir.path());
+        fs::write(dir.path().join(".gitignore"), "secrets.txt\n").unwrap();
+        git(dir.path(), &["add", ".gitignore"]);
+        git(dir.path(), &["commit", "-q", "-m", "ignore"]);
+        fs::write(dir.path().join("secrets.txt"), "hunter2_do_not_ship\n").unwrap();
+        fs::write(dir.path().join("added.rs"), "fn shipped() {}\n").unwrap();
+        match bundle_review(REVIEW_PROMPT, dir.path()) {
+            BundleOutcome::Bundled { bundle, .. } => {
+                assert!(bundle.contains("shipped"), "bundle: {bundle}");
+                assert!(
+                    !bundle.contains("hunter2_do_not_ship"),
+                    "ignored file leaked: {bundle}"
                 );
             }
             other => panic!("expected Bundled, got {other:?}"),
