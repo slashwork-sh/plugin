@@ -188,10 +188,42 @@ pub fn record_saving(tokens: i64) -> Vec<i64> {
     kept
 }
 
+/// How much of a spawn's prompt the route log keeps when capture is on.
+/// Enough to recognise what the task was, bounded so the log stays small and
+/// readable.
+pub(crate) const PROMPT_CAPTURE_MAX: usize = 1000;
+
+/// Shape one route-log record. Split out from the write so the truncation
+/// rules are testable without touching the filesystem.
+fn log_line(ts: u64, decision: &str, detail: &str, prompt: Option<&str>) -> serde_json::Value {
+    let mut line = serde_json::json!({ "ts": ts, "decision": decision, "detail": detail });
+    if let Some(p) = prompt {
+        let kept: String = p.chars().take(PROMPT_CAPTURE_MAX).collect();
+        line["prompt"] = serde_json::Value::from(kept);
+        line["prompt_len"] = serde_json::Value::from(p.chars().count());
+    }
+    line
+}
+
+/// Whether this run records prompts alongside verdicts.
+///
+/// Off by default and deliberately opt-in: the reason a spawn declined is
+/// harmless, but the prompt that declined can carry repo content, so it is the
+/// user's call whether it lands on disk. Nothing here is ever sent anywhere;
+/// the route log is local.
+fn capture_prompts() -> bool {
+    std::env::var("SLASHWORK_ROUTE_LOG_PROMPTS").is_ok_and(|v| v == "1" || v == "true")
+}
+
 /// Append a routed/local verdict to the route log, so the work on widening the
 /// routable slice keeps signal that stderr alone would lose. Point
 /// `SLASHWORK_ROUTE_LOG` at `/dev/null` to disable.
-pub fn route_log(decision: &str, detail: &str) {
+///
+/// `prompt` is recorded only when `SLASHWORK_ROUTE_LOG_PROMPTS=1`. Without it
+/// the log says why a spawn declined but not what declined, which leaves the
+/// largest bucket unauditable: a spawn that truly reads the repo and one that
+/// merely names a path in passing produce the same line.
+pub fn route_log(decision: &str, detail: &str, prompt: Option<&str>) {
     let path = match std::env::var("SLASHWORK_ROUTE_LOG") {
         Ok(p) if p == "/dev/null" || p.is_empty() => return,
         Ok(p) => std::path::PathBuf::from(p),
@@ -206,7 +238,12 @@ pub fn route_log(decision: &str, detail: &str) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let line = serde_json::json!({ "ts": ts, "decision": decision, "detail": detail });
+    let line = log_line(
+        ts,
+        decision,
+        detail,
+        if capture_prompts() { prompt } else { None },
+    );
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -240,6 +277,54 @@ pub fn consent_marker(session_key: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Route-log prompt capture ---
+    //
+    // The log records why a spawn declined but never what it declined, so the
+    // largest bucket ("local path reference", 77% of declines on a real
+    // machine) cannot be audited: there is no way to tell a spawn that truly
+    // reads the repo from one that merely names a path in passing. Capture is
+    // opt-in and local-only; these tests cover the shaping, not the file.
+
+    #[test]
+    fn no_prompt_field_when_capture_is_off() {
+        let line = log_line(1, "local", "local path reference", None);
+        assert!(line.get("prompt").is_none(), "leaked a prompt: {line}");
+        assert!(line.get("prompt_len").is_none());
+    }
+
+    #[test]
+    fn a_captured_prompt_is_recorded_whole_when_short() {
+        let line = log_line(
+            1,
+            "local",
+            "local path reference",
+            Some("read ./src/main.rs"),
+        );
+        assert_eq!(line["prompt"], "read ./src/main.rs");
+        assert_eq!(line["prompt_len"], 18);
+    }
+
+    #[test]
+    fn a_captured_prompt_is_truncated_but_reports_its_true_length() {
+        let long = "x".repeat(PROMPT_CAPTURE_MAX + 500);
+        let line = log_line(1, "local", "local path reference", Some(&long));
+        let got = line["prompt"].as_str().expect("prompt is a string");
+        assert_eq!(got.chars().count(), PROMPT_CAPTURE_MAX);
+        assert_eq!(line["prompt_len"], PROMPT_CAPTURE_MAX + 500);
+    }
+
+    #[test]
+    fn truncation_lands_on_a_character_boundary() {
+        // A multibyte prompt truncated by bytes would panic or emit invalid
+        // UTF-8; the cap counts characters.
+        let long = "é".repeat(PROMPT_CAPTURE_MAX + 10);
+        let line = log_line(1, "local", "detail", Some(&long));
+        assert_eq!(
+            line["prompt"].as_str().expect("string").chars().count(),
+            PROMPT_CAPTURE_MAX
+        );
+    }
 
     #[test]
     fn parses_a_task_envelope() {

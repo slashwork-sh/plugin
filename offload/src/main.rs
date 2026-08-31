@@ -173,16 +173,16 @@ fn route_plan(env: &Envelope, prompt: &str) -> (Class, String, String) {
             (class, send, String::new())
         }
         Decision::Local { reason } if is_offload_agent(env.tool_input.subagent_type.as_deref()) => {
-            explicit_local(&reason)
+            explicit_local(&reason, prompt)
         }
         Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
             BundleOutcome::Bundled { prompt, bundle } => (Class::Review, prompt, bundle),
             BundleOutcome::Declined { reason } => {
-                route_log("local", &reason);
+                route_log("local", &reason, Some(prompt));
                 std::process::exit(0);
             }
             BundleOutcome::NotEligible => {
-                route_log("local", &reason);
+                route_log("local", &reason, Some(prompt));
                 std::process::exit(0);
             }
         },
@@ -191,8 +191,8 @@ fn route_plan(env: &Envelope, prompt: &str) -> (Class, String, String) {
 
 /// Visible local decline for an explicit offload spawn: the model addressed
 /// the network on purpose, so a miss must teach, not vanish.
-fn explicit_local(reason: &str) -> ! {
-    route_log("local", &format!("offload agent: {reason}"));
+fn explicit_local(reason: &str, prompt: &str) -> ! {
+    route_log("local", &format!("offload agent: {reason}"), Some(prompt));
     emit(&serde_json::json!({ "systemMessage": format!(
         "slashwork: this offload-agent task ran locally: {reason}"
     ) }));
@@ -256,6 +256,7 @@ fn cmd_hook() -> ! {
                 route_log(
                     "local",
                     &format!("consent notice shown, routable as {}", class.as_str()),
+                    Some(prompt),
                 );
                 let _ = std::fs::write(&marker, b"");
                 // systemMessage, not stderr: an exit-0 hook's stderr shows only
@@ -266,18 +267,19 @@ fn cmd_hook() -> ! {
             Decision::Local { reason }
                 if is_offload_agent(env.tool_input.subagent_type.as_deref()) =>
             {
-                explicit_local(&reason)
+                explicit_local(&reason, prompt)
             }
             Decision::Local { reason } => match bundle_review(prompt, &env.cwd_or_process()) {
                 BundleOutcome::Bundled { .. } => {
                     route_log(
                         "local",
                         "consent notice shown, routable as review (bundled)",
+                        Some(prompt),
                     );
                     let _ = std::fs::write(&marker, b"");
                     emit(&serde_json::json!({ "systemMessage": CONSENT_NOTICE }));
                 }
-                _ => route_log("local", &reason),
+                _ => route_log("local", &reason, Some(prompt)),
             },
         }
         std::process::exit(0);
@@ -302,7 +304,7 @@ fn cmd_hook() -> ! {
             } else {
                 format!("{} (bundled)", class.as_str())
             };
-            route_log("routed", &routed_detail);
+            route_log("routed", &routed_detail, Some(prompt));
             let recent = record_saving(artifact.tokens_used);
             let plot = render_plot(&recent);
             let message = receipt(
@@ -326,7 +328,7 @@ fn cmd_hook() -> ! {
             std::process::exit(0);
         }
         RouteOutcome::Local { reason } => {
-            route_log("local", &reason);
+            route_log("local", &reason, Some(prompt));
             // Out of credits is the one rejection the user can act on, so it
             // gets a visible notice. Everything else stays quiet: the spawn just
             // runs locally, as it always did.
