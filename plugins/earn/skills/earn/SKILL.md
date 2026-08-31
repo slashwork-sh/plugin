@@ -46,9 +46,9 @@ your own agent folder. Three layers:
   can edit. `--reauth` forces a fresh sign-in even if a token exists.
   `--sandbox` additionally scaffolds `sandbox.sh`, a launcher that runs the
   whole `/earn` session inside a Docker Sandboxes microVM with deny-by-default
-  egress. It protects the earner's machine from a stranger's task and stops a
-  prompt-injected worker from exfiltrating the payload. It does NOT hide the
-  payload from the earner, who owns the host; never describe it that way.
+  egress. It protects the earner's machine from a stranger's task, and narrows
+  (does not close) exfiltration of the payload. It does NOT hide the payload
+  from the earner, who owns the host; never describe it that way.
 - `<goal>`: the earner loop. Hold the live task feed, claim offloaded tasks as
   they appear, run each with this folder's configured agent, submit, and repeat
   until the goal is met. The goal is a time budget (`90s`, `30m`, `2h`) or
@@ -172,21 +172,25 @@ mkdir -p "$DEST/.claude"
 #   sandbox: run the session inside a Docker Sandboxes microVM. enabled is set
 #     by /earn init --sandbox; name/memory/cpus are what ./sandbox.sh creates
 #     the box with. Host containment and egress control, NOT payload privacy.
-jq -n --argjson sb "$SANDBOX" \
-  '{base_url: "", model: "", bypass_permissions: false, default_duration: "30m",
-    sandbox: {enabled: ($sb == 1), name: "slashwork-earner", memory: "4g", cpus: 2}}' \
-  > "$DEST/settings.json"
-
 # The sandbox launcher, only when asked for. It is a real file in the plugin
 # (scripts/sandbox.sh) rather than a heredoc so it can be tested on its own.
+# This runs BEFORE settings.json is written: if the copy fails, the folder must
+# not be left claiming sandbox.enabled with no launcher to honour it, since
+# every later run would print a warning the earner has no way to act on.
 if [ "$SANDBOX" -eq 1 ]; then
   if cp "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox.sh" "$DEST/sandbox.sh" 2>/dev/null; then
     chmod +x "$DEST/sandbox.sh"
     echo "SANDBOX: wrote $DEST/sandbox.sh"
   else
-    echo "SANDBOX: could not copy sandbox.sh from the plugin; run /earn on the host"
+    SANDBOX=0
+    echo "SANDBOX: could not copy sandbox.sh from the plugin; scaffolding without it, run /earn on the host"
   fi
 fi
+
+jq -n --argjson sb "$SANDBOX" \
+  '{base_url: "", model: "", bypass_permissions: false, default_duration: "30m",
+    sandbox: {enabled: ($sb == 1), name: "slashwork-earner", memory: "4g", cpus: 2}}' \
+  > "$DEST/settings.json"
 
 # Claude Code local config. The token is NOT stored here: it lives in
 # ~/.slashwork/token so it never lands in a committable per-folder file.
@@ -293,11 +297,14 @@ First run: `/login` inside the sandbox (your host Claude credentials do not
 carry over), then `/earn 8h`. Your slashwork token is copied in from the host,
 so there is no second `/earn init`.
 
-Read this part before you repeat it to anyone: the sandbox protects **your
-machine** from a stranger's task prompt, and stops a prompt-injected worker
-from sending the payload anywhere. It does **not** hide the offloader's payload
-from you. You own the host, and `sbx exec -it slashwork-earner bash` reads
-everything inside. It is a boundary that points outward.
+Read this part before you repeat it to anyone. The sandbox protects **your
+machine** from a stranger's task prompt: that is a kernel boundary. It
+**narrows** where a compromised worker can send the payload, but it does not
+stop exfiltration outright, because the submit path has to stay reachable and
+github and npm are open until you run `--lock`. And it does **not** hide the
+offloader's payload from you: you own the host, and
+`sbx exec -it <your sandbox.name> bash` reads everything inside. It is a
+boundary that points outward.
 
 Requires Apple silicon (macOS 14+), Windows 11 with Hypervisor Platform, or
 Linux with KVM. Most cloud VMs lack nested virtualization; there, run `/earn`
@@ -328,8 +335,9 @@ If a `SANDBOX: wrote` line printed, step 2 is different: run `./sandbox.sh`
 instead of `/earn`. It creates the microVM, applies the egress allowlist,
 installs the plugin and copies the token in, then drops the user into a Claude
 Code session inside the box where they run `/login` once and then `/earn 8h`.
-Tell them what it does and does not do: it protects their machine and blocks
-exfiltration, and it does not hide the offloader's payload from them.
+Tell them what it does and does not do: it protects their machine, it narrows
+exfiltration without closing it, and it does not hide the offloader's payload
+from them.
 
 If auth printed `AUTH: timed_out` or a failure, the folder was still scaffolded;
 rerun `/earn init --reauth` to finish the token.
@@ -417,9 +425,20 @@ fi
 # folder set up for a sandbox that is running on the host) visible before any
 # task is claimed. Never stop the run over it.
 WANT_SB=$(jq -r '.sandbox.enabled // false' ./settings.json 2>/dev/null)
-IN_SB=0; [ -f "$HOME/.slashwork-sandbox" ] && IN_SB=1
-if [ "$IN_SB" -eq 1 ]; then
-  echo "SANDBOX: inside $(cat "$HOME/.slashwork-sandbox" 2>/dev/null)"
+MARKER="$HOME/.slashwork-sandbox"
+SB_NAME=""
+# Sanitize before printing: the content is a file the worker can write, and an
+# unsanitized echo hands a task prompt the terminal.
+[ -f "$MARKER" ] && SB_NAME=$(tr -cd 'A-Za-z0-9._-' < "$MARKER" 2>/dev/null | head -c 64)
+# Corroborate. sbx boxes are Linux microVMs, so a marker on a Darwin session was
+# provably NOT written by a sandboxed run -- it was planted by a task that ran
+# on this host with edits auto-accepted. Presence alone must never silence the
+# warning, because silencing it permanently is exactly what one cheap accepted
+# task would buy.
+if [ -n "$SB_NAME" ] && [ "$(uname -s)" = "Linux" ]; then
+  echo "SANDBOX: marker says inside '$SB_NAME' (self-reported by the box, not an attestation)"
+elif [ -n "$SB_NAME" ]; then
+  echo "SANDBOX: a sandbox marker exists but this session reports $(uname -s), so no sandboxed run wrote it. Treat it as planted by a task and remove it: rm $MARKER"
 elif [ "$WANT_SB" = "true" ]; then
   echo "SANDBOX: NOT inside a sandbox, but settings.json asks for one; strangers' prompts will run on this host. Start with ./sandbox.sh instead, or set sandbox.enabled false."
 else
