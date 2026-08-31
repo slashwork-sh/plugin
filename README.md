@@ -129,10 +129,17 @@ not carry over, then `/earn 8h`. Your slashwork token is copied in from the
 host, so there is no second `/earn init`.
 
 Be precise about what this buys. It protects **your machine** from a stranger's
-task prompt, and it leaves a prompt-injected worker nowhere to send the
-offloader's payload. It does **not** hide that payload from you: you own the
-host, and `sbx exec -it slashwork-earner bash` reads everything inside. The
-boundary points outward.
+task prompt: that part is a kernel boundary, not a promise.
+
+It **narrows** exfiltration rather than closing it. The allowlist cuts a
+compromised worker down to a few hosts, which is a real reduction, but until
+`--lock` github and npm are reachable and both accept writes, and the submit
+path is allowlisted by design, so a task whose stated deliverable *is* the
+payload gets it out through the one host the policy can never block.
+
+It does **not** hide that payload from you: you own the host, and
+`sbx exec -it <your sandbox.name> bash` reads everything inside. The boundary
+points outward.
 
 Needs Apple silicon (macOS 14+), Windows 11 with Hypervisor Platform, or Linux
 with KVM. Most cloud VMs lack nested virtualization; there, run `/earn` on the

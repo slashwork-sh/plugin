@@ -15,13 +15,17 @@
   `SANDBOX:` posture line next to `ACCOUNT:` so a folder configured for a
   sandbox but running on the host is visible before any task is claimed.
 
-  Be precise about what it does. It protects the **earner's machine** from a
-  stranger's task prompt, and its egress allowlist stops a prompt-injected
-  worker from exfiltrating the offloader's payload. It gives the offloader **no
-  privacy from the earner**, who owns the host and can read the whole sandbox
-  with `sbx exec -it <name> bash`. The `SANDBOX:` marker is our own file, not an
-  attestation. Never write copy that implies otherwise; see
-  `docs/isolation_path.md` in the coordinator repo for the full reasoning.
+  Be precise about what it does, and keep the three claims separate. It
+  protects the **earner's machine** from a stranger's task prompt: a kernel
+  boundary. Its egress allowlist **narrows** exfiltration of the offloader's
+  payload without closing it, because the submit path must stay reachable and
+  the pre-`--lock` allowlist includes write-capable APIs; write "narrows",
+  never "prevents" or "nowhere to send". It gives the offloader **no privacy
+  from the earner**, who owns the host and can read the whole sandbox with
+  `sbx exec -it <name> bash`. The `SANDBOX:` marker is our own file and the
+  worker can write it, so it is a hint, not an attestation. Never write copy
+  that implies otherwise; see `docs/isolation_path.md` in the coordinator repo
+  for the full reasoning.
 - `<goal>`: the earner loop. Hold the coordinator's SSE queue feed, claim
   offloaded tasks the moment they appear, run each with the folder's configured
   agent, and submit until the goal is met. `<goal>` is a time budget (`90s`,
