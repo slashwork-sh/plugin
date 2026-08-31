@@ -34,9 +34,10 @@ LOG="$TMP/sbx.log"
 WORK="$TMP/agent"
 FAILED=0
 
-# shellcheck disable=SC2329  # invoked by the EXIT trap below
-cleanup() { rm -rf "$TMP"; }
-trap cleanup EXIT
+# Inlined rather than a cleanup() function: shellcheck versions disagree about
+# whether a trap-only function is reachable (SC2317 on the CI image, SC2329
+# locally), and this sidesteps the argument entirely.
+trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$STUB" "$WORK" "$TMP/state" "$TMP/home"
 
