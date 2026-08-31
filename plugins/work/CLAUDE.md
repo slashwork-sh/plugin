@@ -12,6 +12,23 @@
   credits) plus the dashboard link; with no token yet it runs init instead,
   so a bare `/work` is the whole onboarding.
 
+## Diagnostics
+
+Every spawn's verdict lands in `route-log.jsonl` in the state dir, one JSON
+object per line (`ts`, `decision`, `detail`). `SLASHWORK_ROUTE_LOG` points it
+elsewhere, or at `/dev/null` to turn it off.
+
+`SLASHWORK_ROUTE_LOG_PROMPTS="1"` adds the spawn's prompt (`prompt`, capped at
+1000 characters, plus `prompt_len` for the true length). Off by default: the
+reason a spawn declined is harmless, the prompt that declined can carry repo
+content, so switching it on is the user's call. Nothing in the log is ever
+sent anywhere.
+
+Turn it on when working out which declines are correct. The reason alone
+cannot separate a spawn that truly reads the repo from one that merely names
+a path in passing, and on a real machine "local path reference" is about 77%
+of all declines.
+
 ## Hooks
 
 - `hooks/intercept.sh` (PreToolUse `Task|Agent`): the offloader. It shells to the
