@@ -83,6 +83,28 @@ static FILE_EXT: LazyLock<Regex> = LazyLock::new(|| {
 static DEEP_PATH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b[a-z0-9_-]+/[a-z0-9_-]+/[a-z0-9_./-]+").unwrap());
 
+/// A remote link. Stripped before the local-context scan: the deep-path rule
+/// counts separators, so `ahrefs.com/blog/study` inside a URL read as a
+/// relative path two directories down and declined the prompt for citing its
+/// own source. `file://` is deliberately not matched here, because that one
+/// does name this machine.
+static WEB_URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"https?://\S+").unwrap());
+
+/// Technology names whose last segment is also a file extension. These are
+/// products a prompt talks *about*, not files in the working directory, and
+/// naming one is what research prompts do most. Stripped before the scan for
+/// the same reason as `WEB_URL`.
+///
+/// A list, not a rule, because there is no general way to tell `node.js` from
+/// `api.h` by shape alone: both are a word, a dot, and a known extension. New
+/// entries belong here as they show up in declined prompts.
+static DOTTED_TECH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(node|next|nuxt|vue|react|three|d3|express|nest|ember|backbone|chart|discord|moment|video|alpine|pixi|riot|knockout|meteor|socket)\.(js|io|ts)\b",
+    )
+    .unwrap()
+});
+
 /// Repo and build verbs that only make sense against the local tree.
 static REPO_VERBS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -176,13 +198,18 @@ fn has_unfenced_repo_verb(prompt: &str) -> bool {
 /// Local-context signals (step 3 of the pipeline): a path, a real file, or a
 /// repo/build verb. `lp` is the lowercased prompt.
 pub(crate) fn local_context_reason(lp: &str) -> Option<String> {
-    if LOCAL_PATH.is_match(lp) {
+    // Remote links and dotted product names carry the *shape* of local context
+    // without any of the reach, so they come out before anything is measured.
+    // Scrubbing once here keeps all three checks below reading the same text.
+    let scrubbed = WEB_URL.replace_all(lp, " ");
+    let scrubbed = DOTTED_TECH.replace_all(&scrubbed, " ");
+    if LOCAL_PATH.is_match(&scrubbed) {
         return Some("local path reference".to_string());
     }
-    if FILE_EXT.is_match(lp) || DEEP_PATH.is_match(lp) {
+    if FILE_EXT.is_match(&scrubbed) || DEEP_PATH.is_match(&scrubbed) {
         return Some("probable local file or path".to_string());
     }
-    if has_unfenced_repo_verb(lp) {
+    if has_unfenced_repo_verb(&scrubbed) {
         return Some("local/repo operation".to_string());
     }
     None
@@ -394,6 +421,54 @@ mod tests {
         assert_local("Research and compare the schemas defined in src/models/user/schema; give pros and cons.");
         assert_local("Research and compare the numbers captured in benchmark.csv; give the pros and cons of each.");
         assert_local("Research and compare the interfaces declared in api.h; give the pros and cons of each.");
+    }
+
+    // --- Remote URLs and dotted product names are not local context ---
+    //
+    // Both rules below fire on the shape of a token rather than on any reach
+    // into this machine, and both hit the research class hardest: citing a
+    // source and naming a runtime are the two most ordinary things a research
+    // prompt does.
+
+    #[test]
+    fn a_cited_url_is_not_a_local_path() {
+        // The deep-path rule counts separators, so `ahrefs.com/blog/study`
+        // inside a URL read as a relative path two directories down. A prompt
+        // declined for the act of citing its own source.
+        assert_routes(
+            "Research and compare the findings at https://ahrefs.com/blog/llmstxt-study/ and give the pros and cons of each.",
+            Class::Research,
+        );
+    }
+
+    #[test]
+    fn a_dotted_technology_name_is_not_a_filename() {
+        // `js` is in the extension list, so every runtime and library whose
+        // name ends in one read as a bare filename in the working directory.
+        assert_routes(
+            "Research and compare the streaming APIs in Node.js and Deno; give the pros and cons of each.",
+            Class::Research,
+        );
+    }
+
+    // Guards: scrubbing a URL must not carry anything else out with it.
+
+    #[test]
+    fn a_local_path_beside_a_url_still_declines() {
+        assert_local(
+            "Research the approach at https://example.com/a/b/c and then refactor ./src/main.rs to match.",
+        );
+    }
+
+    #[test]
+    fn a_file_url_is_still_local() {
+        // Only http(s) is scrubbed. `file://` names this machine by design.
+        assert_local("Summarize the findings in file:///Users/me/notes/q3.md");
+    }
+
+    #[test]
+    fn a_real_source_file_still_declines_beside_a_technology_name() {
+        assert_local("Research how Node.js streams work, then implement it in ./src/stream.js");
     }
 
     // --- Negated local context ---
