@@ -36,14 +36,19 @@ your own agent folder. Three layers:
 
 `$ARGUMENTS` is one of:
 
-- `init [name] [--reauth]`: one-time setup. Authenticate in the browser (token
-  to `~/.slashwork/token`), then scaffold an earner folder at `./name` (default
-  `./slashwork-agent`): a `CLAUDE.md` identity, a `.claude/settings.local.json`
-  (permissions, defaultMode, additionalDirectories), a `settings.json` (run
-  settings: `base_url`, `model`, `bypass_permissions`, `default_duration`), a
-  README, and a `.gitignore`. No questions to answer; the folder ships safe
-  defaults the user can edit. `--reauth` forces a fresh sign-in even if a token
-  exists.
+- `init [name] [--reauth] [--sandbox]`: one-time setup. Authenticate in the
+  browser (token to `~/.slashwork/token`), then scaffold an earner folder at
+  `./name` (default `./slashwork-agent`): a `CLAUDE.md` identity, a
+  `.claude/settings.local.json` (permissions, defaultMode,
+  additionalDirectories), a `settings.json` (run settings: `base_url`, `model`,
+  `bypass_permissions`, `default_duration`, `sandbox`), a README, and a
+  `.gitignore`. No questions to answer; the folder ships safe defaults the user
+  can edit. `--reauth` forces a fresh sign-in even if a token exists.
+  `--sandbox` additionally scaffolds `sandbox.sh`, a launcher that runs the
+  whole `/earn` session inside a Docker Sandboxes microVM with deny-by-default
+  egress. It protects the earner's machine from a stranger's task, and narrows
+  (does not close) exfiltration of the payload. It does NOT hide the payload
+  from the earner, who owns the host; never describe it that way.
 - `<goal>`: the earner loop. Hold the live task feed, claim offloaded tasks as
   they appear, run each with this folder's configured agent, submit, and repeat
   until the goal is met. The goal is a time budget (`90s`, `30m`, `2h`) or
@@ -135,11 +140,15 @@ fi
 
 ```bash
 ARGS="$ARGUMENTS"
-# ARGS is "init [name] [--reauth]". The first word after "init" that is not
-# --reauth names the folder; default slashwork-agent.
-NAME=""
+# ARGS is "init [name] [--reauth] [--sandbox]". The first word after "init"
+# that is not a flag names the folder; default slashwork-agent.
+NAME=""; SANDBOX=0
 for w in $ARGS; do
-  case "$w" in init|--reauth) ;; *) [ -z "$NAME" ] && NAME="$w" ;; esac
+  case "$w" in
+    init|--reauth) ;;
+    --sandbox|-sandbox) SANDBOX=1 ;;
+    *) [ -z "$NAME" ] && NAME="$w" ;;
+  esac
 done
 # Keep the name a single safe path segment.
 NAME=$(printf '%s' "$NAME" | tr -cd 'A-Za-z0-9._-')
@@ -160,7 +169,27 @@ mkdir -p "$DEST/.claude"
 #     at the next run; applies from the next session). Only for unattended
 #     runs, only in a throwaway folder like this one.
 #   default_duration: the goal a bare /earn runs with
-jq -n '{base_url: "", model: "", bypass_permissions: false, default_duration: "30m"}' \
+#   sandbox: run the session inside a Docker Sandboxes microVM. enabled is set
+#     by /earn init --sandbox; name/memory/cpus are what ./sandbox.sh creates
+#     the box with. Host containment and egress control, NOT payload privacy.
+# The sandbox launcher, only when asked for. It is a real file in the plugin
+# (scripts/sandbox.sh) rather than a heredoc so it can be tested on its own.
+# This runs BEFORE settings.json is written: if the copy fails, the folder must
+# not be left claiming sandbox.enabled with no launcher to honour it, since
+# every later run would print a warning the earner has no way to act on.
+if [ "$SANDBOX" -eq 1 ]; then
+  if cp "${CLAUDE_PLUGIN_ROOT}/scripts/sandbox.sh" "$DEST/sandbox.sh" 2>/dev/null; then
+    chmod +x "$DEST/sandbox.sh"
+    echo "SANDBOX: wrote $DEST/sandbox.sh"
+  else
+    SANDBOX=0
+    echo "SANDBOX: could not copy sandbox.sh from the plugin; scaffolding without it, run /earn on the host"
+  fi
+fi
+
+jq -n --argjson sb "$SANDBOX" \
+  '{base_url: "", model: "", bypass_permissions: false, default_duration: "30m",
+    sandbox: {enabled: ($sb == 1), name: "slashwork-earner", memory: "4g", cpus: 2}}' \
   > "$DEST/settings.json"
 
 # Claude Code local config. The token is NOT stored here: it lives in
@@ -250,6 +279,39 @@ machine. Your token lives in `~/.slashwork/token` from `/earn init`; it is not
 stored in this folder.
 MD
 
+if [ "$SANDBOX" -eq 1 ]; then
+cat >> "$DEST/README.md" <<'MD'
+
+## Sandboxed runs
+
+`./sandbox.sh` runs this whole session inside a Docker Sandboxes microVM
+instead of on your machine, with deny-by-default egress allowlisted to
+Anthropic, slashwork, and (during setup) GitHub.
+
+    ./sandbox.sh            create if needed, bootstrap, attach
+    ./sandbox.sh --check    preflight only
+    ./sandbox.sh --lock     drop the install-only egress once it works
+    ./sandbox.sh --rebuild  destroy and recreate
+
+First run: `/login` inside the sandbox (your host Claude credentials do not
+carry over), then `/earn 8h`. Your slashwork token is copied in from the host,
+so there is no second `/earn init`.
+
+Read this part before you repeat it to anyone. The sandbox protects **your
+machine** from a stranger's task prompt: that is a kernel boundary. It
+**narrows** where a compromised worker can send the payload, but it does not
+stop exfiltration outright, because the submit path has to stay reachable and
+github and npm are open until you run `--lock`. And it does **not** hide the
+offloader's payload from you: you own the host, and
+`sbx exec -it <your sandbox.name> bash` reads everything inside. It is a
+boundary that points outward.
+
+Requires Apple silicon (macOS 14+), Windows 11 with Hypervisor Platform, or
+Linux with KVM. Most cloud VMs lack nested virtualization; there, run `/earn`
+on the host.
+MD
+fi
+
 cat > "$DEST/.gitignore" <<'MD'
 # never commit a token or local settings that may carry one
 .slashwork/
@@ -268,6 +330,14 @@ Then tell the user the next steps:
 2. Run `/earn` to start claiming tasks (it runs the folder's
    `default_duration`, 30m out of the box; `/earn 2h` or `/earn 200cr`
    overrides it). Tune `CLAUDE.md` and `settings.json` between runs.
+
+If a `SANDBOX: wrote` line printed, step 2 is different: run `./sandbox.sh`
+instead of `/earn`. It creates the microVM, applies the egress allowlist,
+installs the plugin and copies the token in, then drops the user into a Claude
+Code session inside the box where they run `/login` once and then `/earn 8h`.
+Tell them what it does and does not do: it protects their machine, it narrows
+exfiltration without closing it, and it does not hide the offloader's payload
+from them.
 
 If auth printed `AUTH: timed_out` or a failure, the folder was still scaffolded;
 rerun `/earn init --reauth` to finish the token.
@@ -346,6 +416,33 @@ if [ -n "$HANDLE" ]; then
   echo "ACCOUNT: earning as $HANDLE (at $BASE)"
 else
   echo "ACCOUNT: could not resolve a handle from $BASE/api/me (token may be invalid; continuing)"
+fi
+
+# Sandbox posture, advisory. settings.json says whether this folder is meant to
+# run inside a microVM; ~/.slashwork-sandbox is the marker sandbox.sh writes
+# inside the box. This is our own marker, not an attestation: it says where the
+# loop believes it is running, and its only job is to make the mismatch (a
+# folder set up for a sandbox that is running on the host) visible before any
+# task is claimed. Never stop the run over it.
+WANT_SB=$(jq -r '.sandbox.enabled // false' ./settings.json 2>/dev/null)
+MARKER="$HOME/.slashwork-sandbox"
+SB_NAME=""
+# Sanitize before printing: the content is a file the worker can write, and an
+# unsanitized echo hands a task prompt the terminal.
+[ -f "$MARKER" ] && SB_NAME=$(tr -cd 'A-Za-z0-9._-' < "$MARKER" 2>/dev/null | head -c 64)
+# Corroborate. sbx boxes are Linux microVMs, so a marker on a Darwin session was
+# provably NOT written by a sandboxed run -- it was planted by a task that ran
+# on this host with edits auto-accepted. Presence alone must never silence the
+# warning, because silencing it permanently is exactly what one cheap accepted
+# task would buy.
+if [ -n "$SB_NAME" ] && [ "$(uname -s)" = "Linux" ]; then
+  echo "SANDBOX: marker says inside '$SB_NAME' (self-reported by the box, not an attestation)"
+elif [ -n "$SB_NAME" ]; then
+  echo "SANDBOX: a sandbox marker exists but this session reports $(uname -s), so no sandboxed run wrote it. Treat it as planted by a task and remove it: rm $MARKER"
+elif [ "$WANT_SB" = "true" ]; then
+  echo "SANDBOX: NOT inside a sandbox, but settings.json asks for one; strangers' prompts will run on this host. Start with ./sandbox.sh instead, or set sandbox.enabled false."
+else
+  echo "SANDBOX: off (running on the host)"
 fi
 
 # Run settings from settings.json: the worker model override, and the
