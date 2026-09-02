@@ -28,7 +28,8 @@ use offload::earn::{
 };
 use offload::explicit::{classify_explicit, is_offload_agent, parse_class_header};
 use offload::hook::{
-    consent_marker, is_self_worker, receipt, record_saving, render_plot, route_log, Envelope,
+    bundle_nudge_seen, consent_marker, is_self_worker, receipt, record_saving, render_plot,
+    route_log, Envelope,
 };
 use offload::http::{
     fetch_me, home_dir, login_poll_once, login_start, post_claim, probe_auth, resolve_base,
@@ -70,6 +71,7 @@ fn main() {
         Some("route") => cmd_route(),
         Some("hook") => cmd_hook(),
         Some("classify") => cmd_classify(),
+        Some("plan") => cmd_plan(),
         Some("login") => cmd_login(),
         Some("claim") => cmd_claim(&args[1..]),
         Some("submit") => cmd_submit(&args[1..]),
@@ -77,7 +79,7 @@ fn main() {
         Some("credits") => cmd_credits(),
         _ => {
             eprintln!(
-                "usage: slashwork-offload <route|hook|classify|login|claim|submit|goal|credits>"
+                "usage: slashwork-offload <route|hook|classify|plan|login|claim|submit|goal|credits>"
             );
             std::process::exit(EXIT_USAGE);
         }
@@ -181,12 +183,44 @@ fn route_plan(env: &Envelope, prompt: &str) -> (Class, String, String) {
                 route_log("local", &reason, Some(prompt));
                 std::process::exit(0);
             }
+            BundleOutcome::NotOptedIn { repo } => bundle_not_opted_in(&reason, &repo, prompt),
             BundleOutcome::NotEligible => {
                 route_log("local", &reason, Some(prompt));
                 std::process::exit(0);
             }
         },
     }
+}
+
+/// A spawn that qualified on every count except the repo's consent.
+///
+/// Bundled reviews are opt-in per repo because repo content reaches a
+/// stranger's machine, and that is not negotiable. What was wrong was the
+/// silence: the marker defaulted to absent, a declining spawn said nothing,
+/// and so the feature was enabled in no repo but the one whose author wrote
+/// it. Measured over four weeks of real spawns, more offloadable work was lost
+/// to that missing file than to every classifier rule combined.
+///
+/// So the decline stays, and it explains itself once per repo. The user runs
+/// one command or does not; nothing leaves the machine either way.
+fn bundle_not_opted_in(reason: &str, repo: &std::path::Path, prompt: &str) -> ! {
+    route_log(
+        "local",
+        &format!("{reason} (bundle available, repo not opted in)"),
+        Some(prompt),
+    );
+    if !bundle_nudge_seen(repo) {
+        emit(&serde_json::json!({ "systemMessage": format!(
+            "slashwork: this review could have run on the network instead of \
+             spending your tokens. It needs the repo's diff, and this repo has \
+             not opted in. Run `touch {}/{}` to allow it. That file is the \
+             consent, one per repo, and nothing else changes. Reviews here run \
+             locally until it exists. Shown once per repo.",
+            repo.display(),
+            offload::bundle::BUNDLE_MARKER,
+        ) }));
+    }
+    std::process::exit(0);
 }
 
 /// Visible local decline for an explicit offload spawn: the model addressed
@@ -723,4 +757,71 @@ fn chunk_secs(deadline: Option<Instant>, cap: u64) -> u64 {
             .clamp(1, cap),
         None => cap,
     }
+}
+
+// --- plan (measurement) ---
+
+/// `plan`: report the full routing decision for one spawn without dispatching
+/// it. Reads a hook envelope on stdin (prompt, `subagent_type`, cwd) and prints
+/// the classifier verdict, what bundling did with it, and the final outcome.
+///
+/// This exists because the corpus harness could only ever see `classify`, which
+/// is blind to bundling: a spawn the classifier declines and the bundler then
+/// rescues looked identical to one nothing rescued. Measuring the change to
+/// bundling needs a command that reports the decision the hook actually makes.
+/// Pure and offline; it reads the repo but posts nothing.
+fn cmd_plan() -> ! {
+    let mut buf = String::new();
+    if std::io::stdin().read_to_string(&mut buf).is_err() {
+        emit_local("could not read plan input");
+    }
+    let env = Envelope::parse(&buf);
+    let prompt = env.tool_input.prompt.clone();
+    let cwd = env.cwd_or_process();
+
+    let (classify_decision, classify_reason) = match hook_decision(&env, &prompt) {
+        Decision::Routable { class } => ("routable", class.as_str().to_string()),
+        Decision::Local { reason } => ("local", reason),
+    };
+
+    let mut out = serde_json::json!({
+        "classify": { "decision": classify_decision, "reason": classify_reason },
+    });
+
+    // Bundling only gets a turn on the same path the hook gives it one.
+    let bundled = if classify_decision == "local"
+        && !is_offload_agent(env.tool_input.subagent_type.as_deref())
+    {
+        match bundle_review(&prompt, &cwd) {
+            BundleOutcome::Bundled { bundle, .. } => serde_json::json!({
+                "outcome": "bundled", "class": "review", "bundle_bytes": bundle.len(),
+            }),
+            BundleOutcome::Declined { reason } => {
+                serde_json::json!({ "outcome": "declined", "reason": reason })
+            }
+            BundleOutcome::NotOptedIn { .. } => {
+                serde_json::json!({ "outcome": "not_opted_in" })
+            }
+            BundleOutcome::NotEligible => serde_json::json!({ "outcome": "not_eligible" }),
+        }
+    } else {
+        serde_json::json!({ "outcome": "not_attempted" })
+    };
+
+    let final_decision = if classify_decision == "routable" {
+        serde_json::json!({ "decision": "routable", "class": classify_reason })
+    } else if bundled.get("outcome").and_then(Value::as_str) == Some("bundled") {
+        serde_json::json!({ "decision": "routable", "class": "review", "via": "bundle" })
+    } else {
+        let reason = bundled
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or(classify_reason.as_str());
+        serde_json::json!({ "decision": "local", "reason": reason })
+    };
+
+    out["bundle"] = bundled;
+    out["final"] = final_decision;
+    println!("{out}");
+    std::process::exit(0);
 }

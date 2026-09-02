@@ -274,6 +274,35 @@ pub fn consent_marker(session_key: &str) -> std::path::PathBuf {
     }
 }
 
+/// Whether this repo has already been told that bundled reviews exist, and
+/// record it if not. Once per repo: a nudge the user has declined once is
+/// noise, and noise on every spawn is how a hook gets uninstalled.
+///
+/// Best-effort. If the state file cannot be read or written the nudge is
+/// treated as already shown, so a broken state directory stays quiet rather
+/// than nagging on every spawn.
+pub fn bundle_nudge_seen(repo: &std::path::Path) -> bool {
+    let Some(dir) = state_dir() else {
+        return true;
+    };
+    let path = dir.join("bundle-nudged");
+    let key = repo.to_string_lossy().into_owned();
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if existing.lines().any(|l| l == key) {
+            return true;
+        }
+    }
+    use std::io::Write as _;
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return true;
+    };
+    writeln!(f, "{key}").is_err()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
