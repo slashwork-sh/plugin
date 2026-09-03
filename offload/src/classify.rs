@@ -215,6 +215,26 @@ pub(crate) fn local_context_reason(lp: &str) -> Option<String> {
     None
 }
 
+/// Machine-absolute paths only: filesystem roots, `~/`, a Windows drive. This
+/// is [`LOCAL_PATH`] without `./` and `../`, which the bundler deliberately
+/// produces when it rewrites a prompt to be repo-relative, so the broad check
+/// cannot be used to verify the bundler's own output.
+static ABSOLUTE_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(^|[^a-z])(/(users|home|var|etc|tmp|opt|usr|private|volumes|mnt|srv|root|library)/|~/|[a-z]:\\)",
+    )
+    .unwrap()
+});
+
+/// Whether text still names a path on this machine. The bundler runs this over
+/// the prompt it is about to send: a rewrite that missed something must not
+/// leave, and "it was going to be rewritten" is not evidence that it was.
+pub(crate) fn absolute_path_reason(lp: &str) -> Option<String> {
+    ABSOLUTE_PATH
+        .is_match(lp)
+        .then(|| "absolute path survived the rewrite".to_string())
+}
+
 /// The full secret scan (step 4): key families against the raw text, prose
 /// cues against the lowercased copy.
 pub(crate) fn secret_reason(raw: &str, lp: &str) -> Option<String> {

@@ -24,7 +24,7 @@
 //!
 //! Everything else falls through to the local spawn exactly as before.
 
-use crate::classify::secret_key_reason;
+use crate::classify::{absolute_path_reason, secret_key_reason};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,8 +58,41 @@ const DIFF_EXCLUDES: &[&str] = &[
 
 /// Review-shaped work, matched loosely on purpose: this gate only decides
 /// whether bundling is attempted, never whether a prompt is routable.
-static REVIEW_INTENT: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\b(review|critique|assess|evaluate)\b").unwrap());
+///
+/// Inflections count. A reviewer prompt assigns the role in the participle
+/// ("you are reviewing one task", "you are the task reviewer") far more often
+/// than it uses the bare stem, and `\breview\b` matches neither, so the shape
+/// this gate exists to catch was the shape it missed.
+static REVIEW_INTENT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(review(s|ed|er|ers|ing)?|critiqu(e|es|ed|ing)|assess(es|ed|ing|ment)?|evaluat(e|es|ed|ing|ion))\b")
+        .unwrap()
+});
+
+/// Work that CHANGES the repo, which is never bundle material however much
+/// review vocabulary it carries.
+///
+/// Review words are not evidence of a review. An implementation prompt
+/// routinely describes the review that will follow it ("a separate reviewer
+/// runs after you report", "this work must be reviewed first"), quotes a
+/// finding from an earlier one, or just names a component `review-dock`. On
+/// four weeks of real spawns the bare-vocabulary gate admitted 59 mutation
+/// tasks for every 108 it got right, and admitting one is the worst outcome
+/// this plugin has: the offloader asked for Task 3 to be implemented, the
+/// network answers with a written review, the hook substitutes it for the
+/// local spawn, and the work silently never happens.
+///
+/// So the role decides, not the vocabulary: an implementer is told what to
+/// change, a reviewer is told what to produce. This gate only ever REMOVES
+/// eligibility. A prompt it vetoes runs locally exactly as it did before
+/// bundling existed, which is why it is broad and the review gate stays narrow:
+/// a false veto costs the tokens that spawn always cost, a false admission
+/// costs the user their task.
+static MUTATION_ROLE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)\byou are (implementing|building|creating|writing|refactoring|restyling|migrating|applying|fixing|closing out|adding|updating|porting|wiring)\b|\byou are the [a-z-]* ?implementer\b|\byou are (running|applying) (the |a |single |scoped )*fix wave\b|\byour task is to (implement|add|fix|write|create|update|refactor|build)\b|\bimplement task \d|\bcommit your work\b|\bopen a (pr|pull request)\b|\bdo not create or switch branches\b",
+    )
+    .unwrap()
+});
 
 /// What bundling decided for one spawn.
 #[derive(Debug, PartialEq, Eq)]
@@ -72,6 +105,12 @@ pub enum BundleOutcome {
     /// Bundle material, but it must not leave (over cap, secret-bearing):
     /// run local and log this reason.
     Declined { reason: String },
+    /// Everything about this spawn qualifies except the repo's consent: it is
+    /// review work with material to ship, in a repo that has never opted in.
+    /// The hook says so once per repo, because the alternative is what shipped
+    /// first: a feature that is off by default, invisible when it declines, and
+    /// therefore enabled nowhere.
+    NotOptedIn { repo: PathBuf },
 }
 
 /// Run git in `cwd`, returning stdout only on success.
@@ -216,6 +255,167 @@ fn named_files(prompt: &str, root: &Path) -> Vec<(String, String, String)> {
     out
 }
 
+/// Trim a unified diff to `budget` bytes by dropping whole per-file sections.
+///
+/// A section runs from a `diff --git a/PATH b/PATH` line to the next one (or
+/// the end), and its path is the text after the final ` b/` on that header.
+/// Anything before the first header is a preamble, kept whenever it fits.
+///
+/// Sections are selected smallest first, so the result holds the greatest
+/// number of complete files, and are emitted in their original input order. A
+/// section is never emitted partially: half a hunk is worse than no hunk,
+/// because a reviewer cannot tell the difference between code that is absent
+/// and code that was cut. When anything is dropped the diff ends with a notice
+/// naming what went, so the reviewer knows the material is partial, and the
+/// whole string including that notice still fits `budget`.
+fn trim_diff(diff: &str, budget: usize) -> (String, Vec<String>) {
+    fn header_path(line: &str) -> String {
+        let header = line.trim_end_matches(['\n', '\r']);
+        if let Some((_, path)) = header.rsplit_once(" b/") {
+            return path.to_owned();
+        }
+        header.trim_start_matches("diff --git ").to_owned()
+    }
+
+    fn omission_notice(paths: &[String]) -> String {
+        format!(
+            "\n=== {} files omitted to fit the size limit: {} ===\n",
+            paths.len(),
+            paths.join(", ")
+        )
+    }
+
+    if diff.len() <= budget {
+        return (diff.to_owned(), Vec::new());
+    }
+
+    // `split_inclusive` keeps the terminators, so preamble and bodies
+    // concatenate back to the exact input and every boundary is a char boundary.
+    let mut preamble = String::new();
+    let mut paths: Vec<String> = Vec::new();
+    let mut bodies: Vec<String> = Vec::new();
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            paths.push(header_path(line));
+            bodies.push(line.to_owned());
+        } else if let Some(current) = bodies.last_mut() {
+            current.push_str(line);
+        } else {
+            preamble.push_str(line);
+        }
+    }
+
+    // No header anywhere: one anonymous section, already over budget.
+    if bodies.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    if preamble.len() > budget {
+        return (String::new(), paths);
+    }
+
+    // Smallest first; `sort_by_key` is stable, so ties keep input order.
+    let mut by_size: Vec<(usize, usize)> = bodies.iter().map(String::len).enumerate().collect();
+    by_size.sort_by_key(|&(_, len)| len);
+    let mut smallest_k = Vec::with_capacity(by_size.len() + 1);
+    smallest_k.push(0usize);
+    let mut running = 0usize;
+    for &(_, len) in &by_size {
+        running += len;
+        smallest_k.push(running);
+    }
+
+    // Keeping one more section costs bytes but shortens the notice, so
+    // feasibility is not monotone. Walk down from "keep everything" and take
+    // the first fit: the most whole files that can be kept.
+    for keep in (1..=by_size.len()).rev() {
+        let Some(&used) = smallest_k.get(keep) else {
+            continue;
+        };
+        let mut dropped_idx: Vec<usize> = by_size.iter().skip(keep).map(|&(i, _)| i).collect();
+        dropped_idx.sort_unstable();
+        let dropped: Vec<String> = dropped_idx
+            .iter()
+            .filter_map(|&i| paths.get(i).cloned())
+            .collect();
+        let notice = if dropped.is_empty() {
+            String::new()
+        } else {
+            omission_notice(&dropped)
+        };
+        let total = preamble.len() + used + notice.len();
+        if total > budget {
+            continue;
+        }
+        let mut kept_idx: Vec<usize> = by_size.iter().take(keep).map(|&(i, _)| i).collect();
+        kept_idx.sort_unstable();
+        let mut out = String::with_capacity(total);
+        out.push_str(&preamble);
+        for i in kept_idx {
+            if let Some(body) = bodies.get(i) {
+                out.push_str(body);
+            }
+        }
+        out.push_str(&notice);
+        return (out, dropped);
+    }
+    (String::new(), paths)
+}
+
+/// Every way the prompt might spell the repo root, longest first so a
+/// replacement never leaves a fragment of a longer form behind.
+///
+/// Windows is the reason this is a list: git reports forward slashes, the
+/// prompt uses backslashes, and canonicalizing adds a `\\?\` verbatim prefix.
+/// On Unix the three collapse to one entry.
+fn root_spellings(root: &Path) -> Vec<String> {
+    let base = root.display().to_string();
+    let mut forms = vec![
+        base.clone(),
+        base.replace('/', "\\"),
+        base.replace('\\', "/"),
+    ];
+    for stripped in [
+        base.strip_prefix("\\\\?\\").map(str::to_string),
+        root.canonicalize()
+            .ok()
+            .map(|c| c.display().to_string())
+            .and_then(|c| {
+                c.strip_prefix("\\\\?\\")
+                    .map_or(Some(c.clone()), |s| Some(s.to_string()))
+            }),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        forms.push(stripped.clone());
+        forms.push(stripped.replace('/', "\\"));
+        forms.push(stripped.replace('\\', "/"));
+    }
+    forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    forms.dedup();
+    forms.retain(|f| !f.is_empty());
+    forms
+}
+
+/// Assemble the bundle from a diff and the files the prompt named. Split out so
+/// the trim path re-assembles exactly what the first pass did.
+fn rebuild(
+    diff: &str,
+    files: &[(String, String, String)],
+    named_diff: Option<&(String, String)>,
+) -> String {
+    let mut bundle = String::from("=== diff ===\n");
+    bundle.push_str(diff);
+    for (_, rel, content) in files {
+        // The named diff became the material above; do not ship it twice.
+        if named_diff.is_some_and(|(r, _)| r == rel) {
+            continue;
+        }
+        let _ = write!(bundle, "\n=== file: {rel} ===\n{content}");
+    }
+    bundle
+}
+
 /// Try to turn a review spawn into a prompt + bundle pair. See the module docs
 /// for the eligibility rules; anything ineligible falls through untouched.
 #[must_use]
@@ -223,11 +423,22 @@ pub fn bundle_review(prompt: &str, cwd: &Path) -> BundleOutcome {
     let Some(root) = repo_root(cwd) else {
         return BundleOutcome::NotEligible;
     };
-    if !root.join(BUNDLE_MARKER).exists() {
+    // The veto runs first: a prompt that says both ("implement Task 3, a
+    // reviewer follows") is implementation work, and shipping it as a review
+    // would answer the wrong question.
+    if MUTATION_ROLE.is_match(prompt) || !REVIEW_INTENT.is_match(prompt) {
         return BundleOutcome::NotEligible;
     }
-    if !REVIEW_INTENT.is_match(&prompt.to_lowercase()) {
+    // The consent check comes after the shape checks, not before, so a repo
+    // that has not opted in can still be told that this spawn would have
+    // routed. Collecting the material to prove it costs a git call, so it
+    // happens only for a spawn that has already passed every other gate.
+    let opted_in = root.join(BUNDLE_MARKER).exists();
+    if !opted_in && material_diff(&root).is_none() {
         return BundleOutcome::NotEligible;
+    }
+    if !opted_in {
+        return BundleOutcome::NotOptedIn { repo: root };
     }
     let files = named_files(prompt, &root);
 
@@ -253,23 +464,27 @@ pub fn bundle_review(prompt: &str, cwd: &Path) -> BundleOutcome {
         material
     };
 
-    let mut bundle = String::from("=== diff ===\n");
-    bundle.push_str(&diff);
-    for (_, rel, content) in &files {
-        // The named diff became the material above; do not ship it twice.
-        if named_diff.as_ref().is_some_and(|(r, _)| r == rel) {
-            continue;
-        }
-        let _ = write!(bundle, "\n=== file: {rel} ===\n{content}");
-    }
+    let mut bundle = rebuild(&diff, &files, named_diff.as_ref());
+    // Over the cap, drop whole files from the diff until it fits rather than
+    // discarding the bundle. All-or-nothing threw away every review whose task
+    // happened to touch one large file, and on a branch carrying more than one
+    // task's work that was most of them. What survives is whole files plus a
+    // notice naming what went, so a partial review is visibly partial.
     if bundle.len() > BUNDLE_MAX_BYTES {
-        return BundleOutcome::Declined {
-            reason: format!(
-                "bundle over the {}KB cap ({} bytes)",
-                BUNDLE_MAX_BYTES / 1024,
-                bundle.len()
-            ),
-        };
+        let overhead = bundle.len() - diff.len();
+        let budget = BUNDLE_MAX_BYTES.saturating_sub(overhead);
+        let (trimmed, _dropped) = trim_diff(&diff, budget);
+        if trimmed.trim().is_empty() {
+            return BundleOutcome::Declined {
+                reason: format!(
+                    "bundle over the {}KB cap ({} bytes) and nothing whole fits",
+                    BUNDLE_MAX_BYTES / 1024,
+                    bundle.len()
+                ),
+            };
+        }
+        bundle = rebuild(&trimmed, &files, named_diff.as_ref());
+        debug_assert!(bundle.len() <= BUNDLE_MAX_BYTES);
     }
 
     // Named paths become repo-relative by exact-token replacement (so Windows
@@ -280,7 +495,25 @@ pub fn bundle_review(prompt: &str, cwd: &Path) -> BundleOutcome {
     for (token, rel, _) in &files {
         rewritten = rewritten.replace(token, &format!("./{rel}"));
     }
-    rewritten = rewritten.replace(&format!("{}/", root.display()), "./");
+    // Every spelling of the root, with and without a trailing separator.
+    //
+    // Only the `<root>/` form used to be replaced, so a prompt that says
+    // "in /Users/you/code/app (branch main)" or ends a sentence on the root
+    // kept the whole path, and every bundled review that ever routed carried
+    // the user's home directory and login name to a stranger's session. It is
+    // the commonest way a reviewer prompt names the repo.
+    //
+    // And on Windows the spelling the prompt uses is not the spelling git
+    // reports: `rev-parse --show-toplevel` answers `C:/Users/you/repo` while
+    // the prompt (and Claude Code) says `C:\Users\you\repo`, and a canonical
+    // path adds a `\\?\` verbatim prefix on top. Matching one form and not the
+    // others left the path in place, which after the check below means Windows
+    // gets no bundled reviews at all rather than a leak.
+    for root_form in root_spellings(&root) {
+        rewritten = rewritten.replace(&format!("{root_form}/"), "./");
+        rewritten = rewritten.replace(&format!("{root_form}\\"), "./");
+        rewritten = rewritten.replace(&root_form, ".");
+    }
 
     // Keys-only secret scan over everything that would leave. The prose
     // vocabulary stays prompt-classifier territory: a diff of an auth module
@@ -291,6 +524,14 @@ pub fn bundle_review(prompt: &str, cwd: &Path) -> BundleOutcome {
                 reason: format!("bundle carries a {what}"),
             };
         }
+    }
+
+    // Backstop on the bundler's own output. A path the rewrite could not reach
+    // (a file outside the repo, a directory that no longer exists, a form the
+    // replacement missed) must stop the send rather than ride along in it. The
+    // rewrite is best-effort; this is the guarantee.
+    if let Some(reason) = absolute_path_reason(&rewritten.to_lowercase()) {
+        return BundleOutcome::Declined { reason };
     }
 
     BundleOutcome::Bundled {
@@ -363,14 +604,103 @@ mod tests {
     const REVIEW_PROMPT: &str =
         "Review the changes on this branch for correctness and spec compliance.";
 
+    /// Without the marker nothing is bundled, but the outcome says why: the
+    /// repo has material and never opted in, which is the one decline the user
+    /// can act on.
     #[test]
     fn without_the_marker_nothing_is_bundled() {
         let dir = repo();
         fs::write(dir.path().join("src.rs"), "fn a() { b() }\n").unwrap();
+        match bundle_review(REVIEW_PROMPT, dir.path()) {
+            // Compared canonically: git reports the root with forward slashes
+            // and no verbatim prefix, which on Windows is a different string
+            // for the same directory.
+            BundleOutcome::NotOptedIn { repo } => assert_eq!(
+                repo.canonicalize().unwrap(),
+                dir.path().canonicalize().unwrap()
+            ),
+            other => panic!("expected NotOptedIn, got {other:?}"),
+        }
+    }
+
+    /// An un-opted-in repo with nothing to review stays silent: there is
+    /// nothing to offer, so there is nothing to nudge about.
+    #[test]
+    fn a_clean_un_opted_in_repo_is_not_a_nudge() {
+        let dir = repo();
         assert_eq!(
             bundle_review(REVIEW_PROMPT, dir.path()),
             BundleOutcome::NotEligible
         );
+    }
+
+    /// The veto still wins over the nudge: implementation work in an
+    /// un-opted-in repo must not advertise a feature that would answer it
+    /// with a review.
+    #[test]
+    fn implementation_work_never_nudges() {
+        let dir = repo();
+        fs::write(dir.path().join("src.rs"), "fn a() { b() }\n").unwrap();
+        assert_eq!(
+            bundle_review(
+                "You are implementing Task 3. A reviewer runs after you report.",
+                dir.path()
+            ),
+            BundleOutcome::NotEligible
+        );
+    }
+
+    /// The vocabulary test cannot separate these: an implementation prompt
+    /// routinely describes the review that will follow it. Sending one to the
+    /// network answers "implement Task 3" with a written review and the work
+    /// never happens, so the role has to decide, not the words.
+    #[test]
+    fn an_implementation_prompt_that_mentions_review_is_not_material() {
+        let dir = repo();
+        opt_in(dir.path());
+        fs::write(dir.path().join("src.rs"), "fn a() { b() }\n").unwrap();
+        assert_eq!(
+            bundle_review(
+                "You are implementing Task 3 of an 11-task plan. A review of Task 2 \
+                 found a gap. Do not dispatch subagents of your own, not helpers and \
+                 not a reviewer. A separate reviewer runs after you report.",
+                dir.path()
+            ),
+            BundleOutcome::NotEligible
+        );
+    }
+
+    #[test]
+    fn a_fix_wave_is_not_bundle_material() {
+        let dir = repo();
+        opt_in(dir.path());
+        fs::write(dir.path().join("src.rs"), "fn a() { b() }\n").unwrap();
+        assert_eq!(
+            bundle_review(
+                "You are fixing the findings from the final review of the \
+                 `cli-integration` branch. This is the last gate before merge.",
+                dir.path()
+            ),
+            BundleOutcome::NotEligible
+        );
+    }
+
+    /// The mirror image: a real review names the implementation it is reviewing,
+    /// and must still bundle.
+    #[test]
+    fn a_review_of_implementation_work_is_still_material() {
+        let dir = repo();
+        opt_in(dir.path());
+        fs::write(dir.path().join("src.rs"), "fn a() { changed() }\n").unwrap();
+        assert!(matches!(
+            bundle_review(
+                "You are reviewing one task of a 14-task implementation plan. \
+                 Produce two verdicts: spec compliance and task quality. \
+                 Do not modify any file.",
+                dir.path()
+            ),
+            BundleOutcome::Bundled { .. }
+        ));
     }
 
     #[test]
@@ -598,6 +928,39 @@ mod tests {
         }
     }
 
+    /// Over the cap, the bundle used to be thrown away whole, so a task with
+    /// one oversized file in it lost the review of every other file too. Keep
+    /// what fits and say what did not.
+    #[test]
+    fn trims_to_fit_instead_of_discarding_the_whole_bundle() {
+        let dir = repo();
+        opt_in(dir.path());
+        // Tracked, so the oversize lands in `git diff HEAD` rather than being
+        // filtered out as an untracked add.
+        fs::write(dir.path().join("huge.rs"), "seed\n").unwrap();
+        git(dir.path(), &["add", "huge.rs"]);
+        git(dir.path(), &["commit", "-q", "-m", "seed huge"]);
+        fs::write(dir.path().join("small_a.rs"), "fn a() { changed() }\n").unwrap();
+        fs::write(dir.path().join("small_b.rs"), "fn b() { changed() }\n").unwrap();
+        let mut huge = String::new();
+        for i in 0..(BUNDLE_MAX_BYTES / 8) {
+            let _ = writeln!(huge, "line {i}");
+        }
+        fs::write(dir.path().join("huge.rs"), huge).unwrap();
+        match bundle_review(REVIEW_PROMPT, dir.path()) {
+            BundleOutcome::Bundled { bundle, .. } => {
+                assert!(bundle.len() <= BUNDLE_MAX_BYTES, "len {}", bundle.len());
+                assert!(bundle.contains("small_a.rs"), "kept the small files");
+                assert!(bundle.contains("small_b.rs"), "kept the small files");
+                assert!(
+                    bundle.contains("omitted to fit the size limit: huge.rs"),
+                    "names what it dropped: {bundle}"
+                );
+            }
+            other => panic!("expected Bundled, got {other:?}"),
+        }
+    }
+
     #[test]
     fn declines_when_the_material_is_over_the_cap() {
         let dir = repo();
@@ -607,6 +970,70 @@ mod tests {
         match bundle_review(REVIEW_PROMPT, dir.path()) {
             BundleOutcome::Declined { reason } => {
                 assert!(reason.contains("cap"), "reason: {reason}");
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
+    }
+
+    /// Every bundled review that routed before this carried the user's home
+    /// directory to a stranger's session: only the `<root>/` form was
+    /// rewritten, and "in /Users/you/code/app (branch main)" has no trailing
+    /// slash.
+    #[test]
+    fn the_bare_repo_root_is_rewritten_too() {
+        let dir = repo();
+        opt_in(dir.path());
+        fs::write(dir.path().join("src.rs"), "fn a() { changed() }\n").unwrap();
+        let prompt = format!(
+            "Review the task diff. Working directory: {} (branch `main`). \
+             Report findings.",
+            dir.path().display()
+        );
+        match bundle_review(&prompt, dir.path()) {
+            BundleOutcome::Bundled { prompt, .. } => {
+                assert!(
+                    !prompt.contains(&dir.path().display().to_string()),
+                    "root survived: {prompt}"
+                );
+            }
+            other => panic!("expected Bundled, got {other:?}"),
+        }
+    }
+
+    /// Windows spells the root three ways and the rewrite has to catch all of
+    /// them: git reports `C:/Users/you/repo`, the prompt says
+    /// `C:\\Users\\you\\repo`, and canonicalizing adds a verbatim prefix.
+    /// Missing one leaves an absolute path in the prompt, which the check
+    /// below then declines, so a near miss costs Windows every bundled review
+    /// rather than leaking one.
+    #[test]
+    fn root_spellings_cover_both_separators_and_the_verbatim_prefix() {
+        let forms = root_spellings(Path::new(r"\\?\C:\Users\you\repo"));
+        assert!(
+            forms.contains(&r"C:\Users\you\repo".to_string()),
+            "{forms:?}"
+        );
+        assert!(
+            forms.contains(&"C:/Users/you/repo".to_string()),
+            "{forms:?}"
+        );
+        // Longest first, so replacing one never strands a fragment of another.
+        let lengths: Vec<usize> = forms.iter().map(String::len).collect();
+        assert!(lengths.windows(2).all(|w| w[0] >= w[1]), "{forms:?}");
+    }
+
+    /// A path the rewrite cannot reach must stop the send, not ride along.
+    #[test]
+    fn an_unrewritable_absolute_path_declines() {
+        let dir = repo();
+        opt_in(dir.path());
+        fs::write(dir.path().join("src.rs"), "fn a() { changed() }\n").unwrap();
+        match bundle_review(
+            "Review the task diff against the brief at /Users/someone/elsewhere/brief.md.",
+            dir.path(),
+        ) {
+            BundleOutcome::Declined { reason } => {
+                assert!(reason.contains("survived the rewrite"), "reason: {reason}");
             }
             other => panic!("expected Declined, got {other:?}"),
         }
