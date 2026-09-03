@@ -12,7 +12,7 @@
 # falls back to a local spawn.
 set -u
 
-VERSION="offload-v0.6.4"
+VERSION="offload-v0.6.5"
 REPO="slashwork-sh/plugin"
 BIN_DIR="${HOME}/.slashwork/bin"
 MARKER="${BIN_DIR}/.version"
