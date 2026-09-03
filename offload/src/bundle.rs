@@ -24,7 +24,7 @@
 //!
 //! Everything else falls through to the local spawn exactly as before.
 
-use crate::classify::secret_key_reason;
+use crate::classify::{absolute_path_reason, secret_key_reason};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -361,6 +361,42 @@ fn trim_diff(diff: &str, budget: usize) -> (String, Vec<String>) {
     (String::new(), paths)
 }
 
+/// Every way the prompt might spell the repo root, longest first so a
+/// replacement never leaves a fragment of a longer form behind.
+///
+/// Windows is the reason this is a list: git reports forward slashes, the
+/// prompt uses backslashes, and canonicalizing adds a `\\?\` verbatim prefix.
+/// On Unix the three collapse to one entry.
+fn root_spellings(root: &Path) -> Vec<String> {
+    let base = root.display().to_string();
+    let mut forms = vec![
+        base.clone(),
+        base.replace('/', "\\"),
+        base.replace('\\', "/"),
+    ];
+    for stripped in [
+        base.strip_prefix("\\\\?\\").map(str::to_string),
+        root.canonicalize()
+            .ok()
+            .map(|c| c.display().to_string())
+            .and_then(|c| {
+                c.strip_prefix("\\\\?\\")
+                    .map_or(Some(c.clone()), |s| Some(s.to_string()))
+            }),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        forms.push(stripped.clone());
+        forms.push(stripped.replace('/', "\\"));
+        forms.push(stripped.replace('\\', "/"));
+    }
+    forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    forms.dedup();
+    forms.retain(|f| !f.is_empty());
+    forms
+}
+
 /// Assemble the bundle from a diff and the files the prompt named. Split out so
 /// the trim path re-assembles exactly what the first pass did.
 fn rebuild(
@@ -459,7 +495,25 @@ pub fn bundle_review(prompt: &str, cwd: &Path) -> BundleOutcome {
     for (token, rel, _) in &files {
         rewritten = rewritten.replace(token, &format!("./{rel}"));
     }
-    rewritten = rewritten.replace(&format!("{}/", root.display()), "./");
+    // Every spelling of the root, with and without a trailing separator.
+    //
+    // Only the `<root>/` form used to be replaced, so a prompt that says
+    // "in /Users/you/code/app (branch main)" or ends a sentence on the root
+    // kept the whole path, and every bundled review that ever routed carried
+    // the user's home directory and login name to a stranger's session. It is
+    // the commonest way a reviewer prompt names the repo.
+    //
+    // And on Windows the spelling the prompt uses is not the spelling git
+    // reports: `rev-parse --show-toplevel` answers `C:/Users/you/repo` while
+    // the prompt (and Claude Code) says `C:\Users\you\repo`, and a canonical
+    // path adds a `\\?\` verbatim prefix on top. Matching one form and not the
+    // others left the path in place, which after the check below means Windows
+    // gets no bundled reviews at all rather than a leak.
+    for root_form in root_spellings(&root) {
+        rewritten = rewritten.replace(&format!("{root_form}/"), "./");
+        rewritten = rewritten.replace(&format!("{root_form}\\"), "./");
+        rewritten = rewritten.replace(&root_form, ".");
+    }
 
     // Keys-only secret scan over everything that would leave. The prose
     // vocabulary stays prompt-classifier territory: a diff of an auth module
@@ -470,6 +524,14 @@ pub fn bundle_review(prompt: &str, cwd: &Path) -> BundleOutcome {
                 reason: format!("bundle carries a {what}"),
             };
         }
+    }
+
+    // Backstop on the bundler's own output. A path the rewrite could not reach
+    // (a file outside the repo, a directory that no longer exists, a form the
+    // replacement missed) must stop the send rather than ride along in it. The
+    // rewrite is best-effort; this is the guarantee.
+    if let Some(reason) = absolute_path_reason(&rewritten.to_lowercase()) {
+        return BundleOutcome::Declined { reason };
     }
 
     BundleOutcome::Bundled {
@@ -550,7 +612,13 @@ mod tests {
         let dir = repo();
         fs::write(dir.path().join("src.rs"), "fn a() { b() }\n").unwrap();
         match bundle_review(REVIEW_PROMPT, dir.path()) {
-            BundleOutcome::NotOptedIn { repo } => assert_eq!(repo, dir.path()),
+            // Compared canonically: git reports the root with forward slashes
+            // and no verbatim prefix, which on Windows is a different string
+            // for the same directory.
+            BundleOutcome::NotOptedIn { repo } => assert_eq!(
+                repo.canonicalize().unwrap(),
+                dir.path().canonicalize().unwrap()
+            ),
             other => panic!("expected NotOptedIn, got {other:?}"),
         }
     }
@@ -902,6 +970,70 @@ mod tests {
         match bundle_review(REVIEW_PROMPT, dir.path()) {
             BundleOutcome::Declined { reason } => {
                 assert!(reason.contains("cap"), "reason: {reason}");
+            }
+            other => panic!("expected Declined, got {other:?}"),
+        }
+    }
+
+    /// Every bundled review that routed before this carried the user's home
+    /// directory to a stranger's session: only the `<root>/` form was
+    /// rewritten, and "in /Users/you/code/app (branch main)" has no trailing
+    /// slash.
+    #[test]
+    fn the_bare_repo_root_is_rewritten_too() {
+        let dir = repo();
+        opt_in(dir.path());
+        fs::write(dir.path().join("src.rs"), "fn a() { changed() }\n").unwrap();
+        let prompt = format!(
+            "Review the task diff. Working directory: {} (branch `main`). \
+             Report findings.",
+            dir.path().display()
+        );
+        match bundle_review(&prompt, dir.path()) {
+            BundleOutcome::Bundled { prompt, .. } => {
+                assert!(
+                    !prompt.contains(&dir.path().display().to_string()),
+                    "root survived: {prompt}"
+                );
+            }
+            other => panic!("expected Bundled, got {other:?}"),
+        }
+    }
+
+    /// Windows spells the root three ways and the rewrite has to catch all of
+    /// them: git reports `C:/Users/you/repo`, the prompt says
+    /// `C:\\Users\\you\\repo`, and canonicalizing adds a verbatim prefix.
+    /// Missing one leaves an absolute path in the prompt, which the check
+    /// below then declines, so a near miss costs Windows every bundled review
+    /// rather than leaking one.
+    #[test]
+    fn root_spellings_cover_both_separators_and_the_verbatim_prefix() {
+        let forms = root_spellings(Path::new(r"\\?\C:\Users\you\repo"));
+        assert!(
+            forms.contains(&r"C:\Users\you\repo".to_string()),
+            "{forms:?}"
+        );
+        assert!(
+            forms.contains(&"C:/Users/you/repo".to_string()),
+            "{forms:?}"
+        );
+        // Longest first, so replacing one never strands a fragment of another.
+        let lengths: Vec<usize> = forms.iter().map(String::len).collect();
+        assert!(lengths.windows(2).all(|w| w[0] >= w[1]), "{forms:?}");
+    }
+
+    /// A path the rewrite cannot reach must stop the send, not ride along.
+    #[test]
+    fn an_unrewritable_absolute_path_declines() {
+        let dir = repo();
+        opt_in(dir.path());
+        fs::write(dir.path().join("src.rs"), "fn a() { changed() }\n").unwrap();
+        match bundle_review(
+            "Review the task diff against the brief at /Users/someone/elsewhere/brief.md.",
+            dir.path(),
+        ) {
+            BundleOutcome::Declined { reason } => {
+                assert!(reason.contains("survived the rewrite"), "reason: {reason}");
             }
             other => panic!("expected Declined, got {other:?}"),
         }

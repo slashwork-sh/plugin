@@ -281,7 +281,10 @@ pub fn consent_marker(session_key: &str) -> std::path::PathBuf {
 /// Best-effort. If the state file cannot be read or written the nudge is
 /// treated as already shown, so a broken state directory stays quiet rather
 /// than nagging on every spawn.
+#[must_use]
 pub fn bundle_nudge_seen(repo: &std::path::Path) -> bool {
+    use std::io::Write as _;
+
     let Some(dir) = state_dir() else {
         return true;
     };
@@ -292,7 +295,6 @@ pub fn bundle_nudge_seen(repo: &std::path::Path) -> bool {
             return true;
         }
     }
-    use std::io::Write as _;
     let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

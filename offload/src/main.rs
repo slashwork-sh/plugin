@@ -793,8 +793,13 @@ fn cmd_plan() -> ! {
         && !is_offload_agent(env.tool_input.subagent_type.as_deref())
     {
         match bundle_review(&prompt, &cwd) {
-            BundleOutcome::Bundled { bundle, .. } => serde_json::json!({
+            // The rewritten prompt is what actually leaves, so report it: the
+            // safety check that matters is whether the rewrite removed the
+            // paths, and checking the original prompt can only ever say "yes,
+            // it had paths", which is why it was bundled.
+            BundleOutcome::Bundled { bundle, prompt } => serde_json::json!({
                 "outcome": "bundled", "class": "review", "bundle_bytes": bundle.len(),
+                "sent_prompt": prompt,
             }),
             BundleOutcome::Declined { reason } => {
                 serde_json::json!({ "outcome": "declined", "reason": reason })
