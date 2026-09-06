@@ -141,12 +141,30 @@ printf '%s' "$TOKENS" | grep -qE '^[0-9]+$' || TOKENS=0
 BODYJSON=$(jq -nc --arg a "$ARTIFACT" --argjson t "$TOKENS" '{artifact: $a, tokens_used: $t}')
 
 OUT="/tmp/slashwork-submit-${SESSION_ID}-${ID}.out"
-CODE=$(printf '%s' "$BODYJSON" \
-  | curl -sS --max-time 30 -o "$OUT" -w '%{http_code}' \
-      -X POST "$URL" \
-      -H "authorization: Bearer $TOKEN" \
-      -H 'content-type: application/json' \
-      --data-binary @- || echo "000")
+
+# The token goes to curl on stdin, not in argv. `-H "authorization: Bearer
+# $TOKEN"` is readable by every user on the machine via `ps` for the life of
+# the request. stdin is already spoken for by the artifact body, so the body
+# moves to a private temp file and the header takes stdin instead.
+BODYFILE=$(mktemp "/tmp/slashwork-submit-body-${SESSION_ID}-XXXXXX") || BODYFILE=""
+if [ -n "$BODYFILE" ]; then
+  chmod 600 "$BODYFILE" 2>/dev/null
+  printf '%s' "$BODYJSON" > "$BODYFILE"
+  CODE=$(printf 'header = "authorization: Bearer %s"\n' "$TOKEN" \
+    | curl -sS --config - --max-time 30 -o "$OUT" -w '%{http_code}' \
+        -X POST "$URL" \
+        -H 'content-type: application/json' \
+        --data-binary "@$BODYFILE" || echo "000")
+  rm -f "$BODYFILE"
+else
+  # No temp file available: still keep the token off argv, and send the body
+  # inline rather than failing the submission outright.
+  CODE=$(printf 'header = "authorization: Bearer %s"\n' "$TOKEN" \
+    | curl -sS --config - --max-time 30 -o "$OUT" -w '%{http_code}' \
+        -X POST "$URL" \
+        -H 'content-type: application/json' \
+        --data-binary "$BODYJSON" || echo "000")
+fi
 
 echo "slashwork: submit task $ID -> HTTP $CODE" >&2
 FAIL_MARKER="/tmp/slashwork-submit-fail-${SESSION_ID}.json"
