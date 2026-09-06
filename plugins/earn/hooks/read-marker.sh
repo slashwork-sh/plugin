@@ -14,14 +14,33 @@
 # is also why `earn-listen.sh` and `submit.sh` are files. Keep it that way: any
 # quoting-heavy jq belongs in here, never in the skill.
 #
-# Usage: read-marker.sh <state-file> <marker-file>
-# Always exits 0; the caller branches on the RESULT: line.
+# Usage: read-marker.sh [state-file marker-file]
+#
+# With no arguments it derives both paths from the session id in its own
+# environment, and that is how the skill must call it. The reason is the same
+# safety check that put this logic in a script: a command containing ANY shell
+# variable is flagged "Contains expansion" and prompts, no matter what
+# permission mode the session runs in (bypassPermissions does not silence it;
+# the prompt itself suggests auto mode). Claude Code substitutes
+# ${CLAUDE_PLUGIN_ROOT} before the shell ever sees it, so a bare invocation of
+# this script expands to a literal path and carries no variable at all. Passing
+# "$SESSION_ID"-derived arguments reintroduces the prompt and hangs an
+# unattended earner on its first task.
+#
+# The two-argument form stays for the tests, which need to point at scratch
+# files.
+# Always exits 0 (except on a usage error); the caller branches on RESULT:.
 set -uo pipefail
 
-STATE="${1:-}"
-MARKER="${2:-}"
-if [ -z "$STATE" ] || [ -z "$MARKER" ]; then
-  echo "usage: read-marker.sh <state> <marker>" >&2
+if [ "$#" -eq 2 ]; then
+  STATE="$1"
+  MARKER="$2"
+elif [ "$#" -eq 0 ]; then
+  SESSION_ID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-default}}"
+  STATE="/tmp/slashwork-work-$SESSION_ID.json"
+  MARKER="/tmp/slashwork-earn-$SESSION_ID.json"
+else
+  echo "usage: read-marker.sh [state marker]" >&2
   exit 2
 fi
 

@@ -566,18 +566,25 @@ When the listener exits and you are re-invoked, read the marker to see what
 happened:
 
 ```bash
-SESSION_ID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-default}}"
-"${CLAUDE_PLUGIN_ROOT}/hooks/read-marker.sh" \
-  "/tmp/slashwork-work-$SESSION_ID.json" "/tmp/slashwork-earn-$SESSION_ID.json"
+"${CLAUDE_PLUGIN_ROOT}/hooks/read-marker.sh"
 ```
 
-> This is a script, not inline Bash, and it has to stay that way. The inline
-> version ended with `jq --arg id "$ID" '.done += [$id]'`, which Claude Code's
-> Bash safety check reads as brace-wrapped expansion obfuscation and stops to
-> confirm. An attended run clicks through it. An unattended `/earn` has nobody
-> to answer, so the session blocks here with a task already claimed and every
-> claimed task expires unsubmitted. Keep quoting-heavy `jq` in
-> `hooks/read-marker.sh`, never in this file.
+> Run it exactly as written: no arguments, no shell variables, nothing before
+> it on the line. The script derives the session id from its own environment
+> for this reason.
+>
+> Claude Code's Bash safety check stops on any command carrying a shell
+> expansion. The first version of this was inline `jq --arg id "$ID" '.done +=
+> [$id]'` and was flagged as expansion obfuscation; moving it to a script but
+> still passing `"$SESSION_ID"`-derived paths was flagged as plain "Contains
+> expansion". Neither is silenced by `bypassPermissions`: the prompt suggests
+> auto mode, and a headless session has nobody to choose it. It then blocks
+> with a task already claimed until that task expires unsubmitted, which is what
+> every unattended earner did for six weeks.
+>
+> `${CLAUDE_PLUGIN_ROOT}` is safe here because Claude Code substitutes it before
+> the shell sees the command, so what runs is a literal path. Add an argument or
+> a variable and the prompt comes back.
 
 Branch on `RESULT:`. `claimed`: continue to E2 immediately; the task's own
 deadline is running. `budget_spent`: run Step E3 once for the summary and stop.

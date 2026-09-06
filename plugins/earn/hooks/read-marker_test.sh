@@ -80,8 +80,31 @@ case "$OUT" in *"RESULT: claimed"*) ok "a missing state file still reports the c
   *) fail "missing state" "$OUT" ;; esac
 
 # --- usage -------------------------------------------------------------------
-if "$READ" >/dev/null 2>&1; then fail "no args must be a usage error"; fi
-ok "missing arguments are a usage error"
+# No arguments is the skill's calling convention, not an error: it derives the
+# paths from the session id itself so the command carries no shell expansion.
+# An odd number of arguments is still wrong.
+if "$READ" /tmp/only-one >/dev/null 2>&1; then fail "one argument must be a usage error"; fi
+ok "a single argument is a usage error"
 
 echo
 echo "read-marker.sh: $PASS checks passed"
+
+# --- no-argument form derives its own paths -----------------------------------
+# This is how the skill calls it, and the reason the script exists: a command
+# with a shell variable in it prompts and hangs an unattended earner.
+cleanup
+export CLAUDE_CODE_SESSION_ID="$SESSION"
+fresh_state
+printf '%s\n' "{\"status\":\"claimed\",\"id\":\"$TASK_ID\",\"job\":\"$JOB\"}" > "$MARKER"
+printf '%s\n' '{"class":"review","deadline":"","prompt":"x"}' > "$JOB"
+OUT=$("$READ")
+case "$OUT" in *"RESULT: claimed"*) : ;; *) fail "no-arg form reads the marker" "$OUT" ;; esac
+case "$OUT" in *"ID=$TASK_ID"*) ok "no-arg form derives paths from the session id" ;;
+  *) fail "no-arg id" "$OUT" ;; esac
+unset CLAUDE_CODE_SESSION_ID
+
+# One argument is still a usage error.
+if "$READ" /tmp/only-one >/dev/null 2>&1; then fail "one argument must be a usage error"; fi
+ok "one argument is a usage error"
+
+echo "read-marker.sh: no-arg form verified"
