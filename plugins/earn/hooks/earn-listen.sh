@@ -21,9 +21,21 @@
 # Token: SLASHWORK_TOKEN, else ~/.slashwork/token.
 set -uo pipefail
 
-STATE="${1:-}"
-MARKER="${2:-}"
-if [ -z "$STATE" ] || [ -z "$MARKER" ]; then echo "usage: earn-listen.sh <state> <marker>" >&2; exit 2; fi
+# With no arguments both paths are derived from the session id in this
+# script's own environment, which is how the skill launches it: a command
+# carrying a shell variable is flagged "Contains expansion" and prompts, and an
+# unattended earner has nobody to answer. The two-argument form stays for the
+# tests. See read-marker.sh for the full account.
+if [ "$#" -eq 2 ]; then
+  STATE="$1"
+  MARKER="$2"
+elif [ "$#" -eq 0 ]; then
+  _sid="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-default}}"
+  STATE="/tmp/slashwork-work-$_sid.json"
+  MARKER="/tmp/slashwork-earn-$_sid.json"
+else
+  echo "usage: earn-listen.sh [state marker]" >&2; exit 2
+fi
 
 write_marker() { printf '%s\n' "$1" > "$MARKER"; }
 
