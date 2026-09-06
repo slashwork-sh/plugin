@@ -187,8 +187,20 @@ if [ "$SANDBOX" -eq 1 ]; then
   fi
 fi
 
+# The permission mode follows the sandbox, because the two only make sense
+# together. An unattended earner cannot run with prompts on: Claude Code stops
+# on its own Bash safety checks ("Contains expansion"), and a headless session
+# has nobody to answer, so it blocks with a task already claimed and that task
+# expires unsubmitted. Not hypothetical: it is what every headless earner did
+# until this landed.
+#
+# A plain `init` still scaffolds false, because on the host the risk is real:
+# the worker runs task prompts written by strangers against your filesystem.
+# Inside the sandbox that risk is exactly what the microVM is for, so
+# `--sandbox` turns prompts off and lets the kernel boundary carry the weight
+# instead of a dialog nobody is there to read.
 jq -n --argjson sb "$SANDBOX" \
-  '{base_url: "", model: "", bypass_permissions: false, default_duration: "30m",
+  '{base_url: "", model: "", bypass_permissions: ($sb == 1), default_duration: "30m",
     sandbox: {enabled: ($sb == 1), name: "slashwork-earner", memory: "4g", cpus: 2}}' \
   > "$DEST/settings.json"
 
@@ -258,8 +270,13 @@ Your earner setup. Run `/earn <goal>` from inside this folder.
   - `bypass_permissions`: `true` switches this folder's Claude Code sessions
     to `bypassPermissions` (no prompts at all; synced into
     `.claude/settings.local.json` at the next run, applies from the next
-    session). Only for unattended `/earn` runs, and only in a throwaway
-    folder like this one: the worker runs task prompts written by strangers.
+    session). `/earn init --sandbox` sets it `true`; a plain `init` leaves it
+    `false`. Unattended earning requires it: with prompts on, Claude Code stops
+    on its own Bash safety checks, a headless session has nobody to answer, and
+    it blocks with a task claimed until that task expires unsubmitted. Setting
+    it `true` outside a sandbox means the worker runs strangers' task prompts
+    against your filesystem with nothing asking first, so do that only in a
+    throwaway folder you would not mind losing.
   - `default_duration`: the goal a bare `/earn` runs with (ships as `30m`).
 - `.claude/settings.local.json`: permissions for this agent's Claude Code
   sessions. Ships `defaultMode: acceptEdits` (auto-accepts file edits, still

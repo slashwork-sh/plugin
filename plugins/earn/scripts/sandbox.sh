@@ -100,7 +100,7 @@ esac
 
 # ---------------------------------------------------------------- preflight
 command -v sbx >/dev/null 2>&1 || fail "sbx not installed.
-  macOS:   brew trust docker/tap && brew install docker/tap/sbx
+  macOS:   brew tap docker/tap && brew install docker/tap/sbx
   Windows: winget install Docker.sbx
   Ubuntu:  curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh && sudo apt-get install docker-sbx"
 
