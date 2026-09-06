@@ -546,19 +546,14 @@ and burning nothing, which is the point.
 > this round's listener writes.
 
 ```bash
-SESSION_ID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-default}}"
-rm -f "/tmp/slashwork-earn-$SESSION_ID.json"
-echo "marker cleared; launching listener"
+"${CLAUDE_PLUGIN_ROOT}/hooks/clear-marker.sh"
 ```
 
 > Then launch the listener with the Bash tool and `run_in_background: true`. It
 > returns immediately and holds the SSE queue feed in the background.
 
 ```bash
-SESSION_ID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-default}}"
-STATE="/tmp/slashwork-work-$SESSION_ID.json"
-MARKER="/tmp/slashwork-earn-$SESSION_ID.json"
-"${CLAUDE_PLUGIN_ROOT}/hooks/earn-listen.sh" "$STATE" "$MARKER"
+"${CLAUDE_PLUGIN_ROOT}/hooks/earn-listen.sh"
 ```
 
 After launching it, tell the user you are waiting for a task and end the turn.
@@ -626,51 +621,7 @@ the job staged for this (session, task) pair.
 ### Step E3: goal check
 
 ```bash
-SESSION_ID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-default}}"
-STATE="/tmp/slashwork-work-$SESSION_ID.json"
-TOKEN="${SLASHWORK_TOKEN:-}"
-if [ -z "$TOKEN" ] && [ -f "$HOME/.slashwork/token" ]; then
-  TOKEN=$(cat "$HOME/.slashwork/token")
-fi
-
-BASE=$(jq -r .base "$STATE")
-GMODE=$(jq -r .gmode "$STATE")
-START=$(jq -r .start "$STATE")
-DEADLINE=$(jq -r .deadline "$STATE")
-TARGET_CREDITS=$(jq -r .target_credits "$STATE")
-BASELINE=$(jq -r .baseline_credits "$STATE")
-ROUNDS=$(jq '.done | length' "$STATE")
-
-# Surface a failed submit and clean up after it. The SubagentStop hook writes
-# this marker when the artifact POST did not return 201, and it leaves the staged
-# job in place. It cannot retry on its own (the worker has already stopped and its
-# final message is gone), so this loop owns the cleanup: report the loss once,
-# drop the stale staged job so it does not accumulate across rounds, then clear
-# the marker so the loop keeps going.
-FAIL_MARKER="/tmp/slashwork-submit-fail-$SESSION_ID.json"
-if [ -f "$FAIL_MARKER" ]; then
-  echo "SUBMIT_FAILED: $(jq -c '{id, code}' "$FAIL_MARKER" 2>/dev/null)"
-  FAIL_ID=$(jq -r '.id // empty' "$FAIL_MARKER" 2>/dev/null)
-  [ -n "$FAIL_ID" ] && rm -f "/tmp/slashwork-job-$SESSION_ID-$FAIL_ID.json"
-  rm -f "$FAIL_MARKER"
-fi
-
-NOW=$(date +%s)
-if [ "$GMODE" = "time" ]; then
-  if [ "$((DEADLINE - NOW))" -le 0 ]; then
-    echo "GOAL: done"; echo "earned window closed: ran $ROUNDS task(s) in $((NOW - START))s"; exit 0
-  fi
-  echo "GOAL: continue"; echo "tasks=$ROUNDS elapsed=$((NOW - START))s remaining=$((DEADLINE - NOW))s"
-else
-  CUR=$(curl -sS --max-time 20 -H "authorization: Bearer $TOKEN" "$BASE/api/me" \
-    | jq -r '.credits // 0' 2>/dev/null)
-  printf '%s' "$CUR" | grep -qE '^-?[0-9]+$' || CUR=$BASELINE
-  GAINED=$((CUR - BASELINE))
-  if [ "$GAINED" -ge "$TARGET_CREDITS" ]; then
-    echo "GOAL: done"; echo "earned +$GAINED credits over $ROUNDS task(s)"; exit 0
-  fi
-  echo "GOAL: continue"; echo "tasks=$ROUNDS credits_gained=$GAINED/$TARGET_CREDITS"
-fi
+"${CLAUDE_PLUGIN_ROOT}/hooks/goal-check.sh"
 ```
 
 Loop control:

@@ -26,6 +26,8 @@ jobs:
         run: bash plugins/earn/hooks/earn-listen_test.sh
       - name: Earn marker reader
         run: bash plugins/earn/hooks/read-marker_test.sh
+      - name: Earn goal check and marker clear
+        run: bash plugins/earn/hooks/goal-check_test.sh
       - name: Earner sandbox launcher test
         run: bash plugins/earn/scripts/sandbox_test.sh
       - name: Validate marketplace and plugin manifests
