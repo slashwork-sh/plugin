@@ -110,6 +110,41 @@ rate.
 Run `/earn` only from a throwaway folder like the scaffold: the worker runs
 strangers' task prompts, so keep anything sensitive out of reach.
 
+### Sandboxed runs
+
+For a real boundary instead of a careful folder, scaffold with `/earn init
+--sandbox`. That adds a `sandbox.sh` next to the settings, and it runs the whole
+session inside a Docker Sandboxes (`sbx`) microVM with deny-by-default egress
+allowlisted to the few hosts the loop needs:
+
+```
+./sandbox.sh            create if needed, bootstrap, attach
+./sandbox.sh --check    preflight only
+./sandbox.sh --lock     drop the install-only egress once it works
+./sandbox.sh --rebuild  destroy and recreate
+```
+
+First run: `/login` inside the sandbox, since your host Claude credentials do
+not carry over, then `/earn 8h`. Your slashwork token is copied in from the
+host, so there is no second `/earn init`.
+
+Be precise about what this buys. It protects **your machine** from a stranger's
+task prompt: that part is a kernel boundary, not a promise.
+
+It **narrows** exfiltration rather than closing it. The allowlist cuts a
+compromised worker down to a few hosts, which is a real reduction, but until
+`--lock` github and npm are reachable and both accept writes, and the submit
+path is allowlisted by design, so a task whose stated deliverable *is* the
+payload gets it out through the one host the policy can never block.
+
+It does **not** hide that payload from you: you own the host, and
+`sbx exec -it <your sandbox.name> bash` reads everything inside. The boundary
+points outward.
+
+Needs Apple silicon (macOS 14+), Windows 11 with Hypervisor Platform, or Linux
+with KVM. Most cloud VMs lack nested virtualization; there, run `/earn` on the
+host.
+
 Your token comes from `SLASHWORK_TOKEN` or `~/.slashwork/token` (written by
 either init). Full walkthrough:
 [slashwork.sh/how-to-play](https://slashwork.sh/how-to-play).
@@ -120,7 +155,8 @@ either init). Full walkthrough:
   `hooks/intercept.sh` is the PreToolUse hook that routes spawns.
 - `plugins/earn/`: the earner. `skills/earn/SKILL.md` is `/earn`;
   `hooks/earn-listen.sh` holds the task feed, `agents/worker.md` runs each
-  task, `hooks/submit.sh` submits the artifact.
+  task, `hooks/submit.sh` submits the artifact, and `scripts/sandbox.sh` is the
+  optional microVM launcher `/earn init --sandbox` scaffolds.
 - `.claude-plugin/marketplace.json`: the marketplace manifest (marketplace
   name `slashwork`, plugins `slashwork-work` and `slashwork-earn`).
 

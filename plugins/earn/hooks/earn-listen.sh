@@ -71,13 +71,25 @@ BACKOFF_BASE=2
 BACKOFF_MAX=30
 backoff=$BACKOFF_BASE
 
+# The auth header, fed to curl on stdin rather than as an argument.
+#
+# `-H "authorization: Bearer $TOKEN"` puts the token in the process's argv,
+# where every user on the machine can read it out of `ps`. On this listener
+# that is not a brief window: the SSE curl holds one connection for up to
+# CHUNK_CAP seconds, so the credential sits in the process table continuously
+# for as long as the earner runs. Observed in the wild on a shared box.
+#
+# `--config -` reads the same header off stdin, so it never reaches argv and
+# never touches disk either (a mode-600 temp file would still be a file).
+auth_config() { printf 'header = "authorization: Bearer %s"\n' "$TOKEN"; }
+
 # One cheap auth+reachability probe. Echoes the HTTP status of GET /api/me
 # (000 when unreachable). Fast and returns immediately (unlike the SSE stream),
 # so it fails a dead token fast and detects a down server without opening the
 # expensive stream.
 probe() {
-  curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
-    -H "authorization: Bearer $TOKEN" "$BASE/api/me" 2>/dev/null || echo 000
+  auth_config | curl -sS --config - -o /dev/null -w '%{http_code}' --max-time 10 \
+    "$BASE/api/me" 2>/dev/null || echo 000
 }
 
 # Reconnect until a task is claimed or the budget runs out. Each iteration first
@@ -121,8 +133,8 @@ while :; do
         DATA=${line#data:}; DATA=${DATA# }
         TID=$(printf '%s' "$DATA" | jq -r '.id // empty' 2>/dev/null)
         printf '%s' "$TID" | grep -qE '^[0-9a-fA-F-]{36}$' || continue
-        R=$(curl -sS --max-time 20 -w $'\n%{http_code}' -X POST "$BASE/api/tasks/$TID/claim" \
-          -H "authorization: Bearer $TOKEN" 2>/dev/null)
+        R=$(auth_config | curl -sS --config - --max-time 20 -w $'\n%{http_code}' \
+          -X POST "$BASE/api/tasks/$TID/claim" 2>/dev/null)
         CODE=$(printf '%s' "$R" | tail -n1)
         BODY=$(printf '%s' "$R" | sed '$d')
         case "$CODE" in
@@ -143,7 +155,7 @@ while :; do
         esac
         ;;
     esac
-  done < <(curl -sN --max-time "$CHUNK" -H "authorization: Bearer $TOKEN" \
+  done < <(auth_config | curl -sN --config - --max-time "$CHUNK" \
             "$BASE/api/queue/stream" 2>/dev/null)
 
   # Connection ended with no claim. A long-lived connection was healthy: reset
