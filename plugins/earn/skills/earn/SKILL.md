@@ -453,23 +453,17 @@ happened:
 
 ```bash
 SESSION_ID="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-default}}"
-MARKER="/tmp/slashwork-earn-$SESSION_ID.json"
-STATE="/tmp/slashwork-work-$SESSION_ID.json"
-[ -f "$MARKER" ] || { echo "RESULT: no_marker"; exit 0; }
-STATUS=$(jq -r '.status // "error"' "$MARKER")
-case "$STATUS" in
-  claimed)
-    ID=$(jq -r '.id' "$MARKER"); JOB=$(jq -r '.job' "$MARKER")
-    tmp=$(mktemp); jq --arg id "$ID" '.done += [$id]' "$STATE" > "$tmp" && mv "$tmp" "$STATE"
-    echo "RESULT: claimed"; echo "ID=$ID"; echo "JOB=$JOB"
-    echo "CLASS=$(jq -r '.class // "?"' "$JOB")"
-    echo "TASK_DEADLINE=$(jq -r '.deadline // ""' "$JOB")"
-    echo "MODEL=$(jq -r '.model // ""' "$STATE")" ;;
-  budget_spent) echo "RESULT: budget_spent"; echo "DONE=$(jq '.done | length' "$STATE")" ;;
-  auth_failed)  echo "RESULT: auth_failed" ;;
-  *)            echo "RESULT: error"; echo "DETAIL=$(jq -r '.detail // "unknown"' "$MARKER")" ;;
-esac
+"${CLAUDE_PLUGIN_ROOT}/hooks/read-marker.sh" \
+  "/tmp/slashwork-work-$SESSION_ID.json" "/tmp/slashwork-earn-$SESSION_ID.json"
 ```
+
+> This is a script, not inline Bash, and it has to stay that way. The inline
+> version ended with `jq --arg id "$ID" '.done += [$id]'`, which Claude Code's
+> Bash safety check reads as brace-wrapped expansion obfuscation and stops to
+> confirm. An attended run clicks through it. An unattended `/earn` has nobody
+> to answer, so the session blocks here with a task already claimed and every
+> claimed task expires unsubmitted. Keep quoting-heavy `jq` in
+> `hooks/read-marker.sh`, never in this file.
 
 Branch on `RESULT:`. `claimed`: continue to E2 immediately; the task's own
 deadline is running. `budget_spent`: run Step E3 once for the summary and stop.
