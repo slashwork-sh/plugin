@@ -88,15 +88,37 @@ SETUP_HOSTS="github.com,api.github.com,*.githubusercontent.com,registry.npmjs.or
 # global policy exists" into "the global policy actually denies by default".
 CANARY_HOST="${SLASHWORK_CANARY_HOST:-example.com}"
 
-MODE="run"
+# A bare ./sandbox.sh is the whole product: create the box if needed, bootstrap
+# it, and start the earn loop inside with prompts off, for settings.json's
+# default_duration. --earn overrides the goal, --loop runs legs back to back and
+# rebuilds the box between them, --shell attaches an interactive session with
+# prompts ON for looking around. Everything else is maintenance.
+MODE="earn"
+GOAL=""
+LEGS=1
+usage() {
+  echo "usage: $0 [--earn GOAL] [--loop LEGS GOAL] [--shell] [--check] [--lock] [--unlock] [--rebuild]" >&2
+  exit 2
+}
+goal_ok() { printf '%s' "$1" | grep -qE '^[0-9]+(s|m|h|cr)$'; }
 case "${1:-}" in
   --check)   MODE="check" ;;
   --lock)    MODE="lock" ;;
   --unlock)  MODE="unlock" ;;
   --rebuild) MODE="rebuild" ;;
+  --shell)   MODE="shell" ;;
+  --earn)    goal_ok "${2:-}" || fail "--earn needs a goal like 8h, 30m or 200cr"; GOAL="$2" ;;
+  --loop)
+    printf '%s' "${2:-}" | grep -qE '^[1-9][0-9]*$' || fail "--loop needs a leg count, then a goal: --loop 25 8h"
+    goal_ok "${3:-}" || fail "--loop needs a goal like 8h after the leg count"
+    MODE="loop"; LEGS="$2"; GOAL="$3" ;;
   "")        : ;;
-  *) echo "usage: $0 [--check|--lock|--unlock|--rebuild]" >&2; exit 2 ;;
+  *) usage ;;
 esac
+if [ -z "$GOAL" ] && [ -f "$SETTINGS" ] && command -v jq >/dev/null 2>&1; then
+  GOAL=$(jq -r '.default_duration // empty' "$SETTINGS" 2>/dev/null)
+fi
+goal_ok "${GOAL:-}" || GOAL="30m"
 
 # ---------------------------------------------------------------- preflight
 command -v sbx >/dev/null 2>&1 || fail "sbx not installed.
@@ -226,10 +248,37 @@ if [ "$MODE" = "rebuild" ]; then
   fi
 fi
 
+# --------------------------------------------------------------------- loop
+# Legs back to back, and the box is destroyed and recreated between them. That
+# is the answer to persistence: a task that plants something inside the box
+# (a hook under ~/.claude that forwards later artifacts, a poisoned plugin
+# file) gets at most one leg of it. Each leg is a plain --earn run of this
+# same script, so the create, bootstrap and auth paths are exercised fresh
+# every time rather than assumed to still hold.
+if [ "$MODE" = "loop" ]; then
+  for leg in $(seq 1 "$LEGS"); do
+    say "SANDBOX: leg $leg of $LEGS, rebuilding '$NAME' so nothing a previous task planted survives"
+    sbx stop "$NAME" >/dev/null 2>&1
+    sbx rm "$NAME" >/dev/null 2>&1
+    if sbx ls -q 2>/dev/null | grep -qx "$NAME"; then
+      fail "could not remove '$NAME' before leg $leg; refusing to reuse a box a task may have altered"
+    fi
+    "$0" --earn "$GOAL" || say "SANDBOX: leg $leg ended with status $?"
+    sleep 5
+  done
+  say "SANDBOX: all $LEGS legs done"
+  exit 0
+fi
+
 # ------------------------------------------------------------------- create
+# The workspace is mounted READ-ONLY. The earner loop keeps its state in /tmp
+# inside the box and the artifact is the worker's final message, so nothing in
+# the loop needs to write here, and a stranger's task must not be able to: on
+# one earner box this folder sat inside a checkout of the coordinator repo, and
+# a writable mount would have let any task edit that tree from inside the VM.
 if [ "$MODE" != "lock" ] && ! sbx ls -q 2>/dev/null | grep -qx "$NAME"; then
-  say "SANDBOX: creating '$NAME' (memory=$MEM cpus=$CPUS, workspace=$HERE)"
-  sbx create --name "$NAME" --memory "$MEM" --cpus "$CPUS" claude "$HERE" \
+  say "SANDBOX: creating '$NAME' (memory=$MEM cpus=$CPUS, workspace=$HERE, read-only)"
+  sbx create --name "$NAME" --memory "$MEM" --cpus "$CPUS" claude "$HERE:ro" \
     || fail "sbx create failed"
   CREATED=1
 fi
@@ -329,21 +378,72 @@ else
   say "SANDBOX: no host token at ~/.slashwork/token; run /earn init inside the sandbox"
 fi
 
+# The Claude credential the worker will spend. This is the unavoidable part of
+# the model: an earner that uses your unused quota has to hold a credential
+# that can use your quota, inside a box that runs strangers' prompts. What we
+# can choose is WHICH credential.
+#
+# Preferred: a token from `claude setup-token`, saved by the user at
+# ~/.slashwork/claude-token. It is long-lived, headless, and revocable on its
+# own without touching the host login, which is exactly what you want for a
+# credential that lives next to untrusted code. Fallback: the host's
+# ~/.claude/.credentials.json copied in, which works with no setup but is the
+# same credential your desktop session runs on, so revoking it means logging
+# out everywhere. Say which one was used; the difference matters.
+CLAUDE_AUTH="none"
+if [ -f "$HOME/.slashwork/claude-token" ]; then
+  _tok=$(tr -d '[:space:]' < "$HOME/.slashwork/claude-token")
+  if [ -n "$_tok" ]; then
+    sbx exec "$NAME" sh -c "mkdir -p \"$SB_HOME/.slashwork\"" >/dev/null 2>&1
+    sbx cp "$HOME/.slashwork/claude-token" "$NAME:$SB_HOME/.slashwork/claude-token" >/dev/null 2>&1 \
+      && sbx exec "$NAME" sh -c "chmod 600 \"$SB_HOME/.slashwork/claude-token\"" >/dev/null 2>&1 \
+      && CLAUDE_AUTH="setup-token"
+  fi
+  unset _tok
+fi
+if [ "$CLAUDE_AUTH" = "none" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
+  sbx exec "$NAME" sh -c "mkdir -p \"$SB_HOME/.claude\"" >/dev/null 2>&1
+  sbx cp "$HOME/.claude/.credentials.json" "$NAME:$SB_HOME/.claude/.credentials.json" >/dev/null 2>&1 \
+    && sbx exec "$NAME" sh -c "chmod 600 \"$SB_HOME/.claude/.credentials.json\"" >/dev/null 2>&1 \
+    && CLAUDE_AUTH="host-login"
+fi
+case "$CLAUDE_AUTH" in
+  setup-token) say "SANDBOX: Claude auth: setup-token from ~/.slashwork/claude-token (revocable on its own)" ;;
+  host-login)  say "SANDBOX: Claude auth: copied your host login. To use a credential you can revoke separately, run 'claude setup-token' and save it to ~/.slashwork/claude-token" ;;
+  none)        say "SANDBOX: no Claude credential found on the host; the session will ask you to /login" ;;
+esac
+
 # A marker the /earn preflight reads to confirm it is running inside the box
 # rather than on the host. Cheap, and it makes a misconfigured run visible
 # before any task is claimed.
 sbx exec "$NAME" sh -c "printf '%s' '$NAME' > \"$SB_HOME/.slashwork-sandbox\"" >/dev/null 2>&1
 
 # ------------------------------------------------------------------- attach
-say ""
-say "SANDBOX: attaching to '$NAME'. Inside the session:"
-if [ -n "${CREATED:-}" ]; then
-  say "  1. /login          sign in to Claude (host credentials do not carry over)"
-  say "  2. /earn 8h        start the loop"
+if [ "$MODE" = "shell" ]; then
   say ""
-  say "Then, once it is working: ./sandbox.sh --lock to drop the install-only egress."
-else
-  say "  /earn 8h"
+  say "SANDBOX: attaching an interactive session to '$NAME' (prompts ON; this is for looking around, not earning)"
+  [ "$CLAUDE_AUTH" = "none" ] && say "  run /login first; then /earn $GOAL starts the loop"
+  say ""
+  exec sbx run --name "$NAME"
 fi
+
+# The earn run. Prompts are off INSIDE the box and nowhere else. This is the
+# whole reason the box exists: an unattended earner cannot answer Claude Code's
+# approval prompts, and the worker runs whatever commands a stranger's task
+# needs, so the prompts cannot be allowlisted in advance either. On the host,
+# skipping them would hand a task prompt your filesystem. In here it hands it a
+# read-only workspace, a deny-by-default network, and a box that is rebuilt
+# between legs. That is the trade, and it is only acceptable because of the
+# three things above.
 say ""
-exec sbx run --name "$NAME"
+say "SANDBOX: starting /earn $GOAL inside '$NAME' with prompts off"
+say "SANDBOX: workspace read-only, egress deny-by-default, Claude auth: $CLAUDE_AUTH"
+[ -n "${CREATED:-}" ] && say "SANDBOX: once a task has completed, run './sandbox.sh --lock' to drop the install-only egress"
+say ""
+# Not exec: --loop needs this to return when the budget is spent.
+if [ "$CLAUDE_AUTH" = "setup-token" ]; then
+  # shellcheck disable=SC2016
+  sbx exec "$NAME" sh -c 'export CLAUDE_CODE_OAUTH_TOKEN="$(cat "$HOME/.slashwork/claude-token")"; exec claude --dangerously-skip-permissions "/earn '"$GOAL"'"'
+else
+  sbx run --name "$NAME" -- --dangerously-skip-permissions "/earn $GOAL"
+fi

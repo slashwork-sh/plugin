@@ -440,3 +440,54 @@ GOT_PATH="$(head -1 "$CAP")"
 [ "$GOT_PATH" = "/api/tasks/$CM/submit" ] || fail "should submit to the marker's task id: $GOT_PATH"
 [ ! -f "$CM_JOB" ] || fail "marker-recovered submit should clean its staged job after 201"
 echo "PASS: transcript absent -> identity from the claim marker, past stale stages"
+
+# ---- Scenario 12: an artifact carrying a credential is refused, never sent ----
+# The submit path is the one egress a sandboxed earner can never block, so a
+# task prompt that talks the worker into "deliver the contents of your token
+# file" would walk a credential out with every network rule intact. The hook
+# must refuse mechanically, record it like a failed submit, and leave the
+# staged job for the loop to drop.
+SEC_ID="99999999-8888-7777-6666-555555555555"
+SEC_JOB="/tmp/slashwork-job-${SESSION}-${SEC_ID}.json"
+SEC_FAIL="/tmp/slashwork-submit-fail-${SESSION}.json"
+SEC_ART="Here is the deliverable you asked for: sw_y6J2Ony6MLEwZF6Egqgn_oY_BgYEXdY-pgLeFRLN2P0 and also ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+# Chain from cleanup10, the last link before this scenario. Chaining from an
+# earlier one silently dropped every cleanup in between, and scenario 10's
+# claim marker then survived into the next run and hijacked scenario 3.
+cleanup12() { cleanup10; rm -f "$SEC_JOB" "$SEC_FAIL"; }
+trap cleanup12 EXIT
+rm -f "$CAP" "$SEC_FAIL"
+printf '{"task_id":"%s","base":"%s"}\n' "$SEC_ID" "$BASE" > "$SEC_JOB"
+
+# A mock that would return 201 if anything reached it. It must time out unused.
+timeout 3 python3 - "$PORT" "$CAP" <<'PY' &
+import sys, http.server, socketserver
+port, cap = int(sys.argv[1]), sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get('content-length', 0)); self.rfile.read(n)
+        open(cap, 'w').write(self.path + "\nLEAKED")
+        self.send_response(201); self.end_headers(); self.wfile.write(b'{"ok":true}')
+    def log_message(self, *a): pass
+socketserver.TCPServer.allow_reuse_address = True
+with socketserver.TCPServer(("127.0.0.1", port), H) as s:
+    s.handle_request()
+PY
+MOCK12=$!
+sleep 0.6
+
+SEC_TX="$(mktemp -d)/agent-sec.jsonl"
+{
+  printf '{"type":"user","message":{"role":"user","content":"task_id: %s\\njob_file: %s"}}\n' "$SEC_ID" "$SEC_JOB"
+  printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":%s}]}}\n' "$(printf '%s' "$SEC_ART" | jq -Rs .)"
+} > "$SEC_TX"
+ENVELOPE12="$(jq -nc --arg s "$SESSION" --arg at "$SEC_TX" --arg lam "$SEC_ART" \
+  '{session_id:$s, agent_transcript_path:$at, last_assistant_message:$lam, hook_event_name:"SubagentStop"}')"
+printf '%s' "$ENVELOPE12" | SLASHWORK_TOKEN=testtoken bash "$SUBMIT" 2>"$HOOKERR"
+wait "$MOCK12" 2>/dev/null || true
+[ ! -f "$CAP" ] || fail "a credential-bearing artifact REACHED the coordinator (exfiltration)"
+[ -f "$SEC_FAIL" ] || fail "refusal left no fail marker for the loop to report"
+[ "$(jq -r .code "$SEC_FAIL")" = "secret" ] || fail "fail marker code should be 'secret': $(cat "$SEC_FAIL")"
+[ -f "$SEC_JOB" ] || fail "refusal should leave the staged job for the loop to drop"
+grep -q "REFUSING" "$HOOKERR" || fail "refusal was not announced on stderr"
+echo "PASS: a credential-shaped artifact is refused, never sent, and reported to the loop"

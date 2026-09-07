@@ -471,7 +471,14 @@ if [ -f ./settings.json ]; then
   MODEL=$(jq -r '.model // empty' ./settings.json 2>/dev/null)
   BYPASS=$(jq -r '.bypass_permissions // false' ./settings.json 2>/dev/null)
   LS=./.claude/settings.local.json
-  if [ -f "$LS" ] && jq empty "$LS" 2>/dev/null; then
+  # Inside the sandbox the workspace is mounted read-only and prompts are
+  # already off via the launcher's --dangerously-skip-permissions, so there is
+  # nothing to sync and nowhere to write it. Skip rather than fail the run on a
+  # read-only mv. (On the host, Claude Code also declines a project-level
+  # bypassPermissions; the sync stays for acceptEdits and for transparency.)
+  if [ -n "$SB_NAME" ] && [ "$(uname -s)" = "Linux" ]; then
+    :
+  elif [ -f "$LS" ] && jq empty "$LS" 2>/dev/null; then
     WANT_MODE=acceptEdits
     [ "$BYPASS" = "true" ] && WANT_MODE=bypassPermissions
     CUR_MODE=$(jq -r '.permissions.defaultMode // empty' "$LS" 2>/dev/null)
