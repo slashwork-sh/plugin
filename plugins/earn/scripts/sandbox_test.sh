@@ -338,14 +338,18 @@ check "installs the plugin when absent" \
   "$(has "$LOGGED" "plugin install slashwork-earn@slashwork")" "$LOGGED"
 check "writes the marker into the sandbox HOME, naming the sandbox" \
   "$(has "$LOGGED" "'test-earner' > \"/home/agent/.slashwork-sandbox\"")" "$LOGGED"
-check "attaches at the end" "$(has "$LOGGED" "run --name test-earner")" "$LOGGED"
-check "a fresh box tells the user to /login first" "$(has "$OUT" "1. /login")" "$OUT"
+check "mounts the workspace read-only" "$(has "$LOGGED" "claude $WORK:ro")" "$LOGGED"
+check "starts the earn loop at the end" "$(has "$LOGGED" "run --name test-earner")" "$LOGGED"
+check "prompts are off inside the box" "$(has "$LOGGED" "dangerously-skip-permissions")" "$LOGGED"
+check "the earn goal is passed in" "$(has "$LOGGED" "/earn 30m")" "$LOGGED"
+check "says which Claude credential it used" "$(has "$OUT" "Claude auth")" "$OUT"
 
 OUT=$(STUB_EXISTS=1 run_case); LOGGED=$(cat "$LOG")
 check "re-run does not recreate an existing sandbox" \
   "$(hasnt "$LOGGED" "create --name")" "$LOGGED"
 check "re-run still attaches" "$(has "$LOGGED" "run --name test-earner")" "$LOGGED"
-check "re-run does not repeat the /login guidance" "$(hasnt "$OUT" "/login")" "$OUT"
+check "re-run still starts the loop with prompts off" "$(has "$LOGGED" "dangerously-skip-permissions")" "$LOGGED"
+check "re-run does not offer the lock hint again" "$(hasnt "$OUT" "install-only egress")" "$OUT"
 
 # The $HOME probe must be distinguishable from its fallback, or deleting the
 # probe entirely passes.
@@ -465,6 +469,23 @@ OUT=$(run_case --lokc)
 check "an unknown flag prints usage" "$(has "$OUT" "usage:")" "$OUT"
 check "an unknown flag exits 2" "$(is "$(rc_of --lokc)" 2)" ""
 check "an unknown flag touches no sandbox" "$(nolog "create")" "$(cat "$LOG")"
+
+# -------------------------------------------- 11: single command and legs
+# ./sandbox.sh --earn GOAL is the product: one command, prompts off inside,
+# goal passed through. --loop runs legs and destroys the box between them so
+# nothing a task planted survives into the next leg.
+OUT=$(STUB_EXISTS=0 run_case --earn 8h); LOGGED=$(cat "$LOG")
+check "--earn passes its goal into the box" "$(has "$LOGGED" "/earn 8h")" "$LOGGED"
+check "--earn runs with prompts off" "$(has "$LOGGED" "dangerously-skip-permissions")" "$LOGGED"
+check "--earn rejects a malformed goal" "$([ "$(rc_of --earn tomorrow)" = "1" ] && echo 0 || echo 1)" ""
+
+OUT=$(STUB_EXISTS=0 run_case --loop 2 30m); LOGGED=$(cat "$LOG")
+check "--loop removes the box before each leg" \
+  "$([ "$(printf '%s\n' "$LOGGED" | grep -c '^rm test-earner$')" -ge 2 ] && echo 0 || echo 1)" "$LOGGED"
+check "--loop creates a fresh box for each leg" \
+  "$([ "$(printf '%s\n' "$LOGGED" | grep -c '^create --name test-earner')" -ge 2 ] && echo 0 || echo 1)" "$LOGGED"
+check "--loop reports when all legs are done" "$(has "$OUT" "all 2 legs done")" "$OUT"
+check "--loop needs a leg count" "$([ "$(rc_of --loop 8h)" = "1" ] && echo 0 || echo 1)" ""
 
 # ------------------------------------------------------- 10: the harness itself
 check "hasnt fails on empty input" "$(is "$(hasnt "" anything)" 1)" ""
