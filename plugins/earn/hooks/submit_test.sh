@@ -156,10 +156,15 @@ RC=$?
 [ ! -f "$CAP" ] || fail "non-slashwork subagent must not POST anything: $(cat "$CAP")"
 echo "PASS: subagent without a task_id marker is ignored"
 
-# ---- Scenario 4: transcript absent -> recover the id from the single staged job ----
-# Some harness versions omit agent_transcript_path, so the hook cannot read the
-# task_id from the prompt. It must fall back to the one staged job for the
-# session, submitting the envelope's last_assistant_message.
+# ---- Scenario 4: transcript absent -> NOT a worker, submit nothing ----
+# This used to recover the id from the single staged job and submit the
+# envelope's last_assistant_message. That fallback was a hole: any
+# SubagentStop that arrives without a transcript, from anything at all, was
+# submitted under the claimed task's id with whatever its last message was.
+# Observed live: "keep earning" submitted two seconds after a claim, rejected,
+# and the hook's own 201 cleanup deleted the staged job so the real worker never
+# ran. Identity has to come from the worker's transcript; nothing else may
+# speak for it, and the staged job must survive for the worker that will.
 NT="99999999-8888-7777-6666-555555555555"
 NT_JOB="/tmp/slashwork-job-${SESSION}-${NT}.json"
 NT_OUT="/tmp/slashwork-submit-${SESSION}-${NT}.out"
@@ -171,14 +176,14 @@ rm -f "$CAP"
 rm -f /tmp/slashwork-job-"${SESSION}"-*.json
 printf '{"task_id":"%s","base":"%s"}\n' "$NT" "$BASE" > "$NT_JOB"
 
-timeout 20 python3 - "$PORT" "$CAP" <<'PY' &
+# A mock that would return 201 if anything reached it. It must time out unused.
+timeout 3 python3 - "$PORT" "$CAP" <<'PY' &
 import sys, http.server, socketserver
 port, cap = int(sys.argv[1]), sys.argv[2]
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
-        n = int(self.headers.get('content-length', 0))
-        body = self.rfile.read(n).decode()
-        open(cap, 'w').write(self.path + "\n" + body)
+        n = int(self.headers.get('content-length', 0)); self.rfile.read(n)
+        open(cap, 'w').write(self.path + "\nLEAKED")
         self.send_response(201); self.end_headers(); self.wfile.write(b'{"ok":true}')
     def log_message(self, *a): pass
 socketserver.TCPServer.allow_reuse_address = True
@@ -188,21 +193,16 @@ PY
 MOCK3=$!
 sleep 0.6
 
-# Envelope with NO agent_transcript_path; the artifact comes from the envelope.
+# Envelope with NO agent_transcript_path and a plausible last message.
 ENVELOPE4="$(jq -nc --arg s "$SESSION" --arg lam "$NT_ART" \
   '{session_id:$s, last_assistant_message:$lam, hook_event_name:"SubagentStop"}')"
 printf '%s' "$ENVELOPE4" | SLASHWORK_TOKEN=testtoken bash "$SUBMIT" 2>"$HOOKERR"
 wait "$MOCK3" 2>/dev/null || true
 
-[ -f "$CAP" ] || fail "missing-transcript case submitted nothing (fallback did not fire)"
-GOT_PATH="$(head -1 "$CAP")"
-GOT_ART="$(tail -n +2 "$CAP" | jq -r '.artifact')"
-GOT_TOKENS="$(tail -n +2 "$CAP" | jq -r '.tokens_used')"
-[ "$GOT_PATH" = "/api/tasks/$NT/submit" ] || fail "wrong URL for the recovered id: $GOT_PATH"
-[ "$GOT_ART" = "$NT_ART" ] || fail "wrong artifact for the recovered id: $GOT_ART"
-[ "$GOT_TOKENS" = "0" ] || fail "no transcript must report tokens_used 0: $GOT_TOKENS"
-[ ! -f "$NT_JOB" ] || fail "recovered submit should clean up the staged job after 201"
-echo "PASS: recovers the task id from the single staged job when the transcript is absent"
+[ ! -f "$CAP" ] || fail "a transcript-less SubagentStop was SUBMITTED under the staged job's id"
+[ -f "$NT_JOB" ] || fail "the staged job must survive for the real worker"
+grep -q "cannot prove it was the worker" "$HOOKERR" || fail "should say why it declined" "$(cat "$HOOKERR")"
+echo "PASS: transcript absent -> not a worker; nothing submitted, staged job left for the worker"
 
 # ---- Scenario 5: a failed submit (non-201) leaves a durable failure marker ----
 FT="12121212-3434-5656-7878-909090909090"
@@ -304,7 +304,7 @@ ENVELOPE8="$(jq -nc --arg s "$SESSION" --arg lam "answer" \
   '{session_id:$s, last_assistant_message:$lam, hook_event_name:"SubagentStop"}')"
 printf '%s' "$ENVELOPE8" | SLASHWORK_TOKEN=testtoken bash "$SUBMIT" 2>"$HOOKERR"
 [ ! -f "$CAP" ] || fail "two staged jobs must not be guessed between" "$(cat "$CAP")"
-grep -qi "no single staged job" "$HOOKERR" || fail "should log that it cannot pick a job" "$(cat "$HOOKERR")"
+grep -qiE "no single staged job|cannot prove it was the worker" "$HOOKERR" || fail "should log why it declined" "$(cat "$HOOKERR")"
 echo "PASS: with the transcript absent and two staged jobs, refuses to guess"
 
 # ---- Scenario 9: transcript artifact preferred over the envelope message ----
@@ -430,16 +430,18 @@ PY
 MOCK11=$!
 sleep 0.6
 
-# Envelope with NO agent_transcript_path; identity must come from the marker.
-ENVELOPE11="$(jq -nc --arg s "$SESSION" --arg lam "recovered via claim marker" \
+# Envelope with NO agent_transcript_path. The claim marker names a task, and
+# that is exactly the trap: it proves the LISTENER claimed something, not that
+# this stopping subagent is the worker for it. Nothing may be submitted.
+ENVELOPE11="$(jq -nc --arg s "$SESSION" --arg lam "keep earning" \
   '{session_id:$s, last_assistant_message:$lam, hook_event_name:"SubagentStop"}')"
 printf '%s' "$ENVELOPE11" | SLASHWORK_TOKEN=testtoken bash "$SUBMIT" 2>"$HOOKERR"
-wait "$MOCK11" 2>/dev/null || true
-[ -f "$CAP" ] || fail "claim-marker identity submitted nothing (marker not read)"
-GOT_PATH="$(head -1 "$CAP")"
-[ "$GOT_PATH" = "/api/tasks/$CM/submit" ] || fail "should submit to the marker's task id: $GOT_PATH"
-[ ! -f "$CM_JOB" ] || fail "marker-recovered submit should clean its staged job after 201"
-echo "PASS: transcript absent -> identity from the claim marker, past stale stages"
+kill "$MOCK11" 2>/dev/null; wait "$MOCK11" 2>/dev/null || true
+[ ! -f "$CAP" ] || fail "a transcript-less stop was SUBMITTED under the claim marker's id"
+[ -f "$CM_JOB" ] || fail "the claimed task's staged job must survive for the real worker"
+[ -f "$MARKER" ] || fail "the claim marker must be left for the loop"
+grep -q "cannot prove it was the worker" "$HOOKERR" || fail "should say why it declined" "$(cat "$HOOKERR")"
+echo "PASS: transcript absent + claim marker -> still not a worker; nothing submitted"
 
 # ---- Scenario 12: an artifact carrying a credential is refused, never sent ----
 # The submit path is the one egress a sandboxed earner can never block, so a

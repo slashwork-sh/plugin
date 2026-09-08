@@ -73,31 +73,21 @@ if [ -z "$ID" ]; then
     echo "slashwork: subagent has a transcript but no task_id; not a worker, ignoring" >&2
     exit 0
   fi
-  # No transcript at all (a harness that does not pass agent_transcript_path, so
-  # the prompt cannot be read). earn-listen wrote a claim marker for THIS session
-  # naming the task it claimed; that is the authoritative identity and stays
-  # correct even when stale staged jobs from earlier failed submits are lying
-  # around. Prefer it; fall back to a lone staged job only if the marker is gone.
-  MARKER="/tmp/slashwork-earn-${SESSION_ID}.json"
-  if [ -f "$MARKER" ] && [ "$(jq -r '.status // empty' "$MARKER" 2>/dev/null)" = "claimed" ]; then
-    CAND=$(jq -r '.id // empty' "$MARKER" 2>/dev/null)
-    if printf '%s' "$CAND" | grep -qE '^[0-9a-fA-F-]{36}$'; then
-      ID="$CAND"
-      echo "slashwork: no transcript; using claimed task $ID from the session claim marker" >&2
-    fi
-  fi
-  if [ -z "$ID" ]; then
-    STAGED=()
-    while IFS= read -r f; do STAGED+=("$f"); done < <(
-      ls -1 "/tmp/slashwork-job-${SESSION_ID}-"*.json 2>/dev/null)
-    if [ "${#STAGED[@]}" -eq 1 ]; then
-      ID=$(basename "${STAGED[0]}" \
-        | sed -n "s/^slashwork-job-${SESSION_ID}-\([0-9a-fA-F-]\{36\}\)\.json\$/\1/p")
-      [ -n "$ID" ] && echo "slashwork: no task_id and no marker; recovered $ID from the single staged job" >&2
-    fi
-  fi
+  # No transcript at all. This used to fall back to the session's claim marker
+  # ("the listener claimed X, so this must be X's worker"), and that fallback
+  # was a hole: any SubagentStop that arrives without a transcript, from
+  # anything at all, was submitted under the claimed task's id with whatever
+  # its last message happened to be. Observed live: two seconds after a claim,
+  # before any worker existed, the coordinator received the artifact
+  # "keep earning" for that task, the judge rejected it, and the hook's own
+  # 201 cleanup deleted the staged job, so the real worker never ran. The
+  # identity of a submission has to come from the worker's own transcript;
+  # nothing else in this session is allowed to speak for it. (The other
+  # harnesses submit through the core binary, not this hook, so nothing needs
+  # the fallback.)
+  echo "slashwork: subagent stop with no transcript; cannot prove it was the worker, not submitting" >&2
+  exit 0
 fi
-[ -n "$ID" ] || { echo "slashwork: no task id (no task_id, no claim marker, no single staged job); not submitting" >&2; exit 0; }
 
 STAGE="/tmp/slashwork-job-${SESSION_ID}-${ID}.json"
 [ -f "$STAGE" ] || { echo "slashwork: no staged job for $ID; not submitting" >&2; exit 0; }
