@@ -512,9 +512,64 @@ say ""
 # connected, sat on the feed for a few seconds, and vanished. The earn loop
 # depends on Claude Code re-invoking the skill when the listener exits, and
 # that only happens in a live interactive session.
+# A leg has to END. Claude Code stays interactive after the skill prints its
+# budget summary, so the session below never returns on its own; without a
+# bound, --loop's first leg is also its last, and a single --earn "for 10m"
+# runs until someone quits it. Two things end a leg: the goal's wall-clock
+# budget plus a grace for the task in flight, and the listener's own
+# budget_spent marker (which can arrive early: a microVM clock that gets
+# snapped forward after a stop/resume ends the guest's budget in guest time,
+# not ours). Either way the box is stopped, the session with it, and --loop
+# rebuilds for the next leg.
+goal_secs() { # goal_secs GOAL -> seconds; a credits goal gets the core's 24h ceiling
+  case "$1" in
+    *s) printf '%s' "${1%s}" ;;
+    *m) printf '%s' $(( ${1%m} * 60 )) ;;
+    *h) printf '%s' $(( ${1%h} * 3600 )) ;;
+    *)  printf '%s' 86400 ;;
+  esac
+}
+LEG_CAP=$(( $(goal_secs "$GOAL") + 600 ))
+# Poll and grace intervals are overridable so the test suite, whose stub
+# session returns at once, does not pay 35 seconds per earn case.
+LEG_POLL="${SLASHWORK_LEG_POLL_SECS:-20}"
+LEG_GRACE="${SLASHWORK_LEG_GRACE_SECS:-15}"
+
+# The session runs in the FOREGROUND and the bound runs beside it. The first
+# cut backgrounded the session so this shell could poll it, and a backgrounded
+# job cannot own the pty that -it needs: sbx failed the exec ("inspect exec:
+# context deadline exceeded") and both loop legs ended in seconds. So the
+# watchdog is the background half: it waits for the cap or the marker, then
+# stops the box, which ends the foreground session.
+leg_watchdog() {
+  local start; start=$(date +%s)
+  while :; do
+    sleep "$LEG_POLL"
+    if [ $(( $(date +%s) - start )) -ge "$LEG_CAP" ]; then
+      say "SANDBOX: leg cap reached (${LEG_CAP}s); stopping the box"
+      break
+    fi
+    if sbx exec "$NAME" sh -c 'grep -qs budget_spent /tmp/slashwork-earn-*.json' 2>/dev/null; then
+      # The summary turn needs a moment to print before the box goes away.
+      sleep "$LEG_GRACE"
+      say "SANDBOX: budget spent inside the box; stopping it"
+      break
+    fi
+  done
+  sbx stop "$NAME" >/dev/null 2>&1
+}
+leg_watchdog &
+WATCHDOG_PID=$!
 if [ "$CLAUDE_AUTH" = "setup-token" ]; then
   # shellcheck disable=SC2016
   sbx exec -it "$NAME" sh -c 'export CLAUDE_CODE_OAUTH_TOKEN="$(cat "$HOME/.slashwork/claude-token")"; exec claude --dangerously-skip-permissions "/earn '"$GOAL"'"'
 else
   sbx run --name "$NAME" -- --dangerously-skip-permissions "/earn $GOAL"
 fi
+# The session ended (the watchdog stopped the box, or someone quit it).
+# Either way, retire the watchdog and make sure the box is down so --loop
+# rebuilds it rather than reusing it.
+kill "$WATCHDOG_PID" 2>/dev/null
+wait "$WATCHDOG_PID" 2>/dev/null
+sbx stop "$NAME" >/dev/null 2>&1
+say "SANDBOX: leg ended"

@@ -187,6 +187,9 @@ mkdir -p "$HOME/.slashwork"; printf 'sk-ant-oat01-test-token-not-real\n' > "$HOM
 # Point the virtualization probe at the test's own filesystem. Reading the real
 # /dev/kvm made the Linux refusal pass on a Mac and fail on every CI runner.
 export SLASHWORK_KVM_DEV="$TMP/no-such-kvm"
+# The stub session returns at once; without these every earn case would pay the
+# launcher's real poll and grace intervals (35s) for nothing.
+export SLASHWORK_LEG_POLL_SECS=0 SLASHWORK_LEG_GRACE_SECS=0
 
 # ------------------------------------------------------------------ helpers
 # Every case starts with a working Claude credential on the host, because the
@@ -369,6 +372,12 @@ check "starts the earn loop at the end, token in the session env" \
   "$(has "$LOGGED" "exec -it test-earner sh -c export CLAUDE_CODE_OAUTH_TOKEN")" "$LOGGED"
 check "prompts are off inside the box" "$(has "$LOGGED" "dangerously-skip-permissions")" "$LOGGED"
 check "the earn goal is passed in" "$(has "$LOGGED" "/earn 30m")" "$LOGGED"
+# A leg must END. The session is bounded by the goal's budget plus a grace and
+# by the budget_spent marker, and the box is stopped afterwards so --loop can
+# rebuild for the next leg. The stub's session returns at once; the stop must
+# still follow it.
+check "stops the box when the earn session ends" "$(has "$LOGGED" "stop test-earner")" "$LOGGED"
+check "reports the leg ending" "$(has "$OUT" "leg ended")" "$OUT"
 check "says which Claude credential it used" "$(has "$OUT" "Claude auth")" "$OUT"
 
 OUT=$(STUB_EXISTS=1 run_case); LOGGED=$(cat "$LOG")

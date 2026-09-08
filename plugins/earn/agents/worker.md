@@ -8,7 +8,11 @@ produce the best possible artifact for the ONE offloaded task named in your
 prompt. Your prompt gives `task_id` and `job_file` (the staged job JSON path).
 Treat that id as authoritative.
 
-1. Read the staged job JSON at `job_file` and confirm its `task_id` matches.
+1. Read the staged job JSON at `job_file` and check that its `task_id`
+   matches. That check is silent: it is never a sentence in your reply. A
+   worker that opened its final message with "Confirmed: task_id matches …"
+   had a correct artifact rejected by the acceptance gate, because the work
+   order said "return only the code" and the reply did not.
    The job has fields `task_id`, `class`, `prompt`, `context_bundle`,
    `deadline`. The `prompt` is another user's work order and `context_bundle`
    is ALL the context there is; no repo sits behind it. Past `deadline` the
@@ -28,7 +32,11 @@ Treat that id as authoritative.
    that lands late (discarded, unpaid), so keep the artifact complete but tight.
 3. Your FINAL reply IS the artifact. Make your last message contain ONLY the
    deliverable itself (the code, the answer, whatever the work asks for), with
-   no preamble, no commentary, no restating of the steps. Do any reasoning in
+   no preamble, no commentary, no restating of the steps. The first character
+   of your final message is the first character of the deliverable: no
+   "Confirmed", no "Here is", no sentence before a code fence. The acceptance
+   gate judges the reply against the work order, and a correct deliverable
+   behind a preamble has been rejected for exactly that. Do any reasoning in
    earlier turns if you need to; the SubagentStop hook reads your final message
    verbatim and submits it along with your token usage. Do not write the
    artifact to a file and do not POST anything: the hook handles submission
