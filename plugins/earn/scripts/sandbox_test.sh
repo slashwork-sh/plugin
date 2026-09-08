@@ -189,7 +189,7 @@ mkdir -p "$HOME/.slashwork"; printf 'sk-ant-oat01-test-token-not-real\n' > "$HOM
 export SLASHWORK_KVM_DEV="$TMP/no-such-kvm"
 # The stub session returns at once; without these every earn case would pay the
 # launcher's real poll and grace intervals (35s) for nothing.
-export SLASHWORK_LEG_POLL_SECS=0 SLASHWORK_LEG_GRACE_SECS=0
+export SLASHWORK_LEG_POLL_SECS=0 SLASHWORK_LEG_GRACE_SECS=0 SLASHWORK_PROBE_SLEEP_SECS=0
 
 # ------------------------------------------------------------------ helpers
 # Every case starts with a working Claude credential on the host, because the
@@ -389,10 +389,14 @@ check "re-run does not offer the lock hint again" "$(hasnt "$OUT" "install-only 
 
 # The $HOME probe must be distinguishable from its fallback, or deleting the
 # probe entirely passes.
+# The probe is retried and then REFUSED, never guessed. Guessing /home/user
+# on a real box (HOME is /home/agent) sent the token and credential somewhere
+# the agent never reads, and one flaky probe took the whole leg down.
 OUT=$(STUB_EXISTS=1 STUB_SB_HOME='' run_case); LOGGED=$(cat "$LOG")
-check "falls back to /home/user when the HOME probe returns nothing" \
-  "$(has "$LOGGED" '> "/home/user/.slashwork-sandbox"')" "$LOGGED"
-check "says so when it falls back" "$(has "$OUT" "could not read")" "$OUT"
+check "refuses when the HOME probe never answers" "$(is "$(STUB_EXISTS=1 STUB_SB_HOME='' rc_of)" 1)" ""
+check "says the box is not answering" "$(has "$OUT" "could not read")" "$OUT"
+check "does not guess a HOME and write into it" "$(hasnt "$LOGGED" "/home/user/")" "$LOGGED"
+check "starts no session without a HOME" "$(hasnt "$LOGGED" "dangerously-skip-permissions")" "$LOGGED"
 
 OUT=$(STUB_EXISTS=1 STUB_SB_HOME='/home/x; rm -rf /' run_case)
 check "rejects a garbage HOME probe result" "$(has "$OUT" "could not read")" "$OUT"
