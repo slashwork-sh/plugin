@@ -354,22 +354,30 @@ fi
 # Everything below is idempotent, so a re-run after a reboot just tops up.
 # The single quotes are the point: $HOME must expand inside the sandbox, not on
 # the host. Do not hardcode /home/user; the agent image can change it.
-# shellcheck disable=SC2016
-SB_HOME=$(sbx exec "$NAME" sh -c 'printf %s "$HOME"' 2>/dev/null)
 # The probe runs inside the box, and sbx prints its own chrome on command output
 # from time to time (update notices), so a stray byte would make this a garbage
 # path that still passes a non-empty test -- and then the token, the marker and
 # two mkdirs all silently target the wrong place. Require an absolute path with
-# nothing exotic in it, and say so when falling back rather than pretending the
-# comment above about not hardcoding /home/user still holds.
-case "$SB_HOME" in
-  /*) printf '%s' "$SB_HOME" | grep -qE '^/[A-Za-z0-9._/-]*$' || SB_HOME="" ;;
-  *)  SB_HOME="" ;;
-esac
-if [ -z "$SB_HOME" ]; then
-  SB_HOME="/home/user"
-  say "SANDBOX: could not read \$HOME inside the box, assuming $SB_HOME"
-fi
+# nothing exotic in it.
+#
+# Right after `sbx create` the box can still be coming up, and the first exec
+# returns nothing. This used to fall back to assuming /home/user, which on a
+# real box (HOME is /home/agent) sent the token and the credential to a
+# directory the agent never reads: chown failed, the setup-token copy failed,
+# auth fell through to "stale", and the leg refused to start. One flaky probe
+# took the whole leg down. So retry, and if it never answers, refuse: every
+# step below depends on this path being right.
+SB_HOME=""
+for _try in 1 2 3 4 5 6 7 8 9 10; do
+  # shellcheck disable=SC2016
+  _probe=$(sbx exec "$NAME" sh -c 'printf %s "$HOME"' 2>/dev/null)
+  case "$_probe" in
+    /*) if printf '%s' "$_probe" | grep -qE '^/[A-Za-z0-9._/-]*$'; then SB_HOME="$_probe"; break; fi ;;
+  esac
+  sleep "${SLASHWORK_PROBE_SLEEP_SECS:-3}"
+done
+unset _try _probe
+[ -n "$SB_HOME" ] || fail "could not read \$HOME inside '$NAME' after 30s; the box is not answering. Try again, or './sandbox.sh --rebuild'."
 
 # jq and curl: the hooks exit silently without them, which is the single most
 # confusing failure mode on a fresh box.
