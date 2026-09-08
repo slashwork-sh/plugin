@@ -366,7 +366,7 @@ check "the private copy does not carry the launcher" \
 # With a setup-token the loop starts via exec so the token can be exported into
 # the session's environment rather than written anywhere the worker reads.
 check "starts the earn loop at the end, token in the session env" \
-  "$(has "$LOGGED" "exec test-earner sh -c export CLAUDE_CODE_OAUTH_TOKEN")" "$LOGGED"
+  "$(has "$LOGGED" "exec -it test-earner sh -c export CLAUDE_CODE_OAUTH_TOKEN")" "$LOGGED"
 check "prompts are off inside the box" "$(has "$LOGGED" "dangerously-skip-permissions")" "$LOGGED"
 check "the earn goal is passed in" "$(has "$LOGGED" "/earn 30m")" "$LOGGED"
 check "says which Claude credential it used" "$(has "$OUT" "Claude auth")" "$OUT"
@@ -374,7 +374,7 @@ check "says which Claude credential it used" "$(has "$OUT" "Claude auth")" "$OUT
 OUT=$(STUB_EXISTS=1 run_case); LOGGED=$(cat "$LOG")
 check "re-run does not recreate an existing sandbox" \
   "$(hasnt "$LOGGED" "create --name")" "$LOGGED"
-check "re-run still attaches" "$(has "$LOGGED" "exec test-earner sh -c export CLAUDE_CODE_OAUTH_TOKEN")" "$LOGGED"
+check "re-run still attaches" "$(has "$LOGGED" "exec -it test-earner sh -c export CLAUDE_CODE_OAUTH_TOKEN")" "$LOGGED"
 check "re-run still starts the loop with prompts off" "$(has "$LOGGED" "dangerously-skip-permissions")" "$LOGGED"
 check "re-run does not offer the lock hint again" "$(hasnt "$OUT" "install-only egress")" "$OUT"
 
@@ -487,7 +487,7 @@ check "--rebuild recreates it afterwards" "$(has "$LOGGED" "create --name test-e
 check "--rebuild removes before it creates" \
   "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'rm test-earner' | head -1 | cut -d: -f1)" \
      -lt "$(printf '%s\n' "$LOGGED" | grep -n 'create --name' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
-check "--rebuild attaches at the end" "$(has "$LOGGED" "exec test-earner sh -c export CLAUDE_CODE_OAUTH_TOKEN")" "$LOGGED"
+check "--rebuild attaches at the end" "$(has "$LOGGED" "exec -it test-earner sh -c export CLAUDE_CODE_OAUTH_TOKEN")" "$LOGGED"
 
 # sbx rm refuses a running sandbox; discarding that made --rebuild a silent
 # no-op that attached to the box it was asked to destroy.
