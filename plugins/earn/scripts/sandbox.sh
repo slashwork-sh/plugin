@@ -271,14 +271,32 @@ if [ "$MODE" = "loop" ]; then
 fi
 
 # ------------------------------------------------------------------- create
-# The workspace is mounted READ-ONLY. The earner loop keeps its state in /tmp
-# inside the box and the artifact is the worker's final message, so nothing in
-# the loop needs to write here, and a stranger's task must not be able to: on
-# one earner box this folder sat inside a checkout of the coordinator repo, and
-# a writable mount would have let any task edit that tree from inside the VM.
+# The box never sees this folder. sbx insists the primary workspace be
+# writable (":ro" is refused on it), and a writable mount of the real earner
+# folder is exactly what must not happen: on one earner box that folder sat
+# inside a checkout of the coordinator repo, and any task could have edited
+# that tree from inside the VM. So the box gets a private copy of the earner
+# config in a scratch directory that contains nothing else. The loop keeps its
+# state in /tmp inside the box and the artifact is the worker's final message,
+# so the copy is all it needs; a task that writes into it writes into a
+# throwaway that is wiped on the next create, which --loop does every leg.
+WS="$HOME/.slashwork/sandbox-ws/$NAME"
+stage_workspace() {
+  if ! { rm -rf "$WS" && mkdir -p "$WS" && chmod 700 "$WS"; }; then
+    fail "could not stage $WS"
+  fi
+  for f in settings.json CLAUDE.md README.md; do
+    [ -f "$HERE/$f" ] && cp "$HERE/$f" "$WS/$f"
+  done
+  [ -d "$HERE/.claude" ] && cp -R "$HERE/.claude" "$WS/.claude"
+  # Never the launcher itself, the host token, or anything a task could use to
+  # learn where it really is.
+  return 0
+}
 if [ "$MODE" != "lock" ] && ! sbx ls -q 2>/dev/null | grep -qx "$NAME"; then
-  say "SANDBOX: creating '$NAME' (memory=$MEM cpus=$CPUS, workspace=$HERE, read-only)"
-  sbx create --name "$NAME" --memory "$MEM" --cpus "$CPUS" claude "$HERE:ro" \
+  stage_workspace
+  say "SANDBOX: creating '$NAME' (memory=$MEM cpus=$CPUS, workspace=a private copy of $HERE at $WS)"
+  sbx create --name "$NAME" --memory "$MEM" --cpus "$CPUS" claude "$WS" \
     || fail "sbx create failed"
   CREATED=1
 fi
@@ -363,16 +381,27 @@ if ! sbx exec "$NAME" sh -c 'claude plugin list 2>/dev/null | grep -q slashwork-
     >/dev/null 2>&1 || say "SANDBOX: warning, plugin install failed; run it by hand inside the sandbox"
 fi
 
+# `sbx cp` preserves the HOST file's uid and gid. A 600 file copied from a Mac
+# arrives owned by 501:dialout in a box whose agent is `agent`, so the agent
+# cannot read it and the failure is silent: Claude says "Not logged in" and the
+# listener says "no token", both with the file plainly present. Every copy in
+# goes through this, which hands the file to whoever owns the box's HOME.
+own_in_box() { # own_in_box <path inside the box>
+  sbx exec -u root "$NAME" sh -c "chown \"\$(stat -c %u:%g \"$SB_HOME\")\" \"$1\" && chmod 600 \"$1\"" >/dev/null 2>&1 \
+    || say "SANDBOX: warning, could not fix ownership of $1; the agent may be unable to read it"
+}
+
 # The slashwork token, copied from the host so the earner keeps one identity and
 # does not have to re-run /earn init inside the box. It lands outside the shared
 # workspace, so it does not appear in the host folder.
 if [ -f "$HOME/.slashwork/token" ]; then
-  if ! sbx exec "$NAME" sh -c "[ -f \"$SB_HOME/.slashwork/token\" ]" 2>/dev/null; then
+  # Present AND readable by the agent; a root-owned leftover must be redone.
+  if ! sbx exec "$NAME" sh -c "[ -r \"$SB_HOME/.slashwork/token\" ]" 2>/dev/null; then
     say "SANDBOX: copying the slashwork token in"
     sbx exec "$NAME" sh -c "mkdir -p \"$SB_HOME/.slashwork\"" >/dev/null 2>&1
     sbx cp "$HOME/.slashwork/token" "$NAME:$SB_HOME/.slashwork/token" >/dev/null 2>&1 \
       || say "SANDBOX: warning, token copy failed; run /earn init inside the sandbox"
-    sbx exec "$NAME" sh -c "chmod 600 \"$SB_HOME/.slashwork/token\"" >/dev/null 2>&1
+    own_in_box "$SB_HOME/.slashwork/token"
   fi
 else
   say "SANDBOX: no host token at ~/.slashwork/token; run /earn init inside the sandbox"
@@ -396,20 +425,34 @@ if [ -f "$HOME/.slashwork/claude-token" ]; then
   if [ -n "$_tok" ]; then
     sbx exec "$NAME" sh -c "mkdir -p \"$SB_HOME/.slashwork\"" >/dev/null 2>&1
     sbx cp "$HOME/.slashwork/claude-token" "$NAME:$SB_HOME/.slashwork/claude-token" >/dev/null 2>&1 \
-      && sbx exec "$NAME" sh -c "chmod 600 \"$SB_HOME/.slashwork/claude-token\"" >/dev/null 2>&1 \
+      && own_in_box "$SB_HOME/.slashwork/claude-token" \
       && CLAUDE_AUTH="setup-token"
   fi
   unset _tok
 fi
-if [ "$CLAUDE_AUTH" = "none" ] && [ -f "$HOME/.claude/.credentials.json" ]; then
-  sbx exec "$NAME" sh -c "mkdir -p \"$SB_HOME/.claude\"" >/dev/null 2>&1
-  sbx cp "$HOME/.claude/.credentials.json" "$NAME:$SB_HOME/.claude/.credentials.json" >/dev/null 2>&1 \
-    && sbx exec "$NAME" sh -c "chmod 600 \"$SB_HOME/.claude/.credentials.json\"" >/dev/null 2>&1 \
-    && CLAUDE_AUTH="host-login"
+# The host file is only worth copying if it is still live. On macOS the real
+# credential is refreshed in the Keychain and this file is a snapshot that can
+# be months stale; inside the box it produces "Login expired" with no way to
+# refresh, which is worse than saying nothing because the launcher would have
+# just claimed auth was handled. Read expiresAt (epoch ms) and refuse a dead
+# one up front.
+if [ "$CLAUDE_AUTH" = "none" ] && [ -f "$HOME/.claude/.credentials.json" ] && command -v jq >/dev/null 2>&1; then
+  _exp=$(jq -r '.claudeAiOauth.expiresAt // 0' "$HOME/.claude/.credentials.json" 2>/dev/null)
+  _now_ms=$(( $(date +%s) * 1000 ))
+  if [ "${_exp:-0}" -gt "$_now_ms" ] 2>/dev/null; then
+    sbx exec "$NAME" sh -c "mkdir -p \"$SB_HOME/.claude\"" >/dev/null 2>&1
+    sbx cp "$HOME/.claude/.credentials.json" "$NAME:$SB_HOME/.claude/.credentials.json" >/dev/null 2>&1 \
+      && own_in_box "$SB_HOME/.claude/.credentials.json" \
+      && CLAUDE_AUTH="host-login"
+  else
+    CLAUDE_AUTH="stale"
+  fi
+  unset _exp _now_ms
 fi
 case "$CLAUDE_AUTH" in
   setup-token) say "SANDBOX: Claude auth: setup-token from ~/.slashwork/claude-token (revocable on its own)" ;;
-  host-login)  say "SANDBOX: Claude auth: copied your host login. To use a credential you can revoke separately, run 'claude setup-token' and save it to ~/.slashwork/claude-token" ;;
+  host-login)  say "SANDBOX: Claude auth: copied your host login (live until its expiresAt; it cannot refresh inside the box). For an unattended run use 'claude setup-token' saved to ~/.slashwork/claude-token" ;;
+  stale)       say "SANDBOX: Claude auth: ~/.claude/.credentials.json is expired (the live credential is in the Keychain and does not copy). Run 'claude setup-token' and save the token to ~/.slashwork/claude-token, then re-run." ;;
   none)        say "SANDBOX: no Claude credential found on the host; the session will ask you to /login" ;;
 esac
 
@@ -435,6 +478,18 @@ fi
 # read-only workspace, a deny-by-default network, and a box that is rebuilt
 # between legs. That is the trade, and it is only acceptable because of the
 # three things above.
+# An unattended run with no working Claude credential sits at "Not logged in"
+# for its whole budget, claiming nothing and saying nothing, which is the
+# failure this launcher exists to stop. Refuse up front; --shell is the mode
+# for logging in by hand.
+case "$CLAUDE_AUTH" in
+  setup-token|host-login) : ;;
+  *) fail "no working Claude credential for the box (auth: $CLAUDE_AUTH).
+An unattended earner cannot log in. Run 'claude setup-token' on this host,
+save the token to ~/.slashwork/claude-token (chmod 600), and re-run.
+Or './sandbox.sh --shell' to attach and /login interactively." ;;
+esac
+
 say ""
 say "SANDBOX: starting /earn $GOAL inside '$NAME' with prompts off"
 say "SANDBOX: workspace read-only, egress deny-by-default, Claude auth: $CLAUDE_AUTH"

@@ -212,7 +212,7 @@ jq -n '{
   permissions: {
     allow: [
       "Read(//tmp/slashwork-job-*.json)",
-      "Write(//tmp/slashwork-job-*.json)",
+      "Edit(//tmp/slashwork-job-*.json)",
       "Skill(slashwork-earn:earn)",
       "Skill(slashwork-earn:earn:*)"
     ],
