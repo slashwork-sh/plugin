@@ -180,12 +180,28 @@ export PATH="$STUB:$PATH" SBX_LOG="$LOG" TMP_STATE="$TMP/state"
 # HOME decides which token branch runs. Left unstubbed, the suite took one path
 # on a developer's machine and the other in CI, asserting neither.
 export HOME="$TMP/home"
+# A working Claude credential is a precondition for an unattended run, and the
+# launcher refuses without one. Seed the preferred form so the earn cases run;
+# the refusal has its own case below.
+mkdir -p "$HOME/.slashwork"; printf 'sk-ant-oat01-test-token-not-real\n' > "$HOME/.slashwork/claude-token"
 # Point the virtualization probe at the test's own filesystem. Reading the real
 # /dev/kvm made the Linux refusal pass on a Mac and fail on every CI runner.
 export SLASHWORK_KVM_DEV="$TMP/no-such-kvm"
 
 # ------------------------------------------------------------------ helpers
-reset_state() { rm -rf "$TMP_STATE"; mkdir -p "$TMP_STATE"; : > "$LOG"; }
+# Every case starts with a working Claude credential on the host, because the
+# launcher refuses an unattended run without one and a case that deletes
+# ~/.slashwork (the no-host-token case does) must not silently turn every later
+# earn run into that refusal. NO_CLAUDE_TOKEN=1 is for the refusal case itself.
+reset_state() {
+  rm -rf "$TMP_STATE"; mkdir -p "$TMP_STATE"; : > "$LOG"
+  if [ "${NO_CLAUDE_TOKEN:-0}" = "1" ]; then
+    rm -f "$HOME/.slashwork/claude-token"
+  else
+    mkdir -p "$HOME/.slashwork"
+    printf 'sk-ant-oat01-test-token-not-real\n' > "$HOME/.slashwork/claude-token"
+  fi
+}
 run_case() { reset_state; ( cd "$WORK" && ./sandbox.sh "$@" 2>&1 ); }
 # Same, but keeps state across calls so lock/unlock can be driven in sequence.
 run_keep() { : > "$LOG"; ( cd "$WORK" && ./sandbox.sh "$@" 2>&1 ); }
@@ -338,8 +354,19 @@ check "installs the plugin when absent" \
   "$(has "$LOGGED" "plugin install slashwork-earn@slashwork")" "$LOGGED"
 check "writes the marker into the sandbox HOME, naming the sandbox" \
   "$(has "$LOGGED" "'test-earner' > \"/home/agent/.slashwork-sandbox\"")" "$LOGGED"
-check "mounts the workspace read-only" "$(has "$LOGGED" "claude $WORK:ro")" "$LOGGED"
-check "starts the earn loop at the end" "$(has "$LOGGED" "run --name test-earner")" "$LOGGED"
+# sbx refuses ":ro" on the primary workspace, so the protection is that the
+# real folder is never mounted: the box gets a private copy in a scratch dir.
+check "never mounts the earner folder itself" "$(hasnt "$LOGGED" "claude $WORK")" "$LOGGED"
+check "mounts a private copy under ~/.slashwork/sandbox-ws" \
+  "$(has "$LOGGED" "claude $HOME/.slashwork/sandbox-ws/test-earner")" "$LOGGED"
+check "the private copy carries the earner settings" \
+  "$([ -f "$HOME/.slashwork/sandbox-ws/test-earner/settings.json" ] && echo 0 || echo 1)" ""
+check "the private copy does not carry the launcher" \
+  "$([ ! -f "$HOME/.slashwork/sandbox-ws/test-earner/sandbox.sh" ] && echo 0 || echo 1)" ""
+# With a setup-token the loop starts via exec so the token can be exported into
+# the session's environment rather than written anywhere the worker reads.
+check "starts the earn loop at the end, token in the session env" \
+  "$(has "$LOGGED" "exec test-earner sh -c export CLAUDE_CODE_OAUTH_TOKEN")" "$LOGGED"
 check "prompts are off inside the box" "$(has "$LOGGED" "dangerously-skip-permissions")" "$LOGGED"
 check "the earn goal is passed in" "$(has "$LOGGED" "/earn 30m")" "$LOGGED"
 check "says which Claude credential it used" "$(has "$OUT" "Claude auth")" "$OUT"
@@ -347,7 +374,7 @@ check "says which Claude credential it used" "$(has "$OUT" "Claude auth")" "$OUT
 OUT=$(STUB_EXISTS=1 run_case); LOGGED=$(cat "$LOG")
 check "re-run does not recreate an existing sandbox" \
   "$(hasnt "$LOGGED" "create --name")" "$LOGGED"
-check "re-run still attaches" "$(has "$LOGGED" "run --name test-earner")" "$LOGGED"
+check "re-run still attaches" "$(has "$LOGGED" "exec test-earner sh -c export CLAUDE_CODE_OAUTH_TOKEN")" "$LOGGED"
 check "re-run still starts the loop with prompts off" "$(has "$LOGGED" "dangerously-skip-permissions")" "$LOGGED"
 check "re-run does not offer the lock hint again" "$(hasnt "$OUT" "install-only egress")" "$OUT"
 
@@ -365,16 +392,22 @@ check "rejects a garbage HOME probe result" "$(has "$OUT" "could not read")" "$O
 rm -rf "$HOME/.slashwork"
 OUT=$(STUB_EXISTS=1 run_case); LOGGED=$(cat "$LOG")
 check "no host token: says so" "$(has "$OUT" "no host token")" "$OUT"
-check "no host token: copies nothing" "$(hasnt "$LOGGED" "cp ")" "$LOGGED"
+check "no host token: copies nothing" "$(hasnt "$LOGGED" ".slashwork/token test-earner")" "$LOGGED"
 
 mkdir -p "$HOME/.slashwork"; echo tok > "$HOME/.slashwork/token"
 OUT=$(STUB_EXISTS=1 STUB_TOKEN_IN_BOX=0 run_case); LOGGED=$(cat "$LOG")
 check "copies the token to the sandbox HOME" \
   "$(has "$LOGGED" "cp $HOME/.slashwork/token test-earner:/home/agent/.slashwork/token")" "$LOGGED"
 check "tightens the copied token to 600" "$(has "$LOGGED" "chmod 600")" "$LOGGED"
+# `sbx cp` preserves host uid/gid, so a 600 file from a Mac arrives owned by
+# 501:dialout in a box whose agent is `agent`, unreadable, and the failure is
+# silent ("Not logged in", "no token"). The copy must hand the file to HOME's
+# owner, as root.
+check "hands the copied token to the box user" \
+  "$(has "$LOGGED" "exec -u root test-earner sh -c chown")" "$LOGGED"
 
 OUT=$(STUB_EXISTS=1 STUB_TOKEN_IN_BOX=1 run_case); LOGGED=$(cat "$LOG")
-check "token already in the box: no second copy" "$(hasnt "$LOGGED" "cp ")" "$LOGGED"
+check "token already in the box: no second copy" "$(hasnt "$LOGGED" ".slashwork/token test-earner")" "$LOGGED"
 
 OUT=$(STUB_EXISTS=1 STUB_TOKEN_IN_BOX=0 STUB_FAIL=cp run_case)
 check "warns when the token copy fails" "$(has "$OUT" "token copy failed")" "$OUT"
@@ -454,7 +487,7 @@ check "--rebuild recreates it afterwards" "$(has "$LOGGED" "create --name test-e
 check "--rebuild removes before it creates" \
   "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'rm test-earner' | head -1 | cut -d: -f1)" \
      -lt "$(printf '%s\n' "$LOGGED" | grep -n 'create --name' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
-check "--rebuild attaches at the end" "$(has "$LOGGED" "run --name test-earner")" "$LOGGED"
+check "--rebuild attaches at the end" "$(has "$LOGGED" "exec test-earner sh -c export CLAUDE_CODE_OAUTH_TOKEN")" "$LOGGED"
 
 # sbx rm refuses a running sandbox; discarding that made --rebuild a silent
 # no-op that attached to the box it was asked to destroy.
@@ -469,6 +502,18 @@ OUT=$(run_case --lokc)
 check "an unknown flag prints usage" "$(has "$OUT" "usage:")" "$OUT"
 check "an unknown flag exits 2" "$(is "$(rc_of --lokc)" 2)" ""
 check "an unknown flag touches no sandbox" "$(nolog "create")" "$(cat "$LOG")"
+
+# --------------------------------------------- 10b: no credential, no run
+# A box parked at "Not logged in" for its whole budget is the silent failure
+# the launcher exists to stop, so an unattended run without a working Claude
+# credential must refuse up front rather than start.
+OUT=$(NO_CLAUDE_TOKEN=1 STUB_EXISTS=0 run_case --earn 8h); LOGGED=$(cat "$LOG")
+check "refuses an unattended run with no Claude credential" "$(is "$(NO_CLAUDE_TOKEN=1 rc_of --earn 8h)" 1)" ""
+check "the refusal names setup-token as the fix" "$(has "$OUT" "claude setup-token")" "$OUT"
+check "the refusal starts no session" "$(hasnt "$LOGGED" "dangerously-skip-permissions")" "$LOGGED"
+OUT=$(NO_CLAUDE_TOKEN=1 STUB_EXISTS=0 run_case --shell); LOGGED=$(cat "$LOG")
+check "--shell still attaches without a credential, for /login by hand" \
+  "$(has "$LOGGED" "run --name test-earner")" "$LOGGED"
 
 # -------------------------------------------- 11: single command and legs
 # ./sandbox.sh --earn GOAL is the product: one command, prompts off inside,
