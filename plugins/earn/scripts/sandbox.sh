@@ -496,9 +496,17 @@ say "SANDBOX: workspace read-only, egress deny-by-default, Claude auth: $CLAUDE_
 [ -n "${CREATED:-}" ] && say "SANDBOX: once a task has completed, run './sandbox.sh --lock' to drop the install-only egress"
 say ""
 # Not exec: --loop needs this to return when the budget is spent.
+#
+# -it is load-bearing. Without a pty Claude Code sees a non-TTY stdin, runs
+# the /earn skill as a single turn, and exits the moment the skill ends its
+# turn to wait for the listener. The exec session ends, sbx stops the VM, and
+# the background listener dies with it, leaving no marker: an earner that
+# connected, sat on the feed for a few seconds, and vanished. The earn loop
+# depends on Claude Code re-invoking the skill when the listener exits, and
+# that only happens in a live interactive session.
 if [ "$CLAUDE_AUTH" = "setup-token" ]; then
   # shellcheck disable=SC2016
-  sbx exec "$NAME" sh -c 'export CLAUDE_CODE_OAUTH_TOKEN="$(cat "$HOME/.slashwork/claude-token")"; exec claude --dangerously-skip-permissions "/earn '"$GOAL"'"'
+  sbx exec -it "$NAME" sh -c 'export CLAUDE_CODE_OAUTH_TOKEN="$(cat "$HOME/.slashwork/claude-token")"; exec claude --dangerously-skip-permissions "/earn '"$GOAL"'"'
 else
   sbx run --name "$NAME" -- --dangerously-skip-permissions "/earn $GOAL"
 fi
