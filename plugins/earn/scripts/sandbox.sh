@@ -241,7 +241,11 @@ if [ "$MODE" = "rebuild" ]; then
   # nothing -- the worst possible outcome for the one command an earner reaches
   # for when they suspect a task compromised it.
   sbx stop "$NAME" >/dev/null 2>&1
-  sbx rm "$NAME" >/dev/null 2>&1
+  # -f is load-bearing: without it `sbx rm` asks for confirmation, and with
+  # its output sent to /dev/null and a pty attached (under screen, say) that
+  # prompt is invisible and waits forever. --loop's first rebuild hung on it
+  # for ten minutes with nothing on screen.
+  sbx rm -f "$NAME" >/dev/null 2>&1
   if sbx ls -q 2>/dev/null | grep -qx "$NAME"; then
     fail "could not remove '$NAME'; it still exists. Stop it and retry:
   sbx stop $NAME && sbx rm $NAME"
@@ -259,7 +263,11 @@ if [ "$MODE" = "loop" ]; then
   for leg in $(seq 1 "$LEGS"); do
     say "SANDBOX: leg $leg of $LEGS, rebuilding '$NAME' so nothing a previous task planted survives"
     sbx stop "$NAME" >/dev/null 2>&1
-    sbx rm "$NAME" >/dev/null 2>&1
+    # -f is load-bearing: without it `sbx rm` asks for confirmation, and with
+  # its output sent to /dev/null and a pty attached (under screen, say) that
+  # prompt is invisible and waits forever. --loop's first rebuild hung on it
+  # for ten minutes with nothing on screen.
+  sbx rm -f "$NAME" >/dev/null 2>&1
     if sbx ls -q 2>/dev/null | grep -qx "$NAME"; then
       fail "could not remove '$NAME' before leg $leg; refusing to reuse a box a task may have altered"
     fi

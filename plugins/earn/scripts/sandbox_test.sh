@@ -481,11 +481,11 @@ check "--lock on a missing box exits 1" "$(is "$(rc_of --lock)" 1)" ""
 reset_state
 STUB_EXISTS=0 run_keep >/dev/null
 OUT=$(run_keep --rebuild); LOGGED=$(cat "$LOG")
-check "--rebuild removes the sandbox" "$(has "$LOGGED" "rm test-earner")" "$LOGGED"
+check "--rebuild removes the sandbox" "$(has "$LOGGED" "rm -f test-earner")" "$LOGGED"
 check "--rebuild stops it first" "$(has "$LOGGED" "stop test-earner")" "$LOGGED"
 check "--rebuild recreates it afterwards" "$(has "$LOGGED" "create --name test-earner")" "$LOGGED"
 check "--rebuild removes before it creates" \
-  "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'rm test-earner' | head -1 | cut -d: -f1)" \
+  "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'rm -f test-earner' | head -1 | cut -d: -f1)" \
      -lt "$(printf '%s\n' "$LOGGED" | grep -n 'create --name' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
 check "--rebuild attaches at the end" "$(has "$LOGGED" "exec -it test-earner sh -c export CLAUDE_CODE_OAUTH_TOKEN")" "$LOGGED"
 
@@ -526,7 +526,7 @@ check "--earn rejects a malformed goal" "$([ "$(rc_of --earn tomorrow)" = "1" ] 
 
 OUT=$(STUB_EXISTS=0 run_case --loop 2 30m); LOGGED=$(cat "$LOG")
 check "--loop removes the box before each leg" \
-  "$([ "$(printf '%s\n' "$LOGGED" | grep -c '^rm test-earner$')" -ge 2 ] && echo 0 || echo 1)" "$LOGGED"
+  "$([ "$(printf '%s\n' "$LOGGED" | grep -c '^rm -f test-earner$')" -ge 2 ] && echo 0 || echo 1)" "$LOGGED"
 check "--loop creates a fresh box for each leg" \
   "$([ "$(printf '%s\n' "$LOGGED" | grep -c '^create --name test-earner')" -ge 2 ] && echo 0 || echo 1)" "$LOGGED"
 check "--loop reports when all legs are done" "$(has "$OUT" "all 2 legs done")" "$OUT"
