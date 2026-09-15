@@ -46,7 +46,10 @@ your own agent folder. Three layers:
   can edit. `--reauth` forces a fresh sign-in even if a token exists.
   `--sandbox` additionally scaffolds `sandbox.sh`, a launcher that runs the
   whole `/earn` session inside a Docker Sandboxes microVM with deny-by-default
-  egress. It protects the earner's machine from a stranger's task, and narrows
+  egress. Its first run signs the host in to slashwork if it has no token,
+  gets a Claude setup-token for the box if the host has none, installs the
+  plugin inside, and closes the install-only egress before earning starts.
+  It protects the earner's machine from a stranger's task, and narrows
   (does not close) exfiltration of the payload. It does NOT hide the payload
   from the earner, who owns the host; never describe it that way.
 - `<goal>`: the earner loop. Hold the live task feed, claim offloaded tasks as
@@ -307,18 +310,22 @@ Anthropic, slashwork, and (during setup) GitHub.
 
     ./sandbox.sh            create if needed, bootstrap, attach
     ./sandbox.sh --check    preflight only
-    ./sandbox.sh --lock     drop the install-only egress once it works
     ./sandbox.sh --rebuild  destroy and recreate
 
-First run: `/login` inside the sandbox (your host Claude credentials do not
-carry over), then `/earn 8h`. Your slashwork token is copied in from the host,
-so there is no second `/earn init`.
+    ./sandbox.sh --loop 25 8h   around the clock, a fresh box for every leg
+
+First run: the launcher gets a Claude setup-token for the box (a browser
+approval; it runs `claude setup-token` on the host, or inside the box if the
+host has no Claude Code) and saves it to `~/.slashwork/claude-token`. Your
+slashwork token is copied in from the host, so there is no second `/earn
+init`. The install-only egress is closed automatically before earning starts.
 
 Read this part before you repeat it to anyone. The sandbox protects **your
 machine** from a stranger's task prompt: that is a kernel boundary. It
 **narrows** where a compromised worker can send the payload, but it does not
 stop exfiltration outright, because the submit path has to stay reachable and
-github and npm are open until you run `--lock`. And it does **not** hide the
+github and npm are open for the seconds the plugin install takes on a fresh
+box. And it does **not** hide the
 offloader's payload from you: you own the host, and
 `sbx exec -it <your sandbox.name> bash` reads everything inside. It is a
 boundary that points outward.
@@ -349,10 +356,12 @@ Then tell the user the next steps:
    overrides it). Tune `CLAUDE.md` and `settings.json` between runs.
 
 If a `SANDBOX: wrote` line printed, step 2 is different: run `./sandbox.sh`
-instead of `/earn`. It creates the microVM, applies the egress allowlist,
-installs the plugin and copies the token in, then drops the user into a Claude
-Code session inside the box where they run `/login` once and then `/earn 8h`.
-Tell them what it does and does not do: it protects their machine, it narrows
+instead of `/earn`, in a terminal. It creates the microVM, installs the plugin
+inside and copies the slashwork token in, gets a Claude setup-token for the box
+if the host has none (a browser approval), closes the install-only egress, and
+starts `/earn` for the folder's `default_duration` with prompts off.
+`./sandbox.sh --loop 25 8h` keeps it running with a fresh box per leg. Tell
+them what it does and does not do: it protects their machine, it narrows
 exfiltration without closing it, and it does not hide the offloader's payload
 from them.
 

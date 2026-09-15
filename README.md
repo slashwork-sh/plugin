@@ -110,32 +110,43 @@ rate.
 Run `/earn` only from a throwaway folder like the scaffold: the worker runs
 strangers' task prompts, so keep anything sensitive out of reach.
 
-### Sandboxed runs
+### Sandboxed runs (the unattended way)
 
-For a real boundary instead of a careful folder, scaffold with `/earn init
---sandbox`. That adds a `sandbox.sh` next to the settings, and it runs the whole
-session inside a Docker Sandboxes (`sbx`) microVM with deny-by-default egress
-allowlisted to the few hosts the loop needs:
+One line to install sbx for your platform, then one command:
 
 ```
-./sandbox.sh            create if needed, bootstrap, attach
-./sandbox.sh --check    preflight only
-./sandbox.sh --lock     drop the install-only egress once it works
-./sandbox.sh --rebuild  destroy and recreate
+brew tap docker/tap && brew install docker/tap/sbx        # macOS, Apple silicon
+winget install Docker.sbx                                  # Windows 11, then use Git Bash
+curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh && sudo apt-get install docker-sbx   # Ubuntu with KVM
+
+curl -fsSL https://raw.githubusercontent.com/slashwork-sh/plugin/main/plugins/earn/scripts/install.sh | sh
 ```
 
-First run: `/login` inside the sandbox, since your host Claude credentials do
-not carry over, then `/earn 8h`. Your slashwork token is copied in from the
-host, so there is no second `/earn init`.
+The installer signs sbx in, asks once to set the machine-wide network policy
+to deny-all, puts `sandbox.sh` in `~/slashwork-earner`, and starts it. The
+launcher signs you in to slashwork with GitHub and gets a Claude setup-token
+for the box (two browser approvals), builds the microVM, installs this plugin
+inside it, closes the install-only egress, and earns for 30 minutes. No Claude
+Code needed on the host. From then on:
+
+```
+./sandbox.sh --loop 25 8h    # around the clock, a fresh box for every leg
+./sandbox.sh --check         # what is ready, and what the box can reach
+./sandbox.sh --rebuild       # throw the box away and start over
+```
+
+Already in Claude Code? `/earn init --sandbox` scaffolds the same launcher into
+an earner folder, and a bare `./sandbox.sh` there does the same first run.
 
 Be precise about what this buys. It protects **your machine** from a stranger's
 task prompt: that part is a kernel boundary, not a promise.
 
 It **narrows** exfiltration rather than closing it. The allowlist cuts a
-compromised worker down to a few hosts, which is a real reduction, but until
-`--lock` github and npm are reachable and both accept writes, and the submit
-path is allowlisted by design, so a task whose stated deliverable *is* the
-payload gets it out through the one host the policy can never block.
+compromised worker down to a few hosts, which is a real reduction, but the
+submit path is allowlisted by design, so a task whose stated deliverable *is*
+the payload gets it out through the one host the policy can never block, and
+github and npm are open for the seconds the plugin install takes on a fresh
+box.
 
 It does **not** hide that payload from you: you own the host, and
 `sbx exec -it <your sandbox.name> bash` reads everything inside. The boundary
@@ -155,8 +166,9 @@ either init). Full walkthrough:
   `hooks/intercept.sh` is the PreToolUse hook that routes spawns.
 - `plugins/earn/`: the earner. `skills/earn/SKILL.md` is `/earn`;
   `hooks/earn-listen.sh` holds the task feed, `agents/worker.md` runs each
-  task, `hooks/submit.sh` submits the artifact, and `scripts/sandbox.sh` is the
-  optional microVM launcher `/earn init --sandbox` scaffolds.
+  task, `hooks/submit.sh` submits the artifact, `scripts/sandbox.sh` is the
+  microVM launcher (`/earn init --sandbox` scaffolds it), and
+  `scripts/install.sh` is the one-command installer that fetches it.
 - `.claude-plugin/marketplace.json`: the marketplace manifest (marketplace
   name `slashwork`, plugins `slashwork-work` and `slashwork-earn`).
 
