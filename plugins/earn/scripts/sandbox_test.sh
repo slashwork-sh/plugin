@@ -25,6 +25,9 @@
 #
 # Run: bash plugins/earn/scripts/sandbox_test.sh
 set -uo pipefail
+# Never a terminal on stdin: the launcher's paste-the-token fallback reads one,
+# and a suite that blocks on a prompt is worse than one that fails.
+exec </dev/null
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 LAUNCHER="$HERE/sandbox.sh"
@@ -71,6 +74,8 @@ SH
 #   STUB_TOOLS=0         jq/curl are missing in the box
 #   STUB_PLUGIN=1        the earn plugin is already installed in the box
 #   STUB_TOKEN_IN_BOX=1  the box already holds a token
+#   STUB_SETUP_TOKEN=1   `claude setup-token` inside the box prints a token
+#   STUB_CURL_NOAUTH=1   the coordinator's sign-in start returns nothing
 #   STUB_FAIL="a b"      subcommands to exit 1 on
 #   STUB_FAIL_MATCH=s    exit 1 when the whole argv contains s
 cat > "$STUB/sbx" <<'SH'
@@ -170,12 +175,39 @@ case "$1" in
       *'command -v jq'*)     [ "${STUB_TOOLS:-1}" = "1" ] || exit 1 ;;
       *'plugin list'*)       [ "${STUB_PLUGIN:-0}" = "1" ] || exit 1 ;;
       *'.slashwork/token'*)  [ "${STUB_TOKEN_IN_BOX:-0}" = "1" ] || exit 1 ;;
+      *setup-token*)         [ "${STUB_SETUP_TOKEN:-0}" = "1" ] && echo "Token: sk-ant-oat01-frombox0000000000000000" ;;
     esac
     exit 0 ;;
 esac
 exit 0
 SH
-chmod +x "$STUB/uname" "$STUB/sbx"
+
+# The coordinator's device flow, so a host with no token signs in without the
+# network. Logged to the same file as sbx so a case can prove it did NOT run.
+cat > "$STUB/curl" <<'SH'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >> "$SBX_LOG"
+case "$*" in
+  *auth/cli/start*)
+    [ "${STUB_CURL_NOAUTH:-0}" = "1" ] && exit 0
+    echo '{"request_id":"r1","verify_url":"https://slashwork.sh/auth/cli/r1"}' ;;
+  *auth/cli/r1/token*) printf '{"token":"tok-from-flow"}\n200' ;;
+esac
+exit 0
+SH
+# A browser must never open from the suite.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB/open"; cp "$STUB/open" "$STUB/xdg-open"
+# A host Claude Code that prints a setup-token, for the on-host path. Kept OUT
+# of $STUB so the default is "no claude on the host" and the real one is never
+# reached (SLASHWORK_CLAUDE_BIN below points at nothing).
+mkdir -p "$TMP/hostclaude"
+cat > "$TMP/hostclaude/claude" <<'SH'
+#!/usr/bin/env bash
+echo "Visit https://claude.ai/oauth/... to approve"
+echo "sk-ant-oat01-fromhost000000000000000000"
+SH
+chmod +x "$STUB/uname" "$STUB/sbx" "$STUB/curl" "$STUB/open" "$STUB/xdg-open" "$TMP/hostclaude/claude"
+export SLASHWORK_CLAUDE_BIN="$TMP/no-such-claude" SLASHWORK_AUTH_POLL_SECS=0
 export PATH="$STUB:$PATH" SBX_LOG="$LOG" TMP_STATE="$TMP/state"
 # HOME decides which token branch runs. Left unstubbed, the suite took one path
 # on a developer's machine and the other in CI, asserting neither.
@@ -214,14 +246,15 @@ check() { # check <description> <condition-result> <detail>
   if [ "$2" = "0" ]; then printf 'ok   %s\n' "$1"
   else printf 'FAIL %s\n     %s\n' "$1" "$3"; FAILED=1; fi
 }
-has()  { printf '%s' "$1" | grep -qF "$2" && echo 0 || echo 1; }
+# `--` so a needle that starts with a dash (`--loop 25 8h`) is a needle, not a flag.
+has()  { printf '%s' "$1" | grep -qF -- "$2" && echo 0 || echo 1; }
 # Empty input must NOT satisfy a negative assertion: a case that died before
 # producing output would otherwise report ok for every hasnt in the suite.
-hasnt(){ [ -n "$1" ] || { echo 1; return; }; printf '%s' "$1" | grep -qF "$2" && echo 1 || echo 0; }
+hasnt(){ [ -n "$1" ] || { echo 1; return; }; printf '%s' "$1" | grep -qF -- "$2" && echo 1 || echo 0; }
 is()   { [ "$1" = "$2" ] && echo 0 || echo 1; }
 # "nothing reached sbx" is legitimately proved by an empty log, so this one must
 # NOT inherit hasnt's empty-input rule. Reads $LOG directly.
-nolog(){ grep -qF "$1" "$LOG" 2>/dev/null && echo 1 || echo 0; }
+nolog(){ grep -qF -- "$1" "$LOG" 2>/dev/null && echo 1 || echo 0; }
 
 # ------------------------------------------------------------------- 1: check
 OUT=$(STUB_EXISTS=0 run_case --check)
@@ -310,11 +343,19 @@ mk_folder nosettings ""
 OUT=$(run_in nosettings --check)
 check "no settings.json falls back to the built-in defaults" \
   "$(has "$OUT" "name=slashwork-earner memory=4g cpus=2")" "$OUT"
+# A launcher alone in a folder is a whole earner: it writes what the box needs.
+check "an empty folder gets a settings.json" \
+  "$([ -f "$TMP/nosettings/settings.json" ] && jq -e '.sandbox.enabled == true' "$TMP/nosettings/settings.json" >/dev/null && echo 0 || echo 1)" ""
+check "an empty folder gets a CLAUDE.md playbook" \
+  "$(has "$(cat "$TMP/nosettings/CLAUDE.md" 2>/dev/null)" "slashwork earner agent")" ""
+check "says where the playbook went" "$(has "$OUT" "wrote $TMP/nosettings/CLAUDE.md")" "$OUT"
 
 mk_folder badjson '{"sandbox":'
 OUT=$(run_in badjson --check)
 check "malformed settings.json falls back to the defaults" \
   "$(has "$OUT" "name=slashwork-earner memory=4g cpus=2")" "$OUT"
+check "an existing settings.json is never overwritten, even malformed" \
+  "$(is "$(cat "$TMP/badjson/settings.json")" '{"sandbox":')" ""
 
 # Refuse, do not repair. A silently corrected name points --lock at a DIFFERENT
 # sandbox than the one settings.json asks for.
@@ -379,6 +420,25 @@ check "the earn goal is passed in" "$(has "$LOGGED" "/earn 30m")" "$LOGGED"
 check "stops the box when the earn session ends" "$(has "$LOGGED" "stop test-earner")" "$LOGGED"
 check "reports the leg ending" "$(has "$OUT" "leg ended")" "$OUT"
 check "says which Claude credential it used" "$(has "$OUT" "Claude auth")" "$OUT"
+# The setup egress is for the installs and nothing else, so a fresh box is
+# locked on the same run, after the plugin install and before the earn starts.
+check "closes the setup egress on the fresh run" \
+  "$(has "$LOGGED" "policy rm network --sandbox test-earner --resource github.com,api.github.com,*.githubusercontent.com,registry.npmjs.org")" "$LOGGED"
+check "reports the lock it verified" "$(has "$OUT" "locked. github.com is denied")" "$OUT"
+check "installs the plugin before closing the egress it needs" \
+  "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'plugin install' | head -1 | cut -d: -f1)" \
+     -lt "$(printf '%s\n' "$LOGGED" | grep -n 'policy rm network' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
+check "closes the egress before the earn session starts" \
+  "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'policy rm network' | head -1 | cut -d: -f1)" \
+     -lt "$(printf '%s\n' "$LOGGED" | grep -n 'dangerously-skip-permissions' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
+check "no manual --lock step is asked for" "$(hasnt "$OUT" "run './sandbox.sh --lock'")" "$OUT"
+check "a bare run ends with the loop hint" "$(has "$OUT" "--loop 25 8h")" "$OUT"
+
+# A box whose setup egress cannot be closed does not run: the docs say locked.
+OUT=$(STUB_EXISTS=0 STUB_RM_NOOP=1 run_case); LOGGED=$(cat "$LOG")
+check "refuses to run a fresh box it could not lock" "$(has "$OUT" "Refusing to run the box open")" "$OUT"
+check "an unlockable fresh box exits 1" "$(is "$(STUB_EXISTS=0 STUB_RM_NOOP=1 rc_of)" 1)" ""
+check "an unlockable fresh box starts no session" "$(hasnt "$LOGGED" "dangerously-skip-permissions")" "$LOGGED"
 
 OUT=$(STUB_EXISTS=1 run_case); LOGGED=$(cat "$LOG")
 check "re-run does not recreate an existing sandbox" \
@@ -402,10 +462,27 @@ OUT=$(STUB_EXISTS=1 STUB_SB_HOME='/home/x; rm -rf /' run_case)
 check "rejects a garbage HOME probe result" "$(has "$OUT" "could not read")" "$OUT"
 
 # --------------------------------------------------------------- 5: the token
+# No slashwork token on the host: the launcher signs in itself, with the same
+# device flow /earn init uses, so the one-line installer needs no Claude Code
+# on the host. reset_state re-creates ~/.slashwork with only the Claude token.
 rm -rf "$HOME/.slashwork"
 OUT=$(STUB_EXISTS=1 run_case); LOGGED=$(cat "$LOG")
-check "no host token: says so" "$(has "$OUT" "no host token")" "$OUT"
-check "no host token: copies nothing" "$(hasnt "$LOGGED" ".slashwork/token test-earner")" "$LOGGED"
+check "no host token: starts the sign-in" "$(has "$LOGGED" "curl -sS --max-time 20 -X POST https://slashwork.sh/auth/cli/start")" "$LOGGED"
+check "no host token: shows the verify URL" "$(has "$OUT" "open https://slashwork.sh/auth/cli/r1")" "$OUT"
+check "no host token: saves the token it was granted" \
+  "$(is "$(cat "$HOME/.slashwork/token" 2>/dev/null)" "tok-from-flow")" ""
+check "no host token: the fresh token is copied into the box" \
+  "$(has "$LOGGED" "cp $HOME/.slashwork/token test-earner:/home/agent/.slashwork/token")" "$LOGGED"
+check "the token file is private" "$(is "$(stat -f %Lp "$HOME/.slashwork/token" 2>/dev/null || stat -c %a "$HOME/.slashwork/token")" 600)" ""
+
+rm -rf "$HOME/.slashwork"
+OUT=$(STUB_EXISTS=1 run_case --check); LOGGED=$(cat "$LOG")
+check "--check never signs in" "$(hasnt "$LOGGED" "auth/cli/start")" "$LOGGED"
+rm -f "$HOME/.slashwork/token"
+OUT=$(STUB_EXISTS=1 STUB_CURL_NOAUTH=1 run_case); LOGGED=$(cat "$LOG")
+check "a sign-in that cannot start refuses" "$(has "$OUT" "could not start a sign-in")" "$OUT"
+check "a failed sign-in exits 1" "$(is "$( ( cd "$WORK" && rm -f "$HOME/.slashwork/token"; STUB_EXISTS=1 STUB_CURL_NOAUTH=1 ./sandbox.sh >/dev/null 2>&1 ); echo $?)" 1)" ""
+check "a failed sign-in builds nothing" "$(hasnt "$LOGGED" "create --name")" "$LOGGED"
 
 mkdir -p "$HOME/.slashwork"; echo tok > "$HOME/.slashwork/token"
 OUT=$(STUB_EXISTS=1 STUB_TOKEN_IN_BOX=0 run_case); LOGGED=$(cat "$LOG")
@@ -478,8 +555,10 @@ OUT=$(run_keep --check)
 check "--unlock actually allows github again" "$(has "$OUT" "github.com  allowed")" "$OUT"
 
 # A removal that exits 0 having removed nothing must NOT be reported as locked.
+# The fresh run locks the box itself, so reopen it first to give --lock work.
 reset_state
 STUB_EXISTS=0 run_keep >/dev/null
+run_keep --unlock >/dev/null
 OUT=$(STUB_RM_NOOP=1 run_keep --lock)
 check "--lock refuses to claim a lock it could not verify" \
   "$(has "$OUT" "still allowed")" "$OUT"
@@ -527,6 +606,33 @@ check "the refusal starts no session" "$(hasnt "$LOGGED" "dangerously-skip-permi
 OUT=$(NO_CLAUDE_TOKEN=1 STUB_EXISTS=0 run_case --shell); LOGGED=$(cat "$LOG")
 check "--shell still attaches without a credential, for /login by hand" \
   "$(has "$LOGGED" "run --name test-earner")" "$LOGGED"
+check "--shell does not run setup-token" "$(hasnt "$LOGGED" "setup-token")" "$LOGGED"
+
+# With no credential the launcher gets one on the way instead of refusing:
+# on the host when Claude Code is there, otherwise inside the box. The token
+# is read off the output and saved on the HOST for every later leg.
+OUT=$(NO_CLAUDE_TOKEN=1 STUB_EXISTS=0 SLASHWORK_CLAUDE_BIN="$TMP/hostclaude/claude" run_case --earn 8h); LOGGED=$(cat "$LOG")
+check "no credential, host claude: runs setup-token on the host" "$(has "$OUT" "setup-token' here")" "$OUT"
+check "no credential, host claude: saves the token on the host" \
+  "$(is "$(cat "$HOME/.slashwork/claude-token" 2>/dev/null)" "sk-ant-oat01-fromhost000000000000000000")" ""
+check "no credential, host claude: starts the session with it" \
+  "$(has "$LOGGED" "exec -it test-earner sh -c export CLAUDE_CODE_OAUTH_TOKEN")" "$LOGGED"
+check "no credential, host claude: reports setup-token auth" "$(has "$OUT" "Claude auth: setup-token")" "$OUT"
+
+OUT=$(NO_CLAUDE_TOKEN=1 STUB_EXISTS=0 STUB_SETUP_TOKEN=1 run_case --earn 8h); LOGGED=$(cat "$LOG")
+check "no credential, no host claude: runs setup-token inside the box" \
+  "$(has "$LOGGED" "exec -it test-earner sh -c claude setup-token")" "$LOGGED"
+check "no credential, no host claude: saves the token on the host" \
+  "$(is "$(cat "$HOME/.slashwork/claude-token" 2>/dev/null)" "sk-ant-oat01-frombox0000000000000000")" ""
+check "no credential, no host claude: starts the session with it" \
+  "$(has "$LOGGED" "dangerously-skip-permissions")" "$LOGGED"
+check "the setup-token output is not left in the box" "$(has "$LOGGED" "rm -f /tmp/slashwork-setup-token.out")" "$LOGGED"
+
+# The stub prints something that is not a token: nothing is saved, and with no
+# terminal to paste into, the run refuses as before.
+OUT=$(NO_CLAUDE_TOKEN=1 STUB_EXISTS=0 run_case --earn 8h)
+check "garbage from setup-token saves nothing" "$([ ! -f "$HOME/.slashwork/claude-token" ] && echo 0 || echo 1)" ""
+check "garbage from setup-token still refuses" "$(has "$OUT" "no working Claude credential")" "$OUT"
 
 # -------------------------------------------- 11: single command and legs
 # ./sandbox.sh --earn GOAL is the product: one command, prompts off inside,

@@ -11,7 +11,12 @@
   `sandbox` (`enabled`, `name`, `memory`, `cpus`).
 - `--sandbox` additionally copies `scripts/sandbox.sh` into the folder. It runs
   the whole session inside a Docker Sandboxes (`sbx`) microVM with a
-  deny-by-default egress allowlist, and sets `sandbox.enabled`. Step 1 prints a
+  deny-by-default egress allowlist, and sets `sandbox.enabled`. The launcher
+  is also a whole earner on its own: `scripts/install.sh` (the one-command
+  installer, `curl ... | sh`) fetches it into `~/slashwork-earner` with no
+  Claude Code on the host, and it writes its own `settings.json` and
+  `CLAUDE.md`, signs the host in to slashwork, and gets a Claude setup-token
+  on its first run. Step 1 prints a
   `SANDBOX:` posture line next to `ACCOUNT:` so a folder configured for a
   sandbox but running on the host is visible before any task is claimed.
 
@@ -19,7 +24,8 @@
   protects the **earner's machine** from a stranger's task prompt: a kernel
   boundary. Its egress allowlist **narrows** exfiltration of the offloader's
   payload without closing it, because the submit path must stay reachable and
-  the pre-`--lock` allowlist includes write-capable APIs; write "narrows",
+  github and npm are open during the plugin install on a fresh box (the
+  launcher closes them itself before earning starts); write "narrows",
   never "prevents" or "nowhere to send". It gives the offloader **no privacy
   from the earner**, who owns the host and can read the whole sandbox with
   `sbx exec -it <name> bash`. The `SANDBOX:` marker is our own file and the
