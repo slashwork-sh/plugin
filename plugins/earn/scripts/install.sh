@@ -46,8 +46,9 @@ command -v jq >/dev/null 2>&1 || die "jq is not installed (macOS: brew install j
 
 # Piped through sh, stdin is this script, so every answer and the launcher's
 # interactive session come from the terminal directly.
-[ -r "$TTY" ] && [ -w "$TTY" ] \
-  || die "no terminal at $TTY. This needs one: it opens sign-in pages and asks one question. Run it from a terminal, not from a script or a cron job."
+if [ ! -r "$TTY" ] || [ ! -w "$TTY" ]; then
+  die "no terminal at $TTY. This needs one: it opens sign-in pages and asks one question. Run it from a terminal, not from a script or a cron job."
+fi
 
 # ------------------------------------------------------------------- docker
 # `sbx daemon status` exits 0 whether the daemon is up or not; read the line.
