@@ -432,6 +432,26 @@ check "closes the egress before the earn session starts" \
   "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'policy rm network' | head -1 | cut -d: -f1)" \
      -lt "$(printf '%s\n' "$LOGGED" | grep -n 'dangerously-skip-permissions' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
 check "no manual --lock step is asked for" "$(hasnt "$OUT" "run './sandbox.sh --lock'")" "$OUT"
+# An unattended earner cannot answer a modal. Claude Code 2.1.263 added the
+# auto-mode opt-in dialog, which parked a real box for its whole budget with a
+# task claimed, so every one of these is pre-answered before the session runs.
+for k in skipAutoPermissionPrompt bypassPermissionsModeAccepted skipDangerousModePermissionPrompt; do
+  check "pre-accepts $k inside the box" "$(has "$LOGGED" "$k")" "$LOGGED"
+done
+check "pre-accepts the dialogs only after jq is there to merge with" \
+  "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'skipAutoPermissionPrompt' | head -1 | cut -d: -f1)" \
+     -gt "$(printf '%s\n' "$LOGGED" | grep -n 'command -v jq' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
+check "pre-accepts the dialogs before the session starts" \
+  "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'skipAutoPermissionPrompt' | head -1 | cut -d: -f1)" \
+     -lt "$(printf '%s\n' "$LOGGED" | grep -n 'dangerously-skip-permissions' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
+# A reused box still holds the previous leg's marker, and the watchdog greps
+# every marker for budget_spent, so a stale one stopped the box about half a
+# minute in, before anything was claimed.
+check "clears stale earn markers before the leg" \
+  "$(has "$LOGGED" "rm -f /tmp/slashwork-earn-")" "$LOGGED"
+check "clears them before the session starts" \
+  "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'rm -f /tmp/slashwork-earn-' | head -1 | cut -d: -f1)" \
+     -lt "$(printf '%s\n' "$LOGGED" | grep -n 'dangerously-skip-permissions' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
 check "a bare run ends with the loop hint" "$(has "$OUT" "--loop 25 8h")" "$OUT"
 
 # A box whose setup egress cannot be closed does not run: the docs say locked.
