@@ -493,7 +493,13 @@ check "no host token: saves the token it was granted" \
   "$(is "$(cat "$HOME/.slashwork/token" 2>/dev/null)" "tok-from-flow")" ""
 check "no host token: the fresh token is copied into the box" \
   "$(has "$LOGGED" "cp $HOME/.slashwork/token test-earner:/home/agent/.slashwork/token")" "$LOGGED"
-check "the token file is private" "$(is "$(stat -f %Lp "$HOME/.slashwork/token" 2>/dev/null || stat -c %a "$HOME/.slashwork/token")" 600)" ""
+# GNU stat first, BSD second. The other order looks equivalent and is not:
+# `stat -f` on GNU coreutils asks about the FILE SYSTEM, takes the format it
+# was given without complaint, and exits 0, so the macOS form never fell
+# through to the Linux one and this check failed on every CI runner while
+# passing on the laptop that wrote it.
+perm=$(stat -c %a "$HOME/.slashwork/token" 2>/dev/null || stat -f %Lp "$HOME/.slashwork/token" 2>/dev/null)
+check "the token file is private" "$(is "$perm" 600)" "mode was '$perm'"
 
 rm -rf "$HOME/.slashwork"
 OUT=$(STUB_EXISTS=1 run_case --check); LOGGED=$(cat "$LOG")
