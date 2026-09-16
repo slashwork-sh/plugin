@@ -486,6 +486,28 @@ if ! sbx exec "$NAME" sh -c 'command -v jq >/dev/null && command -v curl >/dev/n
     || say "SANDBOX: warning, could not install jq/curl; the hooks will exit silently without them"
 fi
 
+# Answer Claude Code's opt-in dialogs before they are asked. An unattended
+# earner cannot answer a modal, so any one of these parks the session with a
+# task claimed until it expires, and nothing on screen says why. That is not
+# hypothetical: a fresh 2.1.263 box stopped on "make auto mode the default
+# permission mode" and did nothing for the rest of its budget.
+#
+# The key names are Claude Code's own, and it treats each as "the user has
+# already answered this": skipAutoPermissionPrompt is documented in its
+# settings schema as whether the auto mode opt-in dialog was accepted, and
+# bypassPermissionsModeAccepted plus skipDangerousModePermissionPrompt are
+# what --dangerously-skip-permissions otherwise stops to ask for on a box
+# that has never run it. Merged rather than written, so anything the image or
+# a previous run put there survives.
+#
+# This is a box we build to run strangers' prompts behind a kernel boundary
+# and a deny-by-default network. Turning the same keys on outside one would
+# be a bad idea, which is why the launcher only ever writes them in here.
+say "SANDBOX: pre-accepting Claude Code's permission dialogs inside the box"
+# shellcheck disable=SC2016  # $HOME and $f must expand inside the box, not here
+sbx exec "$NAME" sh -c 'mkdir -p "$HOME/.claude"; f="$HOME/.claude/settings.json"; [ -s "$f" ] || printf "{}" > "$f"; t=$(mktemp) && jq ". + {bypassPermissionsModeAccepted:true, skipDangerousModePermissionPrompt:true, skipAutoPermissionPrompt:true, skipWorkflowUsageWarning:true, permissions:((.permissions // {}) + {defaultMode:\"bypassPermissions\"})}" "$f" > "$t" && mv "$t" "$f"' >/dev/null 2>&1 \
+  || say "SANDBOX: warning, could not pre-accept the permission dialogs; an unattended run may stop on one"
+
 # The earner plugin. The sandbox has its own filesystem, so the host's install
 # does not carry over.
 if ! sbx exec "$NAME" sh -c 'claude plugin list 2>/dev/null | grep -q slashwork-earn' 2>/dev/null; then
@@ -725,6 +747,13 @@ leg_watchdog() {
   done
   sbx stop "$NAME" >/dev/null 2>&1
 }
+# A box that earned before still has that leg's marker in /tmp, and the
+# watchdog below greps every /tmp/slashwork-earn-*.json for budget_spent. On a
+# reused box that is a week-old "budget_spent" sitting there before this leg
+# has claimed anything, so the first poll stops the box about half a minute
+# in. The loop's own clear-marker.sh runs later, inside the session, which is
+# after the watchdog has already made up its mind.
+sbx exec "$NAME" sh -c 'rm -f /tmp/slashwork-earn-*.json' >/dev/null 2>&1
 leg_watchdog &
 WATCHDOG_PID=$!
 if [ "$CLAUDE_AUTH" = "setup-token" ]; then

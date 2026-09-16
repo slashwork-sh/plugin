@@ -432,6 +432,26 @@ check "closes the egress before the earn session starts" \
   "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'policy rm network' | head -1 | cut -d: -f1)" \
      -lt "$(printf '%s\n' "$LOGGED" | grep -n 'dangerously-skip-permissions' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
 check "no manual --lock step is asked for" "$(hasnt "$OUT" "run './sandbox.sh --lock'")" "$OUT"
+# An unattended earner cannot answer a modal. Claude Code 2.1.263 added the
+# auto-mode opt-in dialog, which parked a real box for its whole budget with a
+# task claimed, so every one of these is pre-answered before the session runs.
+for k in skipAutoPermissionPrompt bypassPermissionsModeAccepted skipDangerousModePermissionPrompt; do
+  check "pre-accepts $k inside the box" "$(has "$LOGGED" "$k")" "$LOGGED"
+done
+check "pre-accepts the dialogs only after jq is there to merge with" \
+  "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'skipAutoPermissionPrompt' | head -1 | cut -d: -f1)" \
+     -gt "$(printf '%s\n' "$LOGGED" | grep -n 'command -v jq' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
+check "pre-accepts the dialogs before the session starts" \
+  "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'skipAutoPermissionPrompt' | head -1 | cut -d: -f1)" \
+     -lt "$(printf '%s\n' "$LOGGED" | grep -n 'dangerously-skip-permissions' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
+# A reused box still holds the previous leg's marker, and the watchdog greps
+# every marker for budget_spent, so a stale one stopped the box about half a
+# minute in, before anything was claimed.
+check "clears stale earn markers before the leg" \
+  "$(has "$LOGGED" "rm -f /tmp/slashwork-earn-")" "$LOGGED"
+check "clears them before the session starts" \
+  "$([ "$(printf '%s\n' "$LOGGED" | grep -n 'rm -f /tmp/slashwork-earn-' | head -1 | cut -d: -f1)" \
+     -lt "$(printf '%s\n' "$LOGGED" | grep -n 'dangerously-skip-permissions' | head -1 | cut -d: -f1)" ] && echo 0 || echo 1)" "$LOGGED"
 check "a bare run ends with the loop hint" "$(has "$OUT" "--loop 25 8h")" "$OUT"
 
 # A box whose setup egress cannot be closed does not run: the docs say locked.
@@ -473,7 +493,13 @@ check "no host token: saves the token it was granted" \
   "$(is "$(cat "$HOME/.slashwork/token" 2>/dev/null)" "tok-from-flow")" ""
 check "no host token: the fresh token is copied into the box" \
   "$(has "$LOGGED" "cp $HOME/.slashwork/token test-earner:/home/agent/.slashwork/token")" "$LOGGED"
-check "the token file is private" "$(is "$(stat -f %Lp "$HOME/.slashwork/token" 2>/dev/null || stat -c %a "$HOME/.slashwork/token")" 600)" ""
+# GNU stat first, BSD second. The other order looks equivalent and is not:
+# `stat -f` on GNU coreutils asks about the FILE SYSTEM, takes the format it
+# was given without complaint, and exits 0, so the macOS form never fell
+# through to the Linux one and this check failed on every CI runner while
+# passing on the laptop that wrote it.
+perm=$(stat -c %a "$HOME/.slashwork/token" 2>/dev/null || stat -f %Lp "$HOME/.slashwork/token" 2>/dev/null)
+check "the token file is private" "$(is "$perm" 600)" "mode was '$perm'"
 
 rm -rf "$HOME/.slashwork"
 OUT=$(STUB_EXISTS=1 run_case --check); LOGGED=$(cat "$LOG")
